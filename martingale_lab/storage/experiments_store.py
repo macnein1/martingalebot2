@@ -12,9 +12,16 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+import os
+from pathlib import Path
 
-from ui.utils.structured_logging import Events, db_logger
-from ui.utils.constants import Status
+from martingale_lab.utils.structured_logging import (
+    get_structured_logger, EventNames, Timer, ensure_json_serializable
+)
+from ui.utils.constants import Status, DB_PATH
+
+# Initialize structured logger for database operations
+logger = get_structured_logger("mlab.db")
 
 
 def _jsonify(o: Any):
@@ -55,14 +62,12 @@ class ExperimentRow:
 
 class ExperimentsStore:
     def __init__(self, db_path: str = "db_results/experiments.db"):
-        import os
-        from pathlib import Path
         self.db_path = db_path
         # Ensure directory exists
         Path(os.path.dirname(self.db_path) or ".").mkdir(parents=True, exist_ok=True)
         
         # Log database initialization
-        db_logger.event(Events.DB_INIT, db_path=db_path)
+        logger.info(EventNames.DB_INIT, f"Initializing database at {db_path}", db_path=db_path)
         
         self._init_db()
 
@@ -146,8 +151,9 @@ class ExperimentsStore:
             conn.commit()
             
             # Log experiment creation
-            db_logger.event(
-                Events.DB_UPSERT_EXP,
+            logger.info(
+                EventNames.DB_UPSERT_EXP,
+                f"Created experiment {exp_id} for {adapter}",
                 exp_id=int(exp_id),
                 adapter=adapter,
                 run_id=run_id
@@ -210,23 +216,26 @@ class ExperimentsStore:
                 cur.execute("SELECT COUNT(*) FROM results WHERE experiment_id = ?", (experiment_id,))
                 count = cur.fetchone()[0]
                 
-                db_logger.event(
-                    Events.DB_UPSERT_RES,
+                logger.info(
+                    EventNames.DB_UPSERT_RES,
+                    f"Inserted {inserted} results for experiment {experiment_id}",
                     experiment_id=experiment_id,
                     rows=inserted,
                     total_rows=count
                 )
                 
-                db_logger.event(
-                    Events.DB_VERIFY,
+                logger.info(
+                    EventNames.DB_VERIFY,
+                    f"Verification successful: {count} total rows",
                     ok=True,
                     expected=inserted,
                     actual=count
                 )
                 
         except Exception as e:
-            db_logger.event(
-                Events.DB_ERROR,
+            logger.error(
+                EventNames.DB_ERROR,
+                f"Database error in upsert_results: {str(e)}",
                 error=str(e),
                 operation="upsert_results",
                 experiment_id=experiment_id

@@ -5,12 +5,22 @@ import sqlite3
 import json
 import pandas as pd
 import numpy as np
+from typing import List, Dict, Any, Optional
+from datetime import datetime
+import traceback
 
 # Add the ui directory to the path so we can import utils
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 from ui.utils.config import get_icon_html, setup_page_config
 from ui.utils.constants import DB_PATH
+from martingale_lab.storage.experiments_store import ExperimentsStore
+from martingale_lab.utils.structured_logging import get_structured_logger, EventNames
+from ui.utils.optimization_bridge import get_optimization_bridge
+from ui.utils.logging_buffer import get_live_trace
+
+# Initialize structured logger for results page
+logger = get_structured_logger("mlab.results")
 
 # Streamlit page configuration
 st.set_page_config(
@@ -28,183 +38,498 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-def _open_db(db_path: str = DB_PATH):
-    return sqlite3.connect(db_path)
 
-
-def _load_experiments(conn) -> pd.DataFrame:
+def load_experiments_data(db_path: str) -> List[Dict[str, Any]]:
+    """Load experiments data with logging"""
     try:
-        df = pd.read_sql_query("SELECT id, created_at, adapter, best_score, total_evals, elapsed_s FROM experiments WHERE deleted=0 ORDER BY created_at DESC", conn)
-        return df
+        logger.info(
+            EventNames.UI_RESULTS_LOAD,
+            f"Loading experiments from {db_path}",
+            db_path=db_path
+        )
+        
+        store = ExperimentsStore(db_path)
+        
+        # Get experiments using raw SQL for now (can be enhanced later)
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT id, run_id, adapter, config_json, started_at, finished_at, 
+                       status, best_score, eval_count, notes, created_at
+                FROM experiments 
+                WHERE deleted = 0 
+                ORDER BY created_at DESC
+            """)
+            
+            experiments = []
+            for row in cursor.fetchall():
+                experiments.append({
+                    'id': row[0],
+                    'run_id': row[1],
+                    'adapter': row[2],
+                    'config_json': row[3],
+                    'started_at': row[4],
+                    'finished_at': row[5],
+                    'status': row[6],
+                    'best_score': row[7],
+                    'eval_count': row[8],
+                    'notes': row[9],
+                    'created_at': row[10]
+                })
+        
+        logger.info(
+            EventNames.UI_RESULTS_LOAD,
+            f"Loaded {len(experiments)} experiments",
+            count=len(experiments)
+        )
+        
+        return experiments
+        
     except Exception as e:
-        # Return empty DataFrame if table doesn't exist or other error
-        return pd.DataFrame()
+        logger.error(
+            EventNames.UI_RESULTS_LOAD,
+            f"Failed to load experiments: {str(e)}",
+            error=str(e),
+            traceback=traceback.format_exc()
+        )
+        return []
 
 
-def _load_results(conn, experiment_id: int) -> pd.DataFrame:
+def load_results_data(db_path: str, experiment_id: int, limit: int = 100) -> List[Dict[str, Any]]:
+    """Load results data for an experiment with logging"""
     try:
-        df = pd.read_sql_query("SELECT stable_id, score, params_json, schedule_json, risk_json, penalties_json, created_at FROM results WHERE experiment_id=? ORDER BY score ASC", conn, params=(experiment_id,))
-        # Parse JSON columns
-        def parse_json(col):
-            try:
-                return json.loads(col)
-            except Exception:
-                return {}
-        if not df.empty:
-            df['params'] = df['params_json'].apply(parse_json)
-            df['schedule'] = df['schedule_json'].apply(parse_json)
-            df['risk'] = df['risk_json'].apply(parse_json)
-            df['penalties'] = df['penalties_json'].apply(lambda x: parse_json(x) if pd.notnull(x) else {})
-        return df
+        logger.info(
+            EventNames.UI_RESULTS_LOAD,
+            f"Loading results for experiment {experiment_id}",
+            experiment_id=experiment_id,
+            limit=limit
+        )
+        
+        store = ExperimentsStore(db_path)
+        results = store.get_top_results(experiment_id, limit=limit)
+        
+        logger.info(
+            EventNames.UI_RESULTS_LOAD,
+            f"Loaded {len(results)} results for experiment {experiment_id}",
+            experiment_id=experiment_id,
+            count=len(results)
+        )
+        
+        return results
+        
     except Exception as e:
-        # Return empty DataFrame if table doesn't exist or other error
-        return pd.DataFrame()
+        logger.error(
+            EventNames.UI_RESULTS_LOAD,
+            f"Failed to load results for experiment {experiment_id}: {str(e)}",
+            experiment_id=experiment_id,
+            error=str(e),
+            traceback=traceback.format_exc()
+        )
+        return []
 
 
-def _format_bullets(schedule: dict) -> list:
-    indent = schedule.get('indent_pct', [])
-    volume = schedule.get('volume_pct', [])
-    mart = schedule.get('martingale_pct', [])
-    lines = []
-    for i in range(len(indent)):
-        if i == 0:
-            lines.append(f"{i+1}. Emir: Indent %{indent[i]:.2f}  Volume %{volume[i]:.2f}  (no martingale, first order)")
+def create_needpct_sparkline(needpct: List[float], width: int = 20) -> str:
+    """Create ASCII sparkline for NeedPct values"""
+    if not needpct or len(needpct) < 2:
+        return "─" * width
+    
+    min_val, max_val = min(needpct), max(needpct)
+    if max_val - min_val < 1e-6:
+        return "─" * width
+    
+    # Map to characters
+    chars = "▁▂▃▄▅▆▇█"
+    sparkline = ""
+    
+    for i, val in enumerate(needpct[:width]):
+        normalized = (val - min_val) / (max_val - min_val)
+        char_idx = min(len(chars) - 1, int(normalized * (len(chars) - 1)))
+        sparkline += chars[char_idx]
+    
+    return sparkline
+
+
+def create_sanity_badges(sanity: Dict[str, Any]) -> str:
+    """Create sanity check badges"""
+    badges = []
+    
+    if sanity.get('max_need_mismatch', False):
+        badges.append("🔴 MaxNeed")
+    if sanity.get('collapse_indents', False):
+        badges.append("🟡 Collapse")
+    if sanity.get('tail_overflow', False):
+        badges.append("🟠 TailOvf")
+    if sanity.get('error', False):
+        badges.append("❌ Error")
+    
+    return " ".join(badges) if badges else "✅ OK"
+
+
+def display_live_trace_panel():
+    """Display live trace panel with recent logs"""
+    st.sidebar.markdown("### 🔴 Live Trace")
+    
+    # Get optimization status
+    bridge = get_optimization_bridge()
+    status = bridge.get_status()
+    
+    if status['is_running']:
+        st.sidebar.success("🟢 Optimization Running")
+        st.sidebar.write(f"Run ID: `{status['run_id']}`")
+    else:
+        st.sidebar.info("⚪ No Active Optimization")
+    
+    # Event filter
+    event_filter = st.sidebar.selectbox(
+        "Filter Events",
+        ["All", "ORCH", "EVAL", "DB", "UI"],
+        index=0
+    )
+    
+    filter_value = None if event_filter == "All" else event_filter
+    
+    # Get live logs
+    try:
+        logs = get_live_trace("mlab", event_filter=filter_value, last_n=20)
+        
+        if logs:
+            st.sidebar.markdown("**Recent Events:**")
+            for log in logs[-10:]:  # Show last 10
+                event = log.get('event', 'UNKNOWN')
+                msg = log.get('msg', '')
+                ts = log.get('ts', 0)
+                
+                # Format timestamp
+                try:
+                    dt = datetime.fromtimestamp(ts)
+                    time_str = dt.strftime("%H:%M:%S")
+                except:
+                    time_str = "??:??:??"
+                
+                # Color code by event type
+                if event.startswith('ORCH'):
+                    color = "🔵"
+                elif event.startswith('EVAL'):
+                    color = "🟢"
+                elif event.startswith('DB'):
+                    color = "🟡"
+                elif event.startswith('UI'):
+                    color = "🟣"
+                else:
+                    color = "⚪"
+                
+                st.sidebar.write(f"{color} `{time_str}` **{event}**")
+                if msg and len(msg) < 50:
+                    st.sidebar.write(f"   _{msg}_")
         else:
-            lines.append(f"{i+1}. Emir: Indent %{indent[i]:.2f}  Volume %{volume[i]:.2f}  (Martingale %{mart[i]:.2f})")
-    return lines
+            st.sidebar.write("No recent events")
+            
+    except Exception as e:
+        st.sidebar.error(f"Error loading live trace: {e}")
 
 
-def _sanity(schedule: dict, risk: dict) -> list:
-    msgs = []
-    m = len(schedule.get('indent_pct', []))
-    if not (m and m == len(schedule.get('volume_pct', [])) == len(schedule.get('martingale_pct', [])) == len(schedule.get('needpct', []))):
-        msgs.append('Len mismatch')
-    if abs(sum(schedule.get('volume_pct', [])) - 100.0) > 1e-6:
-        msgs.append('Sum(volume_pct) != 100')
-    if m and schedule.get('martingale_pct', [0])[0] != 0:
-        msgs.append('martingale_pct[0] != 0')
-    if 'max_need' in risk and 'needpct' in schedule and schedule['needpct']:
-        if abs(risk['max_need'] - max(schedule['needpct'])) > 1e-6:
-            msgs.append('max_need mismatch')
-    return msgs
+def display_experiment_summary(experiment: Dict[str, Any]):
+    """Display experiment summary card"""
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("Best Score", f"{experiment['best_score']:.4f}")
+    
+    with col2:
+        st.metric("Evaluations", f"{experiment['eval_count']:,}")
+    
+    with col3:
+        status = experiment['status']
+        status_color = {
+            'COMPLETED': '🟢',
+            'RUNNING': '🟡', 
+            'FAILED': '🔴',
+            'PENDING': '⚪'
+        }.get(status, '❓')
+        st.metric("Status", f"{status_color} {status}")
+    
+    with col4:
+        try:
+            config = json.loads(experiment['config_json'])
+            overlap_range = f"{config.get('overlap_min', 0):.1f}-{config.get('overlap_max', 0):.1f}%"
+            st.metric("Overlap Range", overlap_range)
+        except:
+            st.metric("Config", "Parse Error")
 
 
-db_path = st.text_input("DB path", value=DB_PATH)
+def display_results_table(results: List[Dict[str, Any]], top_n: int = 20):
+    """Display results table with enhanced formatting"""
+    if not results:
+        st.warning("No results found")
+        return
+    
+    # Prepare table data
+    table_data = []
+    
+    for i, result in enumerate(results[:top_n]):
+        payload = result.get('payload', {})
+        schedule = payload.get('schedule', {})
+        sanity = payload.get('sanity', {})
+        diagnostics = payload.get('diagnostics', {})
+        
+        needpct = schedule.get('needpct', [])
+        sparkline = create_needpct_sparkline(needpct)
+        sanity_badges = create_sanity_badges(sanity)
+        
+        table_data.append({
+            'Rank': i + 1,
+            'Score': f"{result['score']:.4f}",
+            'Max Need': f"{payload.get('max_need', 0):.3f}",
+            'Var Need': f"{payload.get('var_need', 0):.3f}",
+            'Tail': f"{payload.get('tail', 0):.3f}",
+            'WCI': f"{diagnostics.get('wci', 0):.2f}",
+            'Sign Flips': diagnostics.get('sign_flips', 0),
+            'NeedPct ▼': sparkline,
+            'Sanity': sanity_badges
+        })
+    
+    # Display table
+    df = pd.DataFrame(table_data)
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
-if not os.path.exists(db_path):
-    st.error(f"DB dosyası bulunamadı: {db_path}")
-    st.info("Önce bir optimizasyon çalıştırın veya doğru DB yolunu girin.")
-    st.stop()
 
-try:
-    conn = _open_db(db_path)
-except Exception as e:
-    st.error(f"DB açılamadı: {e}")
-    st.stop()
+def display_result_detail(result: Dict[str, Any], rank: int):
+    """Display detailed view of a single result"""
+    payload = result.get('payload', {})
+    schedule = payload.get('schedule', {})
+    sanity = payload.get('sanity', {})
+    diagnostics = payload.get('diagnostics', {})
+    penalties = payload.get('penalties', {})
+    
+    st.markdown(f"### 🎯 Rank #{rank} Detail")
+    
+    # Metrics row
+    col1, col2, col3, col4, col5 = st.columns(5)
+    
+    with col1:
+        st.metric("Score", f"{result['score']:.4f}")
+    with col2:
+        st.metric("Max Need", f"{payload.get('max_need', 0):.3f}%")
+    with col3:
+        st.metric("Var Need", f"{payload.get('var_need', 0):.3f}")
+    with col4:
+        st.metric("Tail", f"{payload.get('tail', 0):.3f}")
+    with col5:
+        st.metric("WCI", f"{diagnostics.get('wci', 0):.2f}")
+    
+    # Bullets format
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        st.markdown("**📋 Order Schedule:**")
+        
+        indent_pct = schedule.get('indent_pct', [])
+        volume_pct = schedule.get('volume_pct', [])
+        martingale_pct = schedule.get('martingale_pct', [])
+        needpct = schedule.get('needpct', [])
+        
+        bullets = []
+        for i in range(len(indent_pct)):
+            need_str = f"{needpct[i]:.2f}%" if i < len(needpct) else "N/A"
+            if i == 0:
+                bullets.append(
+                    f"**{i+1}.** Indent {indent_pct[i]:.2f}% • "
+                    f"Volume {volume_pct[i]:.2f}% • "
+                    f"Need {need_str} • "
+                    f"(First order, no martingale)"
+                )
+            else:
+                mart_str = f"{martingale_pct[i]:.1f}%" if i < len(martingale_pct) else "0%"
+                bullets.append(
+                    f"**{i+1}.** Indent {indent_pct[i]:.2f}% • "
+                    f"Volume {volume_pct[i]:.2f}% • "
+                    f"Need {need_str} • "
+                    f"Martingale {mart_str}"
+                )
+        
+        for bullet in bullets:
+            st.markdown(bullet)
+    
+    with col2:
+        st.markdown("**🔍 Diagnostics:**")
+        st.write(f"• Gini: {diagnostics.get('gini', 0):.3f}")
+        st.write(f"• Entropy: {diagnostics.get('entropy', 0):.3f}")
+        st.write(f"• Sign Flips: {diagnostics.get('sign_flips', 0)}")
+        
+        st.markdown("**⚖️ Penalties:**")
+        for key, value in penalties.items():
+            if value > 1e-6:
+                st.write(f"• {key}: {value:.4f}")
+        
+        st.markdown("**✅ Sanity:**")
+        sanity_badges = create_sanity_badges(sanity)
+        st.write(sanity_badges)
 
-with conn:
-    exps = _load_experiments(conn)
 
-if exps.empty:
-    st.info("Kayıt bulunamadı. Önce bir optimizasyon çalıştırın.")
-    st.stop()
+def export_data(result: Dict[str, Any], format_type: str):
+    """Export result data in specified format with logging"""
+    try:
+        logger.info(
+            EventNames.UI_EXPORT,
+            f"Exporting data in {format_type} format",
+            format_type=format_type
+        )
+        
+        payload = result.get('payload', {})
+        schedule = payload.get('schedule', {})
+        
+        if format_type == "CSV":
+            # Create CSV data
+            csv_rows = []
+            indent_pct = schedule.get('indent_pct', [])
+            volume_pct = schedule.get('volume_pct', [])
+            martingale_pct = schedule.get('martingale_pct', [])
+            needpct = schedule.get('needpct', [])
+            order_prices = schedule.get('order_prices', [])
+            price_step_pct = schedule.get('price_step_pct', [])
+            
+            for i in range(len(indent_pct)):
+                csv_rows.append({
+                    'order': i + 1,
+                    'indent_pct': indent_pct[i] if i < len(indent_pct) else 0,
+                    'volume_pct': volume_pct[i] if i < len(volume_pct) else 0,
+                    'martingale_pct': martingale_pct[i] if i < len(martingale_pct) else 0,
+                    'needpct': needpct[i] if i < len(needpct) else 0,
+                    'order_price': order_prices[i+1] if i+1 < len(order_prices) else 0,
+                    'price_step_pct': price_step_pct[i] if i < len(price_step_pct) else 0,
+                })
+            
+            csv_data = pd.DataFrame(csv_rows).to_csv(index=False).encode('utf-8')
+            return csv_data, f"result_{result['id']}.csv", "text/csv"
+            
+        elif format_type == "JSON":
+            # Create JSON data
+            json_data = json.dumps(payload, ensure_ascii=False, indent=2).encode('utf-8')
+            return json_data, f"result_{result['id']}.json", "application/json"
+            
+    except Exception as e:
+        logger.error(
+            EventNames.UI_EXPORT,
+            f"Export failed: {str(e)}",
+            format_type=format_type,
+            error=str(e)
+        )
+        st.error(f"Export failed: {e}")
+        return None, None, None
 
-# Experiments list
-st.markdown("### Kayıtlar")
-exp_options = [f"#{row.id} | {row.adapter} | best J={row.best_score:.4f} | evals={row.total_evals} | {row.created_at}" for _, row in exps.iterrows()]
-sel = st.selectbox("Experiment seç", options=exp_options, index=0)
-exp_id = int(sel.split('|')[0].strip()[1:])
 
-with conn:
-    results_df = _load_results(conn, exp_id)
+# Main UI Logic
+def main():
+    # Display live trace panel in sidebar
+    display_live_trace_panel()
+    
+    # Database path input
+    db_path = st.text_input("DB Path", value=DB_PATH)
+    
+    if not os.path.exists(db_path):
+        st.error(f"Database file not found: {db_path}")
+        st.info("Run an optimization first or enter the correct DB path.")
+        return
+    
+    # Load experiments
+    experiments = load_experiments_data(db_path)
+    
+    if not experiments:
+        st.info("No experiments found. Run an optimization first.")
+        return
+    
+    # Experiment selection
+    st.markdown("### 📋 Experiment Selection")
+    
+    exp_options = []
+    for exp in experiments:
+        option = (
+            f"#{exp['id']} | {exp['adapter']} | "
+            f"Score: {exp['best_score']:.4f} | "
+            f"Evals: {exp['eval_count']:,} | "
+            f"{exp['created_at']}"
+        )
+        exp_options.append(option)
+    
+    selected_option = st.selectbox("Select Experiment", options=exp_options, index=0)
+    exp_id = int(selected_option.split('|')[0].strip()[1:])
+    
+    # Find selected experiment
+    selected_exp = next((exp for exp in experiments if exp['id'] == exp_id), None)
+    
+    if not selected_exp:
+        st.error("Selected experiment not found")
+        return
+    
+    # Display experiment summary
+    st.markdown("### 📊 Experiment Summary")
+    display_experiment_summary(selected_exp)
+    
+    # Load and display results
+    st.markdown("### 🏆 Results")
+    
+    # Results controls
+    col1, col2 = st.columns([1, 3])
+    
+    with col1:
+        top_n = st.slider("Top N Results", 5, 100, 20)
+    
+    with col2:
+        if st.button("🔄 Refresh Data"):
+            st.rerun()
+    
+    # Load results data
+    results = load_results_data(db_path, exp_id, limit=top_n)
+    
+    if not results:
+        st.warning("No results found for this experiment")
+        return
+    
+    # Display results table
+    display_results_table(results, top_n)
+    
+    # Detailed view
+    st.markdown("### 🔍 Detailed View")
+    
+    detail_rank = st.selectbox(
+        "Select rank for detailed view",
+        options=list(range(1, min(len(results) + 1, top_n + 1))),
+        index=0
+    )
+    
+    if detail_rank <= len(results):
+        selected_result = results[detail_rank - 1]
+        display_result_detail(selected_result, detail_rank)
+        
+        # Export buttons
+        st.markdown("### 📤 Export")
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            if st.button("📄 Export CSV"):
+                data, filename, mime = export_data(selected_result, "CSV")
+                if data:
+                    st.download_button(
+                        "Download CSV",
+                        data=data,
+                        file_name=filename,
+                        mime=mime
+                    )
+        
+        with col2:
+            if st.button("📋 Export JSON"):
+                data, filename, mime = export_data(selected_result, "JSON")
+                if data:
+                    st.download_button(
+                        "Download JSON",
+                        data=data,
+                        file_name=filename,
+                        mime=mime
+                    )
+        
+        with col3:
+            st.info("HTML/PNG export coming soon")
 
-if results_df.empty:
-    st.info("Sonuç bulunamadı.")
-    st.stop()
 
-# Summary panel
-st.markdown("### Özet")
-best_row = results_df.iloc[0]
-risk = best_row['risk']
-st.json({
-    "adapter": exps.loc[exps.id == exp_id, 'adapter'].values[0],
-    "best_score": float(best_row['score']),
-    "max_need": float(risk.get('max_need', 0.0)),
-    "var_need": float(risk.get('var_need', 0.0)),
-    "tail": float(risk.get('tail', 0.0)),
-})
-
-# Simple Pareto-esque scatter (max_need vs var_need, color=tail)
-st.markdown("### Pareto Keşif (Basit Scatter)")
-try:
-    chart_df = pd.DataFrame({
-        'max_need': results_df['risk'].apply(lambda r: r.get('max_need', np.nan)),
-        'var_need': results_df['risk'].apply(lambda r: r.get('var_need', np.nan)),
-        'tail': results_df['risk'].apply(lambda r: r.get('tail', np.nan)),
-        'score': results_df['score'],
-    })
-    st.scatter_chart(chart_df, x='max_need', y='var_need', color='tail', size='score')
-except Exception as e:
-    st.warning(f"Grafik oluşturulamadı: {e}")
-
-# Top-N table with small schedule preview
-st.markdown("### Top-N Adaylar")
-top_n = st.slider("Kaç aday?", 5, 50, 10)
-tbl = []
-for i in range(min(top_n, len(results_df))):
-    row = results_df.iloc[i]
-    sched = row['schedule']
-    risk = row['risk']
-    bullets = _format_bullets(sched)[:3]  # show first 3 lines
-    sanity = _sanity(sched, risk)
-    tbl.append({
-        'rank': i + 1,
-        'score': f"{row['score']:.4f}",
-        'max_need': f"{risk.get('max_need', 0.0):.4f}",
-        'var_need': f"{risk.get('var_need', 0.0):.4f}",
-        'tail': f"{risk.get('tail', 0.0):.4f}",
-        'bullets': '\n'.join(bullets),
-        'sanity': 'OK' if not sanity else ', '.join(sanity)
-    })
-st.dataframe(pd.DataFrame(tbl), use_container_width=True)
-
-# Export buttons for selected best row
-st.markdown("### Dışa Aktarım")
-col1, col2, col3 = st.columns(3)
-best = best_row
-sched = best['schedule']
-
-# CSV export
-with col1:
-    if st.button("CSV İndir"):
-        csv_rows = [
-            {
-                'order': i + 1,
-                'indent_pct': sched['indent_pct'][i],
-                'volume_pct': sched['volume_pct'][i],
-                'martingale_pct': sched['martingale_pct'][i],
-                'needpct': sched['needpct'][i],
-                'order_price': sched['order_prices'][i],
-                'price_step_pct': sched['price_step_pct'][i],
-            }
-            for i in range(len(sched.get('indent_pct', [])))
-        ]
-        csv = pd.DataFrame(csv_rows).to_csv(index=False).encode('utf-8')
-        st.download_button("CSV", data=csv, file_name=f"result_{best['stable_id']}.csv", mime="text/csv")
-
-# JSON export
-with col2:
-    if st.button("JSON İndir"):
-        payload = {
-            'stable_id': best['stable_id'],
-            'score': float(best['score']),
-            'params': best['params'],
-            'schedule': sched,
-            'risk': best['risk'],
-            'penalties': best['penalties'],
-        }
-        js = json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
-        st.download_button("JSON", data=js, file_name=f"result_{best['stable_id']}.json", mime="application/json")
-
-with col3:
-    st.info("HTML/PNG export ileride eklenecek.")
+if __name__ == "__main__":
+    main()

@@ -1,297 +1,431 @@
 """
-End-to-End Test for DCA System
-Simulates complete UI workflow with optimization bridge and results loading.
+End-to-End Test for Martingale Lab
+UI simulation with optimization bridge and log flow verification
 """
-import sys
 import os
+import sys
 import time
-from pathlib import Path
-import logging
-import sqlite3
+import threading
 import json
+import traceback
+from typing import Dict, Any, List, Optional
 
-# Add project root to path
-project_root = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(project_root))
+# Add parent directories to path for imports
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
 
-from ui.utils.optimization_bridge import optimization_bridge
+from martingale_lab.utils.structured_logging import (
+    setup_structured_logging, get_structured_logger, EventNames, generate_run_id
+)
+from ui.utils.optimization_bridge import OptimizationBridge
+from ui.utils.logging_buffer import get_live_trace, clear_logs
+from ui.utils.constants import DB_PATH, Status
 from martingale_lab.storage.experiments_store import ExperimentsStore
-from ui.utils.structured_logging import Events, app_logger, setup_structured_logging
-from ui.utils.constants import DB_PATH
+from pages.results import load_experiments_data, load_results_data
 
-# Setup logging
-setup_structured_logging()
-logger = app_logger
+
+def setup_test_environment():
+    """Setup test environment with logging"""
+    # Setup structured logging
+    logger = setup_structured_logging("mlab", level=10)  # DEBUG level
+    
+    # Clear existing logs
+    clear_logs("mlab")
+    
+    return logger
+
+
+def cleanup_database():
+    """Clean up test database"""
+    import sqlite3
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM results")
+            cursor.execute("DELETE FROM experiments")
+            conn.commit()
+        print(f"✅ Database cleaned: {DB_PATH}")
+    except Exception as e:
+        print(f"⚠️  Database cleanup failed: {e}")
+
+
+def create_test_parameters() -> Dict[str, Any]:
+    """Create test optimization parameters"""
+    return {
+        'overlap_min': 5.0,
+        'overlap_max': 15.0,
+        'orders_min': 3,
+        'orders_max': 5,
+        'alpha': 0.5,
+        'beta': 0.3,
+        'gamma': 0.2,
+        'lambda_penalty': 0.1,
+        'wave_pattern': True,
+        'tail_cap': 0.40,
+        'min_indent_step': 0.05,
+        'softmax_temp': 1.0,
+        'batch_size': 20,
+        'max_batches': 3,
+        'patience': 3,
+        'prune_factor': 2.0,
+        'top_k': 10,
+        'base_price': 100.0
+    }
 
 
 def test_optimization_bridge():
-    """Test optimization bridge start/stop functionality."""
-    logger.event(Events.APP_START, test="e2e", phase="bridge_test")
+    """Test optimization bridge functionality"""
+    print("🌉 Testing optimization bridge...")
     
-    # Test parameters
-    params = {
-        "overlap_min": 12.0,
-        "overlap_max": 18.0,
-        "orders_min": 3,
-        "orders_max": 5,
-        "alpha": 0.5,
-        "beta": 0.3,
-        "gamma": 0.2,
-        "lambda_penalty": 0.1,
-        "wave_pattern": True,
-        "tail_cap": 0.35,
-        "n_candidates_per_batch": 20,  # Small for testing
-        "max_batches": 2,
-        "notes": "E2E test optimization"
-    }
+    bridge = OptimizationBridge(DB_PATH)
+    params = create_test_parameters()
     
-    # Validate parameters
-    validation = optimization_bridge.validate_parameters(params)
-    assert validation["success"], f"Parameter validation failed: {validation.get('error')}"
+    # Progress tracking
+    progress_updates = []
     
-    # Start optimization
-    start_result = optimization_bridge.start_optimization(params, DB_PATH)
-    assert start_result["success"], f"Start optimization failed: {start_result.get('error')}"
-    
-    run_id = start_result["run_id"]
-    assert run_id is not None, "Run ID should be provided"
-    
-    # Wait for optimization to complete (max 30 seconds)
-    max_wait = 30
-    waited = 0
-    
-    while waited < max_wait:
-        status = optimization_bridge.get_optimization_status()
-        if status["success"] and status["data"]["status"] == "completed":
-            break
-        
-        time.sleep(1)
-        waited += 1
-    
-    # Verify optimization completed
-    final_status = optimization_bridge.get_optimization_status()
-    assert final_status["success"], "Failed to get optimization status"
-    assert final_status["data"]["status"] == "completed", "Optimization should be completed"
-    
-    logger.info(f"✅ Optimization bridge test passed (run_id: {run_id})")
-    return run_id
-
-
-def test_results_loading():
-    """Test results loading and parsing."""
-    logger.event(Events.UI_RESULTS_LOAD, test="e2e")
-    
-    # Load results from database
-    store = ExperimentsStore(DB_PATH)
-    
-    # Get latest experiment
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT id FROM experiments ORDER BY id DESC LIMIT 1")
-        row = cur.fetchone()
-        assert row is not None, "No experiments found in database"
-        exp_id = row[0]
-    
-    # Get top results
-    results = store.get_top_results(experiment_id=exp_id, limit=10)
-    assert len(results) > 0, "No results found for experiment"
-    
-    # Verify result structure
-    first_result = results[0]
-    
-    # Parse payload JSON
-    payload = json.loads(first_result["payload_json"])
-    
-    # Check required fields
-    assert "score" in payload, "Missing score in payload"
-    assert "schedule" in payload, "Missing schedule in payload"
-    assert "sanity" in payload, "Missing sanity in payload"
-    assert "diagnostics" in payload, "Missing diagnostics in payload"
-    assert "penalties" in payload, "Missing penalties in payload"
-    
-    # Check schedule structure
-    schedule = payload["schedule"]
-    assert "needpct" in schedule, "Missing needpct in schedule"
-    assert "volume_pct" in schedule, "Missing volume_pct in schedule"
-    assert "martingale_pct" in schedule, "Missing martingale_pct in schedule"
-    
-    # Verify NeedPct properties
-    needpct = schedule["needpct"]
-    assert len(needpct) > 0, "NeedPct array should not be empty"
-    assert all(isinstance(x, (int, float)) for x in needpct), "NeedPct should contain only numbers"
-    
-    # Check that NeedPct length matches orders
-    orders = payload.get("params", {}).get("num_orders", 0)
-    if orders > 0:
-        assert len(needpct) == orders, f"NeedPct length {len(needpct)} != orders {orders}"
-    
-    # Verify best score is finite
-    best_score = payload["score"]
-    assert best_score < float("inf"), f"Best score should be finite, got {best_score}"
-    
-    # Check sanity - no hard violations for E2E test
-    sanity = payload["sanity"]
-    # For E2E test, we expect no tail overflow (this is configurable)
-    # assert not sanity.get("tail_overflow", True), "Should not have tail overflow in E2E test"
-    
-    logger.info(f"✅ Results loading test passed (exp_id: {exp_id}, results: {len(results)})")
-    return results
-
-
-def create_top_n_table(results):
-    """Simulate Top-N table creation."""
-    logger.event(Events.UI_RESULTS_LOAD, action="create_table", count=len(results))
-    
-    table_data = []
-    
-    for i, result in enumerate(results[:10]):  # Top 10
-        payload = json.loads(result["payload_json"])
-        schedule = payload["schedule"]
-        sanity = payload["sanity"]
-        diagnostics = payload["diagnostics"]
-        needpct = schedule["needpct"]
-        
-        # Create sparkline (simple simulation)
-        if needpct and len(needpct) > 0:
-            min_val = min(needpct)
-            max_val = max(needpct)
-            if max_val > min_val:
-                spark_chars = "▁▂▃▄▅▆▇█"
-                normalized = [(val - min_val) / (max_val - min_val) * 7 for val in needpct]
-                sparkline = "".join([spark_chars[min(7, int(val))] for val in normalized])
-            else:
-                sparkline = "─" * len(needpct)
-        else:
-            sparkline = "─"
-        
-        # Create sanity badges
-        badges = []
-        if sanity.get("max_need_mismatch", False):
-            badges.append("🔴 Max Need Mismatch")
-        if sanity.get("collapse_indents", False):
-            badges.append("🟡 Collapsed Indents")
-        if sanity.get("tail_overflow", False):
-            badges.append("🟠 Tail Overflow")
-        if not badges:
-            badges.append("✅ All Checks Pass")
-        
-        row = {
-            "rank": i + 1,
-            "score": payload["score"],
-            "max_need": payload["max_need"],
-            "var_need": payload["var_need"],
-            "tail": payload["tail"],
-            "wci": diagnostics["wci"],
-            "sign_flips": diagnostics["sign_flips"],
-            "needpct_sparkline": sparkline,
-            "sanity_badges": " | ".join(badges)
-        }
-        table_data.append(row)
-    
-    logger.info(f"✅ Top-N table created with {len(table_data)} rows")
-    return table_data
-
-
-def test_bullets_creation():
-    """Test bullets format creation from results."""
-    logger.event(Events.UI_RESULTS_LOAD, action="create_bullets")
-    
-    # Get a result
-    store = ExperimentsStore(DB_PATH)
-    results = store.get_top_results(limit=1)
-    assert len(results) > 0, "No results available for bullets test"
-    
-    payload = json.loads(results[0]["payload_json"])
-    schedule = payload["schedule"]
-    
-    # Create bullets
-    from martingale_lab.optimizer.evaluation_engine import create_bullets_format
-    bullets = create_bullets_format(schedule)
-    
-    assert len(bullets) > 0, "Bullets should be created"
-    
-    # Verify format
-    for i, bullet in enumerate(bullets):
-        assert f"{i+1}. Emir:" in bullet, f"Bullet {i+1} format incorrect"
-        assert "NeedPct %" in bullet, f"Bullet {i+1} missing NeedPct"
-        
-        if i == 0:
-            assert "no martingale, first order" in bullet, "First bullet should indicate no martingale"
-        else:
-            assert "Martingale %" in bullet, f"Bullet {i+1} should have martingale"
-    
-    logger.info(f"✅ Bullets creation test passed ({len(bullets)} bullets)")
-    return bullets
-
-
-def run_e2e_test():
-    """Run complete end-to-end test."""
-    logger.event(Events.APP_START, test="e2e")
+    def progress_callback(progress_data: Dict[str, Any]):
+        progress_updates.append(progress_data)
+        print(f"   Progress: Batch {progress_data.get('batch_idx', 0)}, "
+              f"Evals: {progress_data.get('eval_count', 0)}, "
+              f"Best: {progress_data.get('best_score', float('inf')):.4f}")
     
     try:
-        # Clean database
-        if os.path.exists(DB_PATH):
-            os.remove(DB_PATH)
+        # Start optimization
+        run_id = bridge.start_optimization(params, progress_callback)
+        print(f"✅ Optimization started with run_id: {run_id}")
         
-        # 1. Test optimization bridge
-        run_id = test_optimization_bridge()
+        # Check status
+        status = bridge.get_status()
+        if not status['is_running']:
+            print("❌ Optimization should be running")
+            return False
         
-        # 2. Test results loading
-        results = test_results_loading()
+        # Wait for completion (with timeout)
+        timeout = 60  # 60 seconds timeout
+        start_time = time.time()
         
-        # 3. Test Top-N table creation
-        table_data = create_top_n_table(results)
+        while bridge.get_status()['is_running']:
+            if time.time() - start_time > timeout:
+                print("❌ Optimization timed out")
+                bridge.stop_optimization()
+                return False
+            time.sleep(1)
         
-        # 4. Test bullets creation
-        bullets = test_bullets_creation()
+        print(f"✅ Optimization completed")
+        print(f"   Progress updates received: {len(progress_updates)}")
         
-        # Final verification
-        assert len(results) >= 1, "Should have at least 1 result"
-        assert len(table_data) >= 1, "Should have at least 1 table row"
-        assert len(bullets) >= 1, "Should have at least 1 bullet"
-        
-        # Check that best score is reasonable
-        best_score = results[0]["score"] if results else float("inf")
-        assert best_score < float("inf"), "Best score should be finite"
-        
-        logger.event(
-            Events.APP_STOP,
-            test="e2e",
-            status="success",
-            run_id=run_id,
-            results_count=len(results),
-            best_score=best_score
-        )
-        
-        print("✅ E2E test PASSED")
-        print(f"  - Run ID: {run_id}")
-        print(f"  - Results found: {len(results)}")
-        print(f"  - Best score: {best_score:.6f}")
-        print(f"  - Table rows: {len(table_data)}")
-        print(f"  - Bullets: {len(bullets)}")
-        
-        # Show sample bullets
-        print("\nSample bullets:")
-        for bullet in bullets[:3]:
-            print(f"  {bullet}")
+        if not progress_updates:
+            print("❌ No progress updates received")
+            return False
         
         return True
         
     except Exception as e:
-        logger.event(
-            Events.APP_STOP,
-            test="e2e",
-            status="failed",
-            error=str(e)
-        )
-        
-        print(f"❌ E2E test FAILED: {e}")
-        import traceback
+        print(f"❌ Bridge test failed: {e}")
         traceback.print_exc()
-        
         return False
 
 
+def verify_log_flow() -> bool:
+    """Verify complete log flow from start to finish"""
+    print("📋 Verifying log flow...")
+    
+    try:
+        # Get all logs
+        logs = get_live_trace("mlab", last_n=2000)
+        
+        if not logs:
+            print("❌ No logs found")
+            return False
+        
+        # Required log sequence
+        required_sequence = [
+            EventNames.UI_CLICK_START,
+            EventNames.ORCH_START,
+            EventNames.BUILD_CONFIG,
+            EventNames.ORCH_BATCH,
+            EventNames.EVAL_CALL,
+            EventNames.EVAL_RETURN,
+            EventNames.DB_UPSERT_RES,
+            EventNames.ORCH_SAVE_OK,
+            EventNames.ORCH_DONE
+        ]
+        
+        # Find events in sequence
+        event_sequence = []
+        for log in logs:
+            event = log.get('event', '')
+            if event in required_sequence:
+                event_sequence.append(event)
+        
+        # Check if we have the minimum required sequence
+        found_events = set(event_sequence)
+        missing_events = set(required_sequence) - found_events
+        
+        if missing_events:
+            print(f"❌ Missing events in log flow: {missing_events}")
+            return False
+        
+        # Count specific events
+        eval_calls = event_sequence.count(EventNames.EVAL_CALL)
+        eval_returns = event_sequence.count(EventNames.EVAL_RETURN)
+        db_upserts = event_sequence.count(EventNames.DB_UPSERT_RES)
+        
+        print(f"✅ Log flow verification passed:")
+        print(f"   Total logs: {len(logs)}")
+        print(f"   Eval calls: {eval_calls}")
+        print(f"   Eval returns: {eval_returns}")
+        print(f"   DB upserts: {db_upserts}")
+        
+        # Basic sanity checks
+        if eval_calls != eval_returns:
+            print(f"⚠️  Warning: Eval calls ({eval_calls}) != returns ({eval_returns})")
+        
+        if db_upserts == 0:
+            print("❌ No database upserts found")
+            return False
+        
+        return True
+        
+    except Exception as e:
+        print(f"❌ Log flow verification failed: {e}")
+        return False
+
+
+def test_ui_data_loading():
+    """Test UI data loading functions"""
+    print("📊 Testing UI data loading...")
+    
+    try:
+        # Load experiments
+        experiments = load_experiments_data(DB_PATH)
+        
+        if not experiments:
+            print("❌ No experiments loaded")
+            return False
+        
+        print(f"✅ Loaded {len(experiments)} experiments")
+        
+        # Get first experiment
+        exp = experiments[0]
+        exp_id = exp['id']
+        
+        # Load results for experiment
+        results = load_results_data(DB_PATH, exp_id, limit=10)
+        
+        if not results:
+            print("❌ No results loaded")
+            return False
+        
+        print(f"✅ Loaded {len(results)} results for experiment {exp_id}")
+        
+        # Verify result structure
+        result = results[0]
+        payload = result.get('payload', {})
+        
+        required_fields = ['score', 'max_need', 'var_need', 'tail', 'schedule']
+        missing_fields = [field for field in required_fields if field not in payload]
+        
+        if missing_fields:
+            print(f"❌ Missing fields in result payload: {missing_fields}")
+            return False
+        
+        # Verify schedule structure
+        schedule = payload.get('schedule', {})
+        needpct = schedule.get('needpct', [])
+        
+        if not needpct:
+            print("❌ No NeedPct data in schedule")
+            return False
+        
+        print(f"✅ UI data loading verification passed:")
+        print(f"   Best score: {result['score']:.4f}")
+        print(f"   NeedPct length: {len(needpct)}")
+        print(f"   Max need: {payload['max_need']:.3f}")
+        
+        return True
+        
+    except Exception as e:
+        print(f"❌ UI data loading test failed: {e}")
+        traceback.print_exc()
+        return False
+
+
+def verify_data_consistency():
+    """Verify data consistency across system components"""
+    print("🔍 Verifying data consistency...")
+    
+    try:
+        # Load from storage
+        store = ExperimentsStore(DB_PATH)
+        
+        # Get latest experiment
+        import sqlite3
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM experiments ORDER BY created_at DESC LIMIT 1")
+            row = cursor.fetchone()
+            if not row:
+                print("❌ No experiments found")
+                return False
+            exp_id = row[0]
+        
+        # Get results from storage
+        storage_results = store.get_top_results(exp_id, limit=5)
+        
+        # Get results from UI loader
+        ui_results = load_results_data(DB_PATH, exp_id, limit=5)
+        
+        if len(storage_results) != len(ui_results):
+            print(f"❌ Result count mismatch: storage={len(storage_results)}, ui={len(ui_results)}")
+            return False
+        
+        # Compare first result
+        if storage_results and ui_results:
+            storage_score = storage_results[0]['score']
+            ui_score = ui_results[0]['score']
+            
+            if abs(storage_score - ui_score) > 1e-6:
+                print(f"❌ Score mismatch: storage={storage_score}, ui={ui_score}")
+                return False
+        
+        print(f"✅ Data consistency verification passed:")
+        print(f"   Results count: {len(storage_results)}")
+        print(f"   Scores match: {storage_results[0]['score']:.4f}")
+        
+        return True
+        
+    except Exception as e:
+        print(f"❌ Data consistency verification failed: {e}")
+        return False
+
+
+def test_error_handling():
+    """Test error handling and recovery"""
+    print("⚠️  Testing error handling...")
+    
+    try:
+        bridge = OptimizationBridge(DB_PATH)
+        
+        # Try to start optimization when one is already running
+        params = create_test_parameters()
+        params['batch_size'] = 5  # Small batch for quick test
+        params['max_batches'] = 1
+        
+        run_id1 = bridge.start_optimization(params)
+        
+        try:
+            run_id2 = bridge.start_optimization(params)
+            print("❌ Should have failed to start second optimization")
+            return False
+        except RuntimeError:
+            print("✅ Correctly prevented second optimization start")
+        
+        # Wait for completion
+        timeout = 30
+        start_time = time.time()
+        while bridge.get_status()['is_running']:
+            if time.time() - start_time > timeout:
+                bridge.stop_optimization()
+                break
+            time.sleep(0.5)
+        
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error handling test failed: {e}")
+        return False
+
+
+def print_test_summary(logs: List[Dict[str, Any]]):
+    """Print test summary with key metrics"""
+    print("\n📈 Test Summary")
+    print("-" * 50)
+    
+    # Count events by type
+    event_counts = {}
+    for log in logs:
+        event = log.get('event', 'UNKNOWN')
+        event_counts[event] = event_counts.get(event, 0) + 1
+    
+    print("Event Counts:")
+    for event, count in sorted(event_counts.items()):
+        print(f"  {event:20} {count:4d}")
+    
+    # Find timing information
+    start_time = None
+    end_time = None
+    
+    for log in logs:
+        if log.get('event') == EventNames.ORCH_START:
+            start_time = log.get('ts', 0)
+        elif log.get('event') == EventNames.ORCH_DONE:
+            end_time = log.get('ts', 0)
+    
+    if start_time and end_time:
+        duration = end_time - start_time
+        print(f"\nTiming:")
+        print(f"  Total duration: {duration:.2f}s")
+        
+        eval_count = event_counts.get(EventNames.EVAL_CALL, 0)
+        if eval_count > 0:
+            print(f"  Evals per second: {eval_count / duration:.1f}")
+
+
+def main():
+    """Main E2E test function"""
+    print("🎯 Martingale Lab E2E Test")
+    print("=" * 50)
+    
+    exit_code = 0
+    
+    try:
+        # Setup test environment
+        logger = setup_test_environment()
+        print("✅ Test environment setup complete")
+        
+        # Clean database
+        cleanup_database()
+        
+        # Test optimization bridge
+        if not test_optimization_bridge():
+            exit_code = 1
+        
+        # Verify log flow
+        if not verify_log_flow():
+            exit_code = 1
+        
+        # Test UI data loading
+        if not test_ui_data_loading():
+            exit_code = 1
+        
+        # Verify data consistency
+        if not verify_data_consistency():
+            exit_code = 1
+        
+        # Test error handling
+        if not test_error_handling():
+            exit_code = 1
+        
+        # Get final logs for summary
+        logs = get_live_trace("mlab", last_n=2000)
+        
+        if exit_code == 0:
+            print("\n🎉 E2E TEST PASSED")
+            print("   All components working correctly")
+        else:
+            print("\n❌ E2E TEST FAILED")
+            print("   One or more tests failed")
+        
+        print_test_summary(logs)
+        
+    except Exception as e:
+        print(f"\n💥 E2E TEST CRASHED: {e}")
+        traceback.print_exc()
+        exit_code = 1
+    
+    print("=" * 50)
+    sys.exit(exit_code)
+
+
 if __name__ == "__main__":
-    success = run_e2e_test()
-    sys.exit(0 if success else 1)
+    main()

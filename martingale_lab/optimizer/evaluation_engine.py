@@ -12,7 +12,12 @@ from dataclasses import dataclass
 from typing import Dict, Any, List, Optional, Tuple
 import math
 
-from ui.utils.structured_logging import Events, eval_logger, LogContext
+from martingale_lab.utils.structured_logging import (
+    get_structured_logger, EventNames, Timer, ensure_json_serializable
+)
+
+# Initialize structured logger for evaluation
+logger = get_structured_logger("mlab.eval")
 
 
 def _ensure_json_serializable(obj):
@@ -134,8 +139,9 @@ def evaluation_function(
     start_time = time.time()
     
     # Log evaluation call
-    eval_logger.event(
-        Events.EVAL_CALL,
+    logger.info(
+        EventNames.EVAL_CALL,
+        "Starting evaluation",
         overlap=overlap_pct,
         orders=num_orders,
         wave_pattern=wave_pattern,
@@ -301,8 +307,9 @@ def evaluation_function(
         
         # Log successful evaluation
         duration_ms = (time.time() - start_time) * 1000
-        eval_logger.event(
-            Events.EVAL_RETURN,
+        logger.info(
+            EventNames.EVAL_RETURN,
+            "Evaluation completed successfully",
             score=float(score),
             max_need=float(max_need),
             var_need=float(var_need),
@@ -328,8 +335,9 @@ def evaluation_function(
     except Exception as e:
         # Log evaluation error
         duration_ms = (time.time() - start_time) * 1000
-        eval_logger.event(
-            Events.EVAL_ERROR,
+        logger.error(
+            EventNames.EVAL_ERROR,
+            f"Evaluation failed: {str(e)}",
             error=str(e),
             duration_ms=duration_ms,
             overlap=overlap_pct,
