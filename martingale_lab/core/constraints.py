@@ -2,8 +2,119 @@
 Constraints and normalization functions for martingale optimization.
 """
 import numpy as np
-from typing import Tuple, List
+from typing import Tuple, List, Dict, Any
 from .types import Params, Schedule
+
+
+def validate_search_space(cfg: Dict[str, Any]) -> None:
+    """
+    Validate search space configuration parameters.
+    
+    Args:
+        cfg: Configuration dictionary with optimization parameters
+        
+    Raises:
+        AssertionError: If any constraint is violated
+    """
+    assert 0 < cfg.get('overlap_min', 0) < cfg.get('overlap_max', 100) <= 100, \
+        f"Invalid overlap range: {cfg.get('overlap_min')} - {cfg.get('overlap_max')}"
+    
+    assert 1 <= cfg.get('orders_min', 1) <= cfg.get('orders_max', 100) <= 100, \
+        f"Invalid orders range: {cfg.get('orders_min')} - {cfg.get('orders_max')}"
+    
+    # Penalty weight validation
+    alpha = cfg.get('alpha', 0)
+    beta = cfg.get('beta', 0) 
+    gamma = cfg.get('gamma', 0)
+    assert 0 <= alpha <= 1 and 0 <= beta <= 1 and 0 <= gamma <= 1, \
+        f"Invalid penalty weights: α={alpha}, β={beta}, γ={gamma}"
+    
+    # At least one objective should be active
+    assert alpha + beta + gamma > 0, "At least one objective weight must be positive"
+
+
+def assert_schedule_invariants(schedule: Schedule) -> None:
+    """
+    Assert critical schedule invariants for early error detection.
+    
+    Args:
+        schedule: Schedule object to validate
+        
+    Raises:
+        AssertionError: If any invariant is violated
+    """
+    if hasattr(schedule, 'indent_pct'):
+        indent = schedule.indent_pct
+        # Indent should be non-negative and monotonically increasing
+        assert indent[0] >= 0, f"First indent must be non-negative: {indent[0]}"
+        for i in range(len(indent) - 1):
+            assert indent[i] <= indent[i + 1], \
+                f"Indent not monotonic at position {i}: {indent[i]} > {indent[i+1]}"
+    
+    if hasattr(schedule, 'volume_pct'):
+        vol = schedule.volume_pct
+        # Volumes should sum to 1 and be non-negative
+        vol_sum = sum(vol)
+        assert abs(vol_sum - 1.0) < 1e-6, f"Volume sum not 1.0: {vol_sum}"
+        assert all(v >= 0 for v in vol), f"Negative volumes found: {[v for v in vol if v < 0]}"
+
+
+def validate_martingale_bounds(martingale_pct: float) -> None:
+    """
+    Validate martingale percentage bounds.
+    
+    Args:
+        martingale_pct: Martingale percentage to validate
+        
+    Raises:
+        AssertionError: If bounds are violated
+    """
+    assert 0 <= martingale_pct <= 100, f"Martingale % out of bounds: {martingale_pct}"
+
+
+def validate_need_pct_sanity(need_pct_values: np.ndarray) -> None:
+    """
+    Validate NeedPct values are within reasonable bounds.
+    
+    Args:
+        need_pct_values: Array of NeedPct values
+        
+    Raises:
+        AssertionError: If values are unreasonable
+    """
+    assert np.all(need_pct_values >= 0), "NeedPct values must be non-negative"
+    assert np.all(need_pct_values <= 50), f"NeedPct values too high (>50%): {np.max(need_pct_values)}"
+    assert not np.any(np.isnan(need_pct_values)), "NaN values in NeedPct"
+    assert not np.any(np.isinf(need_pct_values)), "Infinite values in NeedPct"
+
+
+def validate_physical_constraints(schedule: Schedule) -> None:
+    """
+    Validate physical/business constraints on schedule.
+    
+    Args:
+        schedule: Schedule to validate
+        
+    Raises:
+        AssertionError: If constraints are violated
+    """
+    # Volume constraints
+    if hasattr(schedule, 'volumes'):
+        volumes = schedule.volumes
+        assert np.all(volumes >= 0), "All volumes must be non-negative"
+        assert np.sum(volumes) > 0, "Total volume must be positive"
+    
+    # Order constraints  
+    if hasattr(schedule, 'orders'):
+        orders = schedule.orders
+        assert np.all(orders >= 1), "All orders must be at least 1"
+        assert np.all(orders <= 1000), "Orders too large (>1000)"
+    
+    # Overlap constraints
+    if hasattr(schedule, 'overlaps'):
+        overlaps = schedule.overlaps
+        assert np.all(overlaps >= 0), "Overlaps must be non-negative"
+        assert np.all(overlaps <= 100), "Overlaps must be <= 100%"
 
 
 class ConstraintValidator:
@@ -19,6 +130,24 @@ class ConstraintValidator:
             0 <= params.smoothing_factor <= 1 and
             0 <= params.tail_weight <= 1
         )
+    
+    @staticmethod
+    def validate_params_strict(params: Params) -> None:
+        """Strict parameter validation with detailed error messages."""
+        if not (0 <= params.min_overlap <= params.max_overlap <= 100):
+            raise ValueError(f"Invalid overlap range: {params.min_overlap} - {params.max_overlap}")
+        
+        if not (1 <= params.min_order <= params.max_order <= 50):
+            raise ValueError(f"Invalid order range: {params.min_order} - {params.max_order}")
+        
+        if params.risk_factor <= 0:
+            raise ValueError(f"Risk factor must be positive: {params.risk_factor}")
+        
+        if not (0 <= params.smoothing_factor <= 1):
+            raise ValueError(f"Smoothing factor out of range [0,1]: {params.smoothing_factor}")
+        
+        if not (0 <= params.tail_weight <= 1):
+            raise ValueError(f"Tail weight out of range [0,1]: {params.tail_weight}")
     
     @staticmethod
     def validate_schedule(schedule: Schedule) -> bool:
@@ -39,6 +168,16 @@ class ConstraintValidator:
             return False
         
         return True
+
+    @staticmethod
+    def validate_schedule_strict(schedule: Schedule) -> None:
+        """Strict schedule validation with detailed error messages."""
+        if schedule.num_levels == 0:
+            raise ValueError("Schedule must have at least one level")
+        
+        # Apply all invariant checks
+        assert_schedule_invariants(schedule)
+        validate_physical_constraints(schedule)
 
 
 class VolumeConstraints:
