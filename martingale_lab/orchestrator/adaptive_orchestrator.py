@@ -14,6 +14,7 @@ from ..interfaces import (
 )
 from ..core.reduction import TopKHeap, ConvergenceChecker, ResultAggregator
 from ..storage.sqlite_store import SQLiteStore
+from ..storage.experiments_store import ExperimentsStore
 
 
 @dataclass
@@ -68,6 +69,8 @@ class AdaptiveOrchestrator:
         
         # Storage
         self.storage = SQLiteStore(self.config.db_path) if self.config.save_to_db else None
+        self.exp_store = ExperimentsStore("experiments.db") if self.config.save_to_db else None
+        self.experiment_id: Optional[int] = None
         
         # Session tracking
         self.session_id = f"session_{int(time.time())}"
@@ -101,6 +104,19 @@ class AdaptiveOrchestrator:
         # Calculate budgets
         time_budgets = self._calculate_phase_budgets(total_time_budget)
         eval_budgets = self._calculate_eval_budgets(total_eval_budget)
+
+        # Create experiment row (summary)
+        if self.exp_store and self.experiment_id is None:
+            cfg_payload = {
+                "overlap_min": getattr(search_config, "overlap_min", None),
+                "overlap_max": getattr(search_config, "overlap_max", None),
+                "orders_min": getattr(search_config, "min_order", None),
+                "orders_max": getattr(search_config, "max_order", None),
+                "alpha": getattr(search_config, "alpha", None),
+                "beta": getattr(search_config, "beta", None),
+                "gamma": getattr(search_config, "gamma", None),
+            }
+            self.experiment_id = self.exp_store.create_experiment(adapter="adaptive", cfg=cfg_payload)
         
         try:
             # Phase 1: Warmup (Coarse Scan)
@@ -109,6 +125,8 @@ class AdaptiveOrchestrator:
                 search_config, time_budgets['warmup'], eval_budgets['warmup']
             )
             self.phase_results.append(('warmup', warmup_candidates, warmup_traces))
+            # Upsert batch results
+            self._upsert_phase_results(warmup_traces)
             
             # Phase 2: Focus (Narrowed Ranges)
             self.logger.info("Phase 2: Focus (Narrowed Ranges)")
@@ -116,6 +134,7 @@ class AdaptiveOrchestrator:
                 search_config, time_budgets['focus'], eval_budgets['focus']
             )
             self.phase_results.append(('focus', focus_candidates, focus_traces))
+            self._upsert_phase_results(focus_traces)
             
             # Phase 3: Fine-tuning (Deep Exploration)
             self.logger.info("Phase 3: Fine-tuning (Deep Exploration)")
@@ -123,6 +142,7 @@ class AdaptiveOrchestrator:
                 search_config, time_budgets['fine_tune'], eval_budgets['fine_tune']
             )
             self.phase_results.append(('fine_tune', fine_tune_candidates, fine_tune_traces))
+            self._upsert_phase_results(fine_tune_traces)
             
             # Phase 4: Output (Results and Storage)
             self.logger.info("Phase 4: Output (Results and Storage)")
@@ -250,6 +270,12 @@ class AdaptiveOrchestrator:
         # Save to database if enabled
         if self.storage and self.config.save_to_db:
             self._save_results_to_db(candidates, traces, stats)
+        # Update experiment summary
+        if self.exp_store and self.experiment_id is not None:
+            best = self.top_k_heap.get_best()[0] if self.top_k_heap.heap else float("inf")
+            total_evals = sum(t.eval_count for t in traces) if traces else 0
+            elapsed_s = stats.get('total_time', 0.0)
+            self.exp_store.update_experiment_summary(self.experiment_id, best_score=best, total_evals=total_evals, elapsed_s=elapsed_s)
         
         self.logger.info(f"Output completed: {len(candidates)} final candidates")
         return candidates, traces, stats
@@ -363,6 +389,43 @@ class AdaptiveOrchestrator:
             
         except Exception as e:
             self.logger.error(f"Failed to save results to database: {e}")
+    
+    def _upsert_phase_results(self, traces: TraceResult) -> None:
+        if not self.exp_store or self.experiment_id is None:
+            return
+        items: List[Dict[str, Any]] = []
+        for t in traces:
+            m = t.to_dict() if hasattr(t, 'to_dict') else {}
+            if not m:
+                # Build from metrics fallback
+                m = {
+                    "stable_id": getattr(t, 'stable_id', None),
+                    "score": getattr(t, 'J', None),
+                    "params": {},
+                    "schedule": {},
+                    "risk": {},
+                    "penalties": {},
+                }
+            else:
+                items.append({
+                    "stable_id": m.get("stable_id"),
+                    "score": m.get("J"),
+                    "params": m.get("candidate", {}) or m.get("params", {}),
+                    "schedule": getattr(getattr(t, 'candidate', None), 'schedule', None) or m.get("schedule", {}),
+                    "risk": {
+                        "max_need": m.get("max_score"),
+                        "var_need": m.get("variance_score"),
+                        "tail": m.get("tail_score"),
+                    },
+                    "penalties": {
+                        "gini": m.get("gini_penalty"),
+                        "entropy": m.get("entropy_penalty"),
+                        "monotone_viol": m.get("monotone_penalty"),
+                        "smooth_viol": m.get("smoothness_penalty"),
+                    }
+                })
+        if items:
+            self.exp_store.upsert_results(self.experiment_id, items)
     
     def get_best_candidate(self) -> Optional[Candidate]:
         """Get the best candidate found."""
