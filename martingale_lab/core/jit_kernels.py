@@ -39,6 +39,8 @@ def calculate_orders(min_order: int, max_order: int, num_levels: int) -> np.ndar
 @njit
 def calculate_max_score(volumes: np.ndarray) -> float:
     """Calculate maximum score component."""
+    if volumes.size == 0:
+        return 0.0
     return np.max(volumes)
 
 

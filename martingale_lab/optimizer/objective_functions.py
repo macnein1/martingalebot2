@@ -30,9 +30,8 @@ class LinearObjective(ObjectiveFunction):
         super().__init__(alpha, beta, gamma)
         self.penalty_weights = penalty_weights or {
             'gini': 1.0,
-            'entropy': 0.5,
-            'tail': 1.0,
-            'monotone': 2.0,
+            'entropy': 1.0,
+            'monotone': 1.0,
             'smoothness': 1.0
         }
     
@@ -153,7 +152,7 @@ class AdaptiveObjective:
                 breakdown.penalty_total)
 
 
-class RobustObjective:
+class RobustObjective(ObjectiveFunction):
     """Robust objective function that considers worst-case scenarios."""
     
     def __init__(self, alpha: float = 0.4, beta: float = 0.3, gamma: float = 0.3,
@@ -181,6 +180,9 @@ class RobustObjective:
 # Factory functions for creating objective functions
 def create_objective(objective_type: str = 'linear', **kwargs) -> ObjectiveFunction:
     """Create objective function by type."""
+    # Accept 'type' alias from predefined configs
+    if 'type' in kwargs:
+        objective_type = kwargs.pop('type')
     if objective_type == 'linear':
         return LinearObjective(**kwargs)
     elif objective_type == 'exponential':

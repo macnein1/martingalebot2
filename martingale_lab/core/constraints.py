@@ -151,8 +151,8 @@ class Normalizer:
         return Params(
             min_overlap=normalized[0] * 100.0,
             max_overlap=normalized[1] * 100.0,
-            min_order=int(normalized[2] * 49.0) + 1,
-            max_order=int(normalized[3] * 49.0) + 1,
+            min_order=int(round(normalized[2] * 49.0)) + 1,
+            max_order=int(round(normalized[3] * 49.0)) + 1,
             risk_factor=normalized[4] * 10.0,
             smoothing_factor=normalized[5],
             tail_weight=normalized[6]

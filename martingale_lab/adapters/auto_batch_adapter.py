@@ -87,6 +87,16 @@ class AutoBatchAdapter(OptimizerAdapter):
                     num_orders=int(M),
                     # buraya gerekiyorsa weight/penalty/alpha-beta-gamma gibi
                     # ek parametreler (cfg’den) geçirilebilir
+                    alpha=getattr(cfg, 'alpha', 0.4),
+                    beta=getattr(cfg, 'beta', 0.3),
+                    gamma=getattr(cfg, 'gamma', 0.3),
+                    penalty_gini=getattr(cfg, 'gini_penalty_weight', 0.0),
+                    penalty_entropy=getattr(cfg, 'entropy_penalty_weight', 0.0),
+                    penalty_monotone=getattr(cfg, 'monotone_penalty_weight', 0.0),
+                    penalty_step_smooth=getattr(cfg, 'smoothness_penalty_weight', 0.0),
+                    limit_tail=getattr(cfg, 'limit_tail', None),
+                    last_order_cap=getattr(cfg, 'last_order_cap', None),
+                    random_seed=self.config.random_seed,
                 )
 
                 cand = Candidate(

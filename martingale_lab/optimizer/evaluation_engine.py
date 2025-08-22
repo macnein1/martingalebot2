@@ -8,50 +8,14 @@ import numpy as np
 
 from martingale_lab.adapters.numba_adapter import NumbaAdapter, NumbaAdapterConfig
 from .numba_optimizer import evaluate_batch
+from .eval_contract import evaluate_configuration
 
 
 def evaluation_function(overlap_pct: float, num_orders: int, **kwargs) -> Tuple[float, Dict[str, Any]]:
     """
-    Evaluate a single martingale configuration.
-    
-    Args:
-        overlap_pct: Overlap percentage
-        num_orders: Number of orders
-        **kwargs: Additional parameters
-    
-    Returns:
-        Tuple of (score, metrics_dict)
+    Contract: returns (J, metrics) with complete schedule/risk/penalties/params/stable_id.
     """
-    import numpy as np
-    
-    # Generate random logits for the evaluation
-    rng = np.random.default_rng(42)
-    ind_logits = rng.normal(0.0, 1.0, size=num_orders).astype(np.float64)
-    vol_logits = rng.normal(0.0, 1.0, size=num_orders).astype(np.float64)
-    
-    # Evaluate using the numba optimizer
-    J, max_need, var_need, tail = evaluate_batch(
-        base_price=1.0,
-        overlaps=np.array([overlap_pct], dtype=np.float64),
-        ind_logits=ind_logits.reshape(1, -1),
-        vol_logits=vol_logits.reshape(1, -1)
-    )
-    
-    # Create metrics dictionary
-    metrics = {
-        "score": float(J[0]),
-        "max_need": float(max_need[0]),
-        "var_need": float(var_need[0]),
-        "tail": float(tail[0]),
-        "schedule": {
-            "overlap_pct": overlap_pct,
-            "num_orders": num_orders,
-            "ind_logits": ind_logits.tolist(),
-            "vol_logits": vol_logits.tolist()
-        }
-    }
-    
-    return float(J[0]), metrics
+    return evaluate_configuration(overlap_pct=overlap_pct, num_orders=num_orders, **kwargs)
 
 
 @dataclass
