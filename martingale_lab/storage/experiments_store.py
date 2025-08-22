@@ -13,6 +13,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+from ui.utils.structured_logging import Events, db_logger
+from ui.utils.constants import Status
+
 
 def _jsonify(o: Any):
     # numpy array -> list
@@ -57,6 +60,10 @@ class ExperimentsStore:
         self.db_path = db_path
         # Ensure directory exists
         Path(os.path.dirname(self.db_path) or ".").mkdir(parents=True, exist_ok=True)
+        
+        # Log database initialization
+        db_logger.event(Events.DB_INIT, db_path=db_path)
+        
         self._init_db()
 
     def _init_db(self) -> None:
@@ -66,18 +73,16 @@ class ExperimentsStore:
                 """
                 CREATE TABLE IF NOT EXISTS experiments (
                   id INTEGER PRIMARY KEY,
-                  created_at TEXT NOT NULL,
+                  run_id TEXT NOT NULL,
                   adapter TEXT NOT NULL,
+                  config_json TEXT NOT NULL,
+                  started_at TEXT NOT NULL,
+                  finished_at TEXT,
+                  status TEXT NOT NULL DEFAULT 'PENDING',
                   best_score REAL NOT NULL,
-                  total_evals INTEGER NOT NULL,
-                  elapsed_s REAL NOT NULL,
-                  overlap_min REAL, overlap_max REAL,
-                  orders_min INTEGER, orders_max INTEGER,
-                  alpha REAL, beta REAL, gamma REAL,
-                  lambda_penalty REAL,
-                  wave_pattern INTEGER,
-                  tail_cap REAL,
+                  eval_count INTEGER NOT NULL DEFAULT 0,
                   notes TEXT,
+                  created_at TEXT NOT NULL,
                   deleted INTEGER DEFAULT 0
                 );
                 """
@@ -92,26 +97,13 @@ class ExperimentsStore:
                 CREATE TABLE IF NOT EXISTS results (
                   id INTEGER PRIMARY KEY,
                   experiment_id INTEGER NOT NULL REFERENCES experiments(id),
-                  stable_id TEXT NOT NULL,
                   score REAL NOT NULL,
-                  max_need REAL NOT NULL,
-                  var_need REAL NOT NULL,
-                  tail REAL NOT NULL,
-                  shape_reward REAL,
-                  cvar80 REAL,
-                  params_json TEXT NOT NULL,
-                  schedule_json TEXT NOT NULL,
+                  payload_json TEXT NOT NULL,
                   sanity_json TEXT NOT NULL,
                   diagnostics_json TEXT NOT NULL,
                   penalties_json TEXT NOT NULL,
-                  knobs_json TEXT NOT NULL,
                   created_at TEXT NOT NULL
                 );
-                """
-            )
-            cur.execute(
-                """
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_results_stable ON results(stable_id);
                 """
             )
             cur.execute(
@@ -121,46 +113,46 @@ class ExperimentsStore:
             )
             cur.execute(
                 """
-                CREATE INDEX IF NOT EXISTS idx_results_metrics ON results(max_need, var_need, tail);
+                CREATE INDEX IF NOT EXISTS idx_experiments_run ON experiments(run_id);
                 """
             )
             conn.commit()
 
-    def create_experiment(self, adapter: str, cfg: Dict[str, Any]) -> int:
+    def create_experiment(self, adapter: str, cfg: Dict[str, Any], run_id: str) -> int:
         created_at = datetime.now().isoformat()
+        
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.cursor()
             cur.execute(
                 """
                 INSERT INTO experiments (
-                  created_at, adapter, best_score, total_evals, elapsed_s,
-                  overlap_min, overlap_max, orders_min, orders_max, 
-                  alpha, beta, gamma, lambda_penalty, wave_pattern, tail_cap, 
-                  notes, deleted
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  run_id, adapter, config_json, started_at, status, best_score, eval_count, notes, created_at, deleted
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    created_at,
+                    run_id,
                     adapter,
+                    json.dumps(_jsonify(cfg), separators=(",", ":"), ensure_ascii=False),
+                    created_at,
+                    Status.RUNNING,
                     float("inf"),  # placeholder
                     0,
-                    0.0,
-                    cfg.get("overlap_min"),
-                    cfg.get("overlap_max"),
-                    cfg.get("orders_min"),
-                    cfg.get("orders_max"),
-                    cfg.get("alpha", 0.5),
-                    cfg.get("beta", 0.3),
-                    cfg.get("gamma", 0.2),
-                    cfg.get("lambda_penalty", 0.1),
-                    1 if cfg.get("wave_pattern", False) else 0,
-                    cfg.get("tail_cap", 0.40),
                     cfg.get("notes"),
+                    created_at,
                     0,
                 ),
             )
             exp_id = cur.lastrowid
             conn.commit()
+            
+            # Log experiment creation
+            db_logger.event(
+                Events.DB_UPSERT_EXP,
+                exp_id=int(exp_id),
+                adapter=adapter,
+                run_id=run_id
+            )
+            
             return int(exp_id)
 
     def update_experiment_summary(self, experiment_id: int, best_score: float, total_evals: int, elapsed_s: float) -> None:
@@ -170,79 +162,77 @@ class ExperimentsStore:
                 """
                 UPDATE experiments
                 SET best_score = MIN(best_score, ?),
-                    total_evals = ?,
-                    elapsed_s = ?
+                    eval_count = ?,
+                    finished_at = ?,
+                    status = ?
                 WHERE id = ?
                 """,
-                (best_score, total_evals, elapsed_s, experiment_id),
+                (best_score, total_evals, datetime.now().isoformat(), Status.COMPLETED, experiment_id),
             )
             conn.commit()
 
     def upsert_results(self, experiment_id: int, items: List[Dict[str, Any]]) -> int:
         """
         Upsert results with complete DCA evaluation contract structure.
-        Each item should contain: score, max_need, var_need, tail, schedule, sanity, diagnostics, penalties, knobs.
+        Each item should contain: score, schedule, sanity, diagnostics, penalties.
         """
         if not items:
             return 0
         now = datetime.now().isoformat()
         inserted = 0
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.cursor()
-            for item in items:
-                # Generate stable_id from parameters
-                params = item.get("params", {})
-                stable_id = item.get("stable_id")
-                if not stable_id:
-                    # Generate from core parameters
-                    import hashlib
-                    params_str = json.dumps(params, sort_keys=True)
-                    stable_id = hashlib.sha1(params_str.encode()).hexdigest()[:16]
-                
-                cur.execute(
-                    """
-                    INSERT INTO results (
-                        experiment_id, stable_id, score, max_need, var_need, tail, shape_reward, cvar80,
-                        params_json, schedule_json, sanity_json, diagnostics_json, 
-                        penalties_json, knobs_json, created_at
+        
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.cursor()
+                for item in items:
+                    cur.execute(
+                        """
+                        INSERT INTO results (
+                            experiment_id, score, payload_json, sanity_json, 
+                            diagnostics_json, penalties_json, created_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            experiment_id,
+                            float(item.get("score", float("inf"))),
+                            json.dumps(_jsonify(item), separators=(",", ":"), ensure_ascii=False),
+                            json.dumps(_jsonify(item.get("sanity", {})), separators=(",", ":"), ensure_ascii=False),
+                            json.dumps(_jsonify(item.get("diagnostics", {})), separators=(",", ":"), ensure_ascii=False),
+                            json.dumps(_jsonify(item.get("penalties", {})), separators=(",", ":"), ensure_ascii=False),
+                            now,
+                        ),
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(stable_id) DO UPDATE SET
-                      experiment_id=excluded.experiment_id,
-                      score=excluded.score,
-                      max_need=excluded.max_need,
-                      var_need=excluded.var_need,
-                      tail=excluded.tail,
-                      shape_reward=excluded.shape_reward,
-                      cvar80=excluded.cvar80,
-                      params_json=excluded.params_json,
-                      schedule_json=excluded.schedule_json,
-                      sanity_json=excluded.sanity_json,
-                      diagnostics_json=excluded.diagnostics_json,
-                      penalties_json=excluded.penalties_json,
-                      knobs_json=excluded.knobs_json,
-                      created_at=excluded.created_at
-                    """,
-                    (
-                        experiment_id,
-                        stable_id,
-                        float(item.get("score", float("inf"))),
-                        float(item.get("max_need", 0.0)),
-                        float(item.get("var_need", 0.0)),
-                        float(item.get("tail", 0.0)),
-                        float(item.get("shape_reward", 0.0)),
-                        float(item.get("cvar_need", 0.0)),  # Store as cvar80
-                        json.dumps(_jsonify(params), separators=(",", ":"), ensure_ascii=False),
-                        json.dumps(_jsonify(item.get("schedule", {})), separators=(",", ":"), ensure_ascii=False),
-                        json.dumps(_jsonify(item.get("sanity", {})), separators=(",", ":"), ensure_ascii=False),
-                        json.dumps(_jsonify(item.get("diagnostics", {})), separators=(",", ":"), ensure_ascii=False),
-                        json.dumps(_jsonify(item.get("penalties", {})), separators=(",", ":"), ensure_ascii=False),
-                        json.dumps(_jsonify(item.get("knobs", {})), separators=(",", ":"), ensure_ascii=False),
-                        now,
-                    ),
+                    inserted += 1
+                conn.commit()
+                
+                # Verify insertion
+                cur.execute("SELECT COUNT(*) FROM results WHERE experiment_id = ?", (experiment_id,))
+                count = cur.fetchone()[0]
+                
+                db_logger.event(
+                    Events.DB_UPSERT_RES,
+                    experiment_id=experiment_id,
+                    rows=inserted,
+                    total_rows=count
                 )
-                inserted += 1
-            conn.commit()
+                
+                db_logger.event(
+                    Events.DB_VERIFY,
+                    ok=True,
+                    expected=inserted,
+                    actual=count
+                )
+                
+        except Exception as e:
+            db_logger.event(
+                Events.DB_ERROR,
+                error=str(e),
+                operation="upsert_results",
+                experiment_id=experiment_id
+            )
+            raise
+            
         return inserted
 
     def get_top_results(self, 
@@ -254,7 +244,9 @@ class ExperimentsStore:
             cur = conn.cursor()
             
             query = """
-                SELECT r.*, e.adapter, e.created_at as exp_created_at
+                SELECT r.id, r.experiment_id, r.score, r.payload_json, r.sanity_json, 
+                       r.diagnostics_json, r.penalties_json, r.created_at,
+                       e.adapter, e.created_at as exp_created_at
                 FROM results r
                 JOIN experiments e ON r.experiment_id = e.id
                 WHERE e.deleted = 0
@@ -269,14 +261,6 @@ class ExperimentsStore:
                 if "max_score" in filters:
                     query += " AND r.score <= ?"
                     params.append(filters["max_score"])
-                if "min_max_need" in filters:
-                    query += " AND r.max_need >= ?"
-                    params.append(filters["min_max_need"])
-                if "max_max_need" in filters:
-                    query += " AND r.max_need <= ?"
-                    params.append(filters["max_max_need"])
-                if "wave_pattern_only" in filters and filters["wave_pattern_only"]:
-                    query += " AND e.wave_pattern = 1"
                     
             query += " ORDER BY r.score ASC LIMIT ?"
             params.append(limit)
@@ -291,25 +275,17 @@ class ExperimentsStore:
                     result = {
                         "id": row[0],
                         "experiment_id": row[1],
-                        "stable_id": row[2],
-                        "score": row[3],
-                        "max_need": row[4],
-                        "var_need": row[5],
-                        "tail": row[6],
-                        "shape_reward": row[7],
-                        "cvar80": row[8],
-                        "params": json.loads(row[9]),
-                        "schedule": json.loads(row[10]),
-                        "sanity": json.loads(row[11]),
-                        "diagnostics": json.loads(row[12]),
-                        "penalties": json.loads(row[13]),
-                        "knobs": json.loads(row[14]),
-                        "created_at": row[15],
-                        "adapter": row[16],
-                        "exp_created_at": row[17],
+                        "score": row[2],
+                        "payload_json": row[3],
+                        "sanity_json": row[4],
+                        "diagnostics_json": row[5],
+                        "penalties_json": row[6],
+                        "created_at": row[7],
+                        "adapter": row[8],
+                        "exp_created_at": row[9],
                     }
                     results.append(result)
-                except json.JSONDecodeError as e:
+                except Exception as e:
                     # Skip malformed records
                     continue
                     

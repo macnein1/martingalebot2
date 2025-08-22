@@ -7,9 +7,12 @@ from __future__ import annotations
 import hashlib
 import json
 import numpy as np
+import time
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional, Tuple
 import math
+
+from ui.utils.structured_logging import Events, eval_logger, LogContext
 
 
 def _ensure_json_serializable(obj):
@@ -128,6 +131,20 @@ def evaluation_function(
     Returns complete dict with all required outputs, always JSON-serializable.
     Never throws exceptions - returns error state in dict if needed.
     """
+    start_time = time.time()
+    
+    # Log evaluation call
+    eval_logger.event(
+        Events.EVAL_CALL,
+        overlap=overlap_pct,
+        orders=num_orders,
+        wave_pattern=wave_pattern,
+        alpha=alpha,
+        beta=beta,
+        gamma=gamma,
+        lambda_penalty=lambda_penalty
+    )
+    
     try:
         # Generate random parameters
         rng = np.random.default_rng(seed)
@@ -282,6 +299,19 @@ def evaluation_function(
         penalty_sum = sum(penalties.values())
         score = alpha * max_need + beta * var_need + gamma * tail + lambda_penalty * penalty_sum
         
+        # Log successful evaluation
+        duration_ms = (time.time() - start_time) * 1000
+        eval_logger.event(
+            Events.EVAL_RETURN,
+            score=float(score),
+            max_need=float(max_need),
+            var_need=float(var_need),
+            tail=float(tail),
+            duration_ms=duration_ms,
+            sanity_violations=sum(1 for v in sanity.values() if v),
+            penalty_sum=penalty_sum
+        )
+        
         # Return complete dict exactly as specified in README
         return {
             "score": float(score),
@@ -296,6 +326,16 @@ def evaluation_function(
         }
         
     except Exception as e:
+        # Log evaluation error
+        duration_ms = (time.time() - start_time) * 1000
+        eval_logger.event(
+            Events.EVAL_ERROR,
+            error=str(e),
+            duration_ms=duration_ms,
+            overlap=overlap_pct,
+            orders=num_orders
+        )
+        
         # Never throw - return error state as complete dict
         return {
             "score": float("inf"),

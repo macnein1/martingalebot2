@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import time
 import logging
+import traceback
 from dataclasses import dataclass
 from typing import Dict, List, Any, Optional, Tuple, Callable
 import numpy as np
@@ -13,6 +14,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from martingale_lab.optimizer.evaluation_engine import evaluation_function
 from martingale_lab.storage.experiments_store import ExperimentsStore
+from ui.utils.structured_logging import Events, orch_logger, LogContext, generate_run_id, create_crash_snapshot
+from ui.utils.constants import Status
 
 
 @dataclass
@@ -60,10 +63,14 @@ class DCAConfig:
 class DCAOrchestrator:
     """Main orchestrator for DCA optimization with new evaluation contract."""
     
-    def __init__(self, config: DCAConfig, store: Optional[ExperimentsStore] = None):
+    def __init__(self, config: DCAConfig, store: Optional[ExperimentsStore] = None, run_id: Optional[str] = None):
         self.config = config
         self.store = store or ExperimentsStore()
-        self.logger = logging.getLogger(__name__)
+        self.logger = orch_logger
+        self.run_id = run_id or generate_run_id()
+        
+        # Set context for logging
+        LogContext.set_run_id(self.run_id)
         
         # State tracking
         self.current_experiment_id: Optional[int] = None
@@ -81,12 +88,18 @@ class DCAOrchestrator:
             "batches_completed": 0,
             "early_stopped": False,
             "sanity_violations": 0,
-            "wave_pattern_rewards": 0
+            "wave_pattern_rewards": 0,
+            "evals_total": 0,
+            "evals_ok": 0,
+            "evals_failed": 0,
+            "pruned": 0,
+            "saved_rows": 0
         }
     
     def create_experiment(self, notes: Optional[str] = None) -> int:
         """Create a new experiment in the database."""
         config_dict = {
+            "run_id": self.run_id,
             "overlap_min": self.config.overlap_min,
             "overlap_max": self.config.overlap_max,
             "orders_min": self.config.orders_min,
@@ -100,7 +113,9 @@ class DCAOrchestrator:
             "notes": notes or "DCA optimization with new evaluation contract"
         }
         
-        self.current_experiment_id = self.store.create_experiment("DCAOrchestrator", config_dict)
+        self.current_experiment_id = self.store.create_experiment("DCAOrchestrator", config_dict, self.run_id)
+        LogContext.set_exp_id(self.current_experiment_id)
+        
         return self.current_experiment_id
     
     def generate_random_parameters(self, n_samples: int) -> List[Dict[str, Any]]:
@@ -138,8 +153,16 @@ class DCAOrchestrator:
     
     def evaluate_candidate(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Evaluate a single candidate using the new evaluation contract."""
+        self.stats["evals_total"] += 1
+        
         try:
             result = evaluation_function(**params)
+            
+            # Check if evaluation was successful
+            if result.get("score", float("inf")) == float("inf"):
+                self.stats["evals_failed"] += 1
+            else:
+                self.stats["evals_ok"] += 1
             
             # Add parameter info and stable_id
             import hashlib
@@ -167,19 +190,32 @@ class DCAOrchestrator:
             return result
             
         except Exception as e:
-            self.logger.error(f"Evaluation failed for params {params}: {e}")
+            self.stats["evals_failed"] += 1
+            
+            # Log evaluation error with crash snapshot
+            error_msg = str(e)
+            crash_file = create_crash_snapshot(self.run_id, params, error_msg)
+            
+            self.logger.event(
+                Events.EVAL_ERROR,
+                error=error_msg,
+                crash_file=crash_file,
+                overlap=params.get("overlap_pct"),
+                orders=params.get("num_orders")
+            )
+            
             return {
                 "score": float("inf"),
                 "max_need": float("inf"),
                 "var_need": float("inf"),
                 "tail": float("inf"),
                 "schedule": {},
-                "sanity": {"max_need_mismatch": True, "collapse_indents": True, "tail_overflow": True},
+                "sanity": {"max_need_mismatch": True, "collapse_indents": True, "tail_overflow": True, "error": True, "reason": error_msg},
                 "diagnostics": {"wci": 0.0, "sign_flips": 0, "gini": 1.0, "entropy": 0.0},
                 "penalties": {},
                 "params": params,
                 "stable_id": None,
-                "error": str(e)
+                "error": error_msg
             }
     
     def evaluate_batch_parallel(self, param_batch: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -274,15 +310,30 @@ class DCAOrchestrator:
                         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
                         notes: Optional[str] = None) -> Dict[str, Any]:
         """Run the complete DCA optimization process."""
-        self.logger.info("Starting DCA optimization with new evaluation contract")
-        
         # Initialize experiment
         exp_id = self.create_experiment(notes)
         self.start_time = time.time()
         
+        # Log orchestrator start with config snapshot
+        self.logger.event(
+            Events.ORCH_START,
+            adapter="DCAOrchestrator",
+            overlap_range=f"{self.config.overlap_min}-{self.config.overlap_max}",
+            orders_range=f"{self.config.orders_min}-{self.config.orders_max}",
+            alpha=self.config.alpha,
+            beta=self.config.beta,
+            gamma=self.config.gamma,
+            lambda_penalty=self.config.lambda_penalty,
+            wave_pattern=self.config.wave_pattern,
+            tail_cap=self.config.tail_cap,
+            n_candidates_per_batch=self.config.n_candidates_per_batch,
+            max_batches=self.config.max_batches
+        )
+        
         try:
             for batch_idx in range(self.config.max_batches):
                 batch_start = time.time()
+                LogContext.set_batch_idx(batch_idx)
                 
                 # Generate parameters for this batch
                 param_batch = self.generate_random_parameters(self.config.n_candidates_per_batch)
@@ -292,7 +343,19 @@ class DCAOrchestrator:
                 self.total_evaluations += len(batch_results)
                 
                 # Apply early pruning
+                pre_prune_count = len(batch_results)
                 pruned_results = self.early_pruning(batch_results)
+                post_prune_count = len(pruned_results)
+                
+                if pre_prune_count > post_prune_count:
+                    pruned_count = pre_prune_count - post_prune_count
+                    self.stats["pruned"] += pruned_count
+                    self.logger.event(
+                        Events.ORCH_PRUNE,
+                        pruned=pruned_count,
+                        kept=post_prune_count,
+                        total=pre_prune_count
+                    )
                 
                 # Update best candidates
                 self.update_best_candidates(pruned_results)

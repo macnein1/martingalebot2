@@ -1,192 +1,200 @@
 """
-Bridge module between Streamlit UI and background optimization runner.
-Starts/stops background orchestrator, exposes validation and status helpers.
+Optimization Bridge for UI Integration
+Provides background threading and proper logging for DCA optimization.
 """
-import sys
-import os
-import json
+from __future__ import annotations
+
+import threading
 import time
-import logging
 from typing import Dict, Any, Optional, Callable
-from pathlib import Path
-from uuid import uuid4
-from datetime import datetime
-from threading import Thread, Event
+from concurrent.futures import ThreadPoolExecutor
 
-from ui.utils.constants import DB_PATH
-from ui.utils.logging_buffer import ensure_ring_handler
-from ui.utils.orchestrator_runner import BackgroundOrchestrator, RunnerConfig
-
-logger = logging.getLogger("mlab")
-ensure_ring_handler("mlab")
+from martingale_lab.orchestrator.dca_orchestrator import DCAOrchestrator, DCAConfig
+from martingale_lab.storage.experiments_store import ExperimentsStore
+from ui.utils.structured_logging import Events, ui_logger, LogContext, generate_run_id
+from ui.utils.constants import DB_PATH, Status
 
 
 class OptimizationBridge:
-    """Bridge owning the lifecycle of a background optimization job."""
+    """Bridge between UI and optimization backend."""
     
     def __init__(self):
-        self._thread: Optional[Thread] = None
-        self._stop_event: Optional[Event] = None
-        self._run_id: Optional[str] = None
-        self._last_error: Optional[str] = None
-        self.progress_callback: Optional[Callable] = None
-    
-    def set_progress_callback(self, callback: Callable):
-        """Set callback function for progress updates."""
-        self.progress_callback = callback
-    
-    def create_optimization_session(self, parameters: Dict[str, Any], 
-                                  max_iterations: int = 1000,
-                                  time_limit: float = 300.0) -> Dict[str, Any]:
-        """For compatibility with existing UI. No-op that returns a dummy session id."""
-        sid = f"session_{int(time.time())}"
-        return {'success': True, 'session_id': sid, 'message': 'Session stub created'}
-    
-    def start_optimization(self, parameters: Optional[Dict[str, Any]] = None, db_path: str = DB_PATH) -> Dict[str, Any]:
-        """Start background orchestrator and return run id."""
-        if self._thread and self._thread.is_alive():
-            return {'success': False, 'error': 'Already running', 'message': 'A job is already running'}
+        """Initialize optimization bridge."""
+        self.current_run_id: Optional[str] = None
+        self.current_thread: Optional[threading.Thread] = None
+        self.stop_event = threading.Event()
+        self.is_running = False
+        
+    def start_optimization(self, params: Dict[str, Any], db_path: str = DB_PATH) -> Dict[str, Any]:
+        """
+        Start optimization in background thread.
+        
+        Args:
+            params: Optimization parameters
+            db_path: Database path
+            
+        Returns:
+            Dict with success status and run_id
+        """
+        if self.is_running:
+            return {"success": False, "error": "Optimization already running"}
+        
         try:
-            params = parameters or {}
-            self._run_id = datetime.utcnow().strftime("%Y%m%d-%H%M%S") + "-" + uuid4().hex[:6]
-            self._stop_event = Event()
-            self._last_error = None
-
-            cfg = RunnerConfig(
-                min_overlap=float(params.get('min_overlap', 1.0)),
-                max_overlap=float(params.get('max_overlap', 10.0)),
-                min_order=int(params.get('min_order', 3)),
-                max_order=int(params.get('max_order', 8)),
-                db_path=db_path,
+            # Generate run ID
+            run_id = generate_run_id()
+            self.current_run_id = run_id
+            
+            # Log UI start event
+            ui_logger.event(
+                Events.UI_CLICK_START,
+                run_id=run_id,
+                overlap_range=f"{params.get('overlap_min', 0)}-{params.get('overlap_max', 0)}",
+                orders_range=f"{params.get('orders_min', 0)}-{params.get('orders_max', 0)}",
+                wave_pattern=params.get('wave_pattern', False)
             )
-            runner = BackgroundOrchestrator(cfg, stop_event=self._stop_event)
-
-            def _target():
-                logger.info("THREAD.START run_id=%s", self._run_id)
+            
+            # Create configuration
+            config = DCAConfig(
+                overlap_min=params.get('overlap_min', 10.0),
+                overlap_max=params.get('overlap_max', 30.0),
+                orders_min=params.get('orders_min', 5),
+                orders_max=params.get('orders_max', 15),
+                alpha=params.get('alpha', 0.5),
+                beta=params.get('beta', 0.3),
+                gamma=params.get('gamma', 0.2),
+                lambda_penalty=params.get('lambda_penalty', 0.1),
+                wave_pattern=params.get('wave_pattern', True),
+                tail_cap=params.get('tail_cap', 0.40),
+                n_candidates_per_batch=params.get('n_candidates_per_batch', 1000),
+                max_batches=params.get('max_batches', 100),
+                n_workers=params.get('n_workers', 4),
+                random_seed=params.get('random_seed', None)
+            )
+            
+            # Start optimization in background thread
+            def run_optimization():
                 try:
-                    runner.run(run_id=self._run_id)
-                except Exception:
-                    import traceback
-                    self._last_error = traceback.format_exc()
-                finally:
-                    logger.info("THREAD.END run_id=%s", self._run_id)
-
-            self._thread = Thread(target=_target, daemon=True)
-            self._thread.start()
-            return {'success': True, 'run_id': self._run_id}
+                    LogContext.set_run_id(run_id)
+                    
+                    store = ExperimentsStore(db_path)
+                    orchestrator = DCAOrchestrator(config, store, run_id)
+                    
+                    # Run optimization
+                    results = orchestrator.run_optimization(notes=params.get('notes', ''))
+                    
+                    self.is_running = False
+                    
+                except Exception as e:
+                    ui_logger.event(
+                        Events.ORCH_ERROR,
+                        run_id=run_id,
+                        error=str(e)
+                    )
+                    self.is_running = False
+            
+            self.current_thread = threading.Thread(target=run_optimization, daemon=True)
+            self.current_thread.start()
+            self.is_running = True
+            
+            return {"success": True, "run_id": run_id}
+            
         except Exception as e:
-            logger.exception("start_optimization failed")
-            return {'success': False, 'error': str(e)}
+            ui_logger.event(
+                Events.UI_CLICK_START,
+                error=str(e),
+                status="failed"
+            )
+            return {"success": False, "error": str(e)}
     
     def stop_optimization(self) -> Dict[str, Any]:
-        """Signal stop and wait for the background thread to finish."""
-        if not self._thread:
-            return {'success': False, 'error': 'No job running'}
+        """
+        Stop current optimization.
+        
+        Returns:
+            Dict with success status
+        """
         try:
-            assert self._stop_event is not None
-            self._stop_event.set()
-            self._thread.join(timeout=10.0)
-            stopped = not self._thread.is_alive()
-            return {'success': True, 'stopped': stopped}
+            if not self.is_running:
+                return {"success": False, "error": "No optimization running"}
+            
+            # Set stop event
+            self.stop_event.set()
+            
+            # Wait for thread to finish (with timeout)
+            if self.current_thread and self.current_thread.is_alive():
+                self.current_thread.join(timeout=5.0)
+            
+            self.is_running = False
+            
+            ui_logger.event(
+                Events.UI_CLICK_STOP,
+                run_id=self.current_run_id,
+                status="stopped"
+            )
+            
+            return {"success": True}
+            
         except Exception as e:
-            logger.exception("stop_optimization failed")
-            return {'success': False, 'error': str(e)}
+            ui_logger.event(
+                Events.UI_CLICK_STOP,
+                error=str(e),
+                status="failed"
+            )
+            return {"success": False, "error": str(e)}
     
     def get_optimization_status(self) -> Dict[str, Any]:
-        """Report background thread status."""
-        try:
-            status = 'idle'
-            if self._thread:
-                if self._last_error is not None:
-                    status = 'error'
-                else:
-                    status = 'running' if self._thread.is_alive() else 'completed'
-            data = {'status': status, 'run_id': self._run_id}
-            if self._last_error is not None:
-                data['error'] = self._last_error
-            return {'success': True, 'data': data}
-        except Exception as e:
-            logger.exception("get_optimization_status failed")
-            return {'success': False, 'error': str(e)}
+        """
+        Get current optimization status.
+        
+        Returns:
+            Dict with status information
+        """
+        if not self.is_running:
+            return {"success": True, "data": {"status": "completed"}}
+        
+        return {"success": True, "data": {"status": "running", "run_id": self.current_run_id}}
     
-    def get_results(self) -> Dict[str, Any]:
-        """Results are persisted in DB; this returns status only."""
-        try:
-            completed = self._thread is not None and not self._thread.is_alive()
-            return {'success': True, 'results': {}, 'statistics': {}, 'completed': completed}
-        except Exception as e:
-            logger.exception("get_results failed")
-            return {'success': False, 'error': str(e)}
-    
-    def cleanup_session(self) -> Dict[str, Any]:
-        self._thread = None
-        self._stop_event = None
-        self._run_id = None
-        return {'success': True}
-    
-    def validate_parameters(self, parameters: Dict[str, Any]) -> Dict[str, Any]:
-        """Validate optimization parameters."""
+    def validate_parameters(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Validate optimization parameters.
+        
+        Args:
+            params: Parameters to validate
+            
+        Returns:
+            Dict with validation result
+        """
         try:
             # Basic validation
-            if parameters['min_overlap'] >= parameters['max_overlap']:
-                return {
-                    'success': False,
-                    'error': 'Min overlap must be less than max overlap',
-                    'message': 'Invalid overlap parameters'
-                }
+            overlap_min = params.get('overlap_min', 0)
+            overlap_max = params.get('overlap_max', 0)
+            orders_min = params.get('orders_min', 0)
+            orders_max = params.get('orders_max', 0)
             
-            if parameters['min_order'] >= parameters['max_order']:
-                return {
-                    'success': False,
-                    'error': 'Min order must be less than max order',
-                    'message': 'Invalid order parameters'
-                }
+            if overlap_min >= overlap_max:
+                return {"success": False, "error": "overlap_min must be < overlap_max"}
             
-            if not (0 <= parameters['min_overlap'] <= 100):
-                return {
-                    'success': False,
-                    'error': 'Min overlap must be between 0 and 100',
-                    'message': 'Invalid min overlap value'
-                }
+            if orders_min >= orders_max:
+                return {"success": False, "error": "orders_min must be < orders_max"}
             
-            if not (0 <= parameters['max_overlap'] <= 100):
-                return {
-                    'success': False,
-                    'error': 'Max overlap must be between 0 and 100',
-                    'message': 'Invalid max overlap value'
-                }
+            if overlap_min <= 0 or overlap_max > 100:
+                return {"success": False, "error": "Overlap percentages must be in (0, 100]"}
             
-            if not (1 <= parameters['min_order'] <= 50):
-                return {
-                    'success': False,
-                    'error': 'Min order must be between 1 and 50',
-                    'message': 'Invalid min order value'
-                }
+            if orders_min < 2 or orders_max > 50:
+                return {"success": False, "error": "Orders must be in [2, 50]"}
             
-            if not (1 <= parameters['max_order'] <= 50):
-                return {
-                    'success': False,
-                    'error': 'Max order must be between 1 and 50',
-                    'message': 'Invalid max order value'
-                }
+            # Weight validation
+            alpha = params.get('alpha', 0.5)
+            beta = params.get('beta', 0.3)
+            gamma = params.get('gamma', 0.2)
             
-            return {
-                'success': True,
-                'message': 'Parameters validated successfully'
-            }
+            if not (0 <= alpha <= 1 and 0 <= beta <= 1 and 0 <= gamma <= 1):
+                return {"success": False, "error": "Weights must be in [0, 1]"}
             
-        except KeyError as e:
-            return {
-                'success': False,
-                'error': f'Missing parameter: {e}',
-                'message': 'Required parameter missing'
-            }
+            return {"success": True}
+            
         except Exception as e:
-            return {
-                'success': False,
-                'error': str(e),
-                'message': 'Parameter validation failed'
-            }
+            return {"success": False, "error": str(e)}
 
 
 # Global bridge instance
