@@ -1,117 +1,437 @@
+"""
+Results Section UI - DCA/Martingale "İşlemden En Hızlı Çıkış" Results Display
+Shows Top-N candidates with bullets format, NeedPct sparklines, sanity badges, and filtering.
+"""
 import streamlit as st
-from ui.utils.config import get_icon_html
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import plotly.express as px
+from typing import Dict, List, Any, Optional
+import json
+import sqlite3
 
-def render_results_section():
-    """Render the final results section"""
-    st.markdown(f"""
-    <div class="section-header">
-        {get_icon_html("document")} Son Sonuçlar
-    </div>
-    """, unsafe_allow_html=True)
+
+def create_needpct_sparkline(needpct: List[float], width: int = 100, height: int = 30) -> str:
+    """Create a simple ASCII sparkline for NeedPct values."""
+    if not needpct or len(needpct) == 0:
+        return "─" * 10
     
-    # Check if optimization has been completed
-    if 'optimization_results' not in st.session_state:
-        st.info("Henüz optimizasyon sonucu bulunmuyor.")
-        return
+    min_val = min(needpct)
+    max_val = max(needpct)
+    if max_val == min_val:
+        return "─" * len(needpct)
     
-    results = st.session_state.optimization_results
-    statistics = st.session_state.get('optimization_statistics', {})
+    # Normalize to 0-7 range for spark characters
+    spark_chars = "▁▂▃▄▅▆▇█"
+    normalized = [(val - min_val) / (max_val - min_val) * 7 for val in needpct]
+    sparkline = "".join([spark_chars[min(7, int(val))] for val in normalized])
     
-    # Display results in a structured way
-    col1, col2 = st.columns(2)
+    return sparkline
+
+
+def format_bullets(schedule: Dict[str, Any]) -> List[str]:
+    """
+    Format bullets exactly as specified:
+    1. Emir: Indent %0.00 Volume %x.xx (no martingale, first order) — NeedPct %n1
+    2. Emir: Indent %p2 Volume %v2 (Martingale %m2) — NeedPct %n2
+    """
+    indent_pct = schedule.get("indent_pct", [])
+    volume_pct = schedule.get("volume_pct", [])
+    martingale_pct = schedule.get("martingale_pct", [])
+    needpct = schedule.get("needpct", [])
     
-    with col1:
-        st.markdown("### En İyi Parametreler")
-        if 'results' in results and results['results']:
-            best_result = results['results'][0]  # First result is typically the best
-            best_params = best_result.get('params', {})
-            st.json({
-                "Min Overlap": f"{best_params.get('min_overlap', 0):.2f}%",
-                "Max Overlap": f"{best_params.get('max_overlap', 0):.2f}%",
-                "Min Order": best_params.get('min_order', 0),
-                "Max Order": best_params.get('max_order', 0),
-                "Risk Factor": f"{best_params.get('risk_factor', 1.0):.2f}",
-                "Smoothing Factor": f"{best_params.get('smoothing_factor', 0.1):.3f}",
-                "Tail Weight": f"{best_params.get('tail_weight', 0.2):.2f}"
-            })
+    bullets = []
+    n = len(volume_pct)
+    
+    for i in range(n):
+        indent = indent_pct[i] if i < len(indent_pct) else 0.0
+        volume = volume_pct[i] if i < len(volume_pct) else 0.0
+        martingale = martingale_pct[i] if i < len(martingale_pct) else 0.0
+        need = needpct[i] if i < len(needpct) else 0.0
+        
+        if i == 0:
+            bullet = f"{i+1}. Emir: Indent %{indent:.2f}  Volume %{volume:.2f}  (no martingale, first order) — NeedPct %{need:.2f}"
         else:
-            st.info("Parametre bilgisi mevcut değil.")
+            bullet = f"{i+1}. Emir: Indent %{indent:.2f}  Volume %{volume:.2f}  (Martingale %{martingale:.2f}) — NeedPct %{need:.2f}"
+        
+        bullets.append(bullet)
     
-    with col2:
-        st.markdown("### Performans Metrikleri")
-        if 'results' in results and results['results']:
-            best_result = results['results'][0]
-            best_score = best_result.get('score', 0)
-            breakdown = best_result.get('breakdown', {})
-            
-            st.metric("En İyi Skor", f"{best_score:.4f}")
-            st.metric("Max Score", f"{breakdown.get('max_score', 0):.4f}")
-            st.metric("Variance Score", f"{breakdown.get('variance_score', 0):.4f}")
-            st.metric("Tail Score", f"{breakdown.get('tail_score', 0):.4f}")
-        else:
-            st.info("Performans metrikleri mevcut değil.")
+    return bullets
+
+
+def create_sanity_badges(sanity: Dict[str, bool]) -> str:
+    """Create colored badges for sanity check flags."""
+    badges = []
     
-    # Statistics section
-    if statistics:
-        st.markdown("### Optimizasyon İstatistikleri")
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.metric("Toplam Değerlendirme", statistics.get('total_evaluations', 0))
-            st.metric("Toplam Süre", f"{statistics.get('total_time', 0):.2f}s")
-        
-        with col2:
-            st.metric("Saniyede Değerlendirme", f"{statistics.get('evaluations_per_second', 0):.1f}")
-            st.metric("Ortalama Süre", f"{statistics.get('average_time_per_evaluation', 0):.4f}s")
-        
-        with col3:
-            st.metric("En İyi Skor", f"{statistics.get('best_score', 0):.4f}")
-            st.metric("Geçen Süre", f"{statistics.get('elapsed_time', 0):.2f}s")
+    if sanity.get("max_need_mismatch", False):
+        badges.append("🔴 Max Need Mismatch")
+    if sanity.get("collapse_indents", False):
+        badges.append("🟡 Collapsed Indents")
+    if sanity.get("tail_overflow", False):
+        badges.append("🟠 Tail Overflow")
     
-    # Detailed results table
-    st.markdown("### Detaylı Sonuçlar")
-    if 'results' in results and results['results']:
-        # Create a dataframe from the results
-        import pandas as pd
-        
-        data = []
-        for i, result in enumerate(results['results'][:10]):  # Show top 10 results
-            params = result.get('params', {})
-            breakdown = result.get('breakdown', {})
-            
-            data.append({
-                'Rank': i + 1,
-                'Score': f"{result.get('score', 0):.4f}",
-                'Min Overlap': f"{params.get('min_overlap', 0):.2f}%",
-                'Max Overlap': f"{params.get('max_overlap', 0):.2f}%",
-                'Min Order': params.get('min_order', 0),
-                'Max Order': params.get('max_order', 0),
-                'Max Score': f"{breakdown.get('max_score', 0):.4f}",
-                'Variance Score': f"{breakdown.get('variance_score', 0):.4f}",
-                'Tail Score': f"{breakdown.get('tail_score', 0):.4f}",
-                'Penalty Total': f"{breakdown.get('penalty_total', 0):.4f}"
-            })
-        
-        if data:
-            df = pd.DataFrame(data)
-            st.dataframe(df, use_container_width=True)
-        else:
-            st.info("Detaylı sonuç verisi mevcut değil.")
-    else:
-        st.info("Detaylı sonuçlar henüz mevcut değil.")
+    if not badges:
+        badges.append("✅ All Checks Pass")
     
-    # Export options
-    st.markdown("### Sonuçları Dışa Aktar")
+    return " | ".join(badges)
+
+
+def create_needpct_chart(needpct: List[float], title: str = "NeedPct Progression") -> go.Figure:
+    """Create detailed NeedPct chart for expanded view."""
+    if not needpct:
+        fig = go.Figure()
+        fig.add_annotation(text="No data available", xref="paper", yref="paper", x=0.5, y=0.5)
+        return fig
+    
+    fig = go.Figure()
+    
+    # Main line
+    fig.add_trace(go.Scatter(
+        x=list(range(1, len(needpct) + 1)),
+        y=needpct,
+        mode='lines+markers',
+        name='NeedPct',
+        line=dict(color='#1f77b4', width=3),
+        marker=dict(size=8)
+    ))
+    
+    # Add zero line
+    fig.add_hline(y=0, line_dash="dash", line_color="gray", annotation_text="Break-even")
+    
+    fig.update_layout(
+        title=title,
+        xaxis_title="Order Number",
+        yaxis_title="NeedPct (%)",
+        height=300,
+        showlegend=False,
+        template="plotly_white"
+    )
+    
+    return fig
+
+
+def create_volume_distribution_chart(schedule: Dict[str, Any]) -> go.Figure:
+    """Create volume distribution chart with indent and martingale info."""
+    volume_pct = schedule.get("volume_pct", [])
+    indent_pct = schedule.get("indent_pct", [])
+    martingale_pct = schedule.get("martingale_pct", [])
+    
+    if not volume_pct:
+        fig = go.Figure()
+        fig.add_annotation(text="No data available", xref="paper", yref="paper", x=0.5, y=0.5)
+        return fig
+    
+    fig = go.Figure()
+    
+    # Volume bars
+    fig.add_trace(go.Bar(
+        x=list(range(1, len(volume_pct) + 1)),
+        y=volume_pct,
+        name='Volume %',
+        marker_color='lightblue',
+        text=[f"{v:.1f}%" for v in volume_pct],
+        textposition='auto'
+    ))
+    
+    # Indent line (secondary y-axis)
+    if indent_pct:
+        fig.add_trace(go.Scatter(
+            x=list(range(1, len(indent_pct) + 1)),
+            y=indent_pct,
+            mode='lines+markers',
+            name='Indent %',
+            yaxis='y2',
+            line=dict(color='red', dash='dot'),
+            marker=dict(size=6)
+        ))
+    
+    # Martingale line (secondary y-axis)
+    if martingale_pct:
+        fig.add_trace(go.Scatter(
+            x=list(range(1, len(martingale_pct) + 1)),
+            y=martingale_pct,
+            mode='lines+markers',
+            name='Martingale %',
+            yaxis='y2',
+            line=dict(color='green', dash='dash'),
+            marker=dict(size=6)
+        ))
+    
+    fig.update_layout(
+        title="Volume Distribution with Indent & Martingale",
+        xaxis_title="Order Number",
+        yaxis=dict(title="Volume %", side="left"),
+        yaxis2=dict(title="Indent/Martingale %", side="right", overlaying="y"),
+        height=400,
+        template="plotly_white"
+    )
+    
+    return fig
+
+
+def display_results_filters():
+    """Display filtering controls."""
+    st.subheader("🔍 Filters")
+    
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        if st.button("CSV Olarak İndir"):
-            st.info("CSV indirme özelliği eklenecek.")
+        max_score = st.number_input("Max Score (J)", min_value=0.0, value=100.0, step=1.0)
+        overlap_range = st.slider("Overlap % Range", 5.0, 50.0, (10.0, 30.0), step=0.5)
     
     with col2:
-        if st.button("JSON Olarak İndir"):
-            st.info("JSON indirme özelliği eklenecek.")
+        max_need_range = st.slider("Max Need % Range", 0.0, 50.0, (0.0, 20.0), step=0.5)
+        orders_range = st.slider("Orders Range", 2, 30, (5, 15))
     
     with col3:
-        if st.button("Rapor Oluştur"):
-            st.info("Rapor oluşturma özelliği eklenecek.")
+        wave_pattern_only = st.checkbox("Wave Pattern Only")
+        pareto_only = st.checkbox("Pareto Optimal Only")
+    
+    return {
+        "max_score": max_score,
+        "overlap_min": overlap_range[0],
+        "overlap_max": overlap_range[1],
+        "min_max_need": max_need_range[0],
+        "max_max_need": max_need_range[1],
+        "orders_min": orders_range[0],
+        "orders_max": orders_range[1],
+        "wave_pattern_only": wave_pattern_only,
+        "pareto_only": pareto_only
+    }
+
+
+def display_summary_card(summary: Dict[str, Any]):
+    """Display experiment summary card."""
+    st.subheader("📊 Experiment Summary")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("Best Score", f"{summary.get('best_score', 0):.3f}")
+        st.metric("Total Results", f"{summary.get('statistics', {}).get('total_results', 0):,}")
+    
+    with col2:
+        stats = summary.get('statistics', {})
+        st.metric("Min Max Need", f"{stats.get('min_max_need', 0):.2f}%")
+        st.metric("Avg Max Need", f"{stats.get('avg_max_need', 0):.2f}%")
+    
+    with col3:
+        st.metric("Avg Var Need", f"{stats.get('avg_var_need', 0):.3f}")
+        st.metric("Avg Tail", f"{stats.get('avg_tail', 0):.3f}")
+    
+    with col4:
+        config = summary.get('config', {})
+        st.metric("Orders Range", f"{config.get('orders_min', 0)}-{config.get('orders_max', 0)}")
+        st.metric("Overlap Range", f"{config.get('overlap_min', 0):.1f}%-{config.get('overlap_max', 0):.1f}%")
+
+
+def display_results_table(results: List[Dict[str, Any]], limit: int = 50):
+    """Display the main results table with expandable rows."""
+    if not results:
+        st.warning("No results to display.")
+        return
+    
+    st.subheader(f"🏆 Top {min(len(results), limit)} Results")
+    
+    # Prepare table data
+    table_data = []
+    for i, result in enumerate(results[:limit]):
+        schedule = result.get("schedule", {})
+        sanity = result.get("sanity", {})
+        diagnostics = result.get("diagnostics", {})
+        needpct = schedule.get("needpct", [])
+        
+        row = {
+            "Rank": i + 1,
+            "Score (J)": f"{result.get('score', 0):.3f}",
+            "Max Need": f"{result.get('max_need', 0):.2f}%",
+            "Var Need": f"{result.get('var_need', 0):.3f}",
+            "Tail": f"{result.get('tail', 0):.3f}",
+            "WCI": f"{diagnostics.get('wci', 0):.3f}",
+            "Sign Flips": diagnostics.get('sign_flips', 0),
+            "NeedPct Sparkline": create_needpct_sparkline(needpct),
+            "Sanity": create_sanity_badges(sanity),
+            "Details": f"expand_{i}"  # Placeholder for expand button
+        }
+        table_data.append(row)
+    
+    # Display table
+    df = pd.DataFrame(table_data)
+    
+    # Use streamlit's native table with selection
+    selected_rows = st.dataframe(
+        df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "NeedPct Sparkline": st.column_config.TextColumn("NeedPct ▁▂▃▄▅▆▇█"),
+            "Sanity": st.column_config.TextColumn("Sanity Checks"),
+        }
+    )
+    
+    # Expandable details sections
+    st.subheader("📋 Detailed View")
+    
+    selected_index = st.selectbox(
+        "Select result to view details:",
+        range(min(len(results), limit)),
+        format_func=lambda x: f"Rank {x+1}: Score {results[x].get('score', 0):.3f}"
+    )
+    
+    if selected_index is not None and selected_index < len(results):
+        result = results[selected_index]
+        display_result_detail(result)
+
+
+def display_result_detail(result: Dict[str, Any]):
+    """Display detailed view of a single result."""
+    schedule = result.get("schedule", {})
+    sanity = result.get("sanity", {})
+    diagnostics = result.get("diagnostics", {})
+    penalties = result.get("penalties", {})
+    
+    # Summary metrics
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Score (J)", f"{result.get('score', 0):.3f}")
+    with col2:
+        st.metric("Max Need", f"{result.get('max_need', 0):.2f}%")
+    with col3:
+        st.metric("Var Need", f"{result.get('var_need', 0):.3f}")
+    with col4:
+        st.metric("Tail", f"{result.get('tail', 0):.3f}")
+    
+    # Bullets format
+    st.subheader("🎯 Order Bullets")
+    bullets = format_bullets(schedule)
+    for bullet in bullets:
+        st.text(bullet)
+    
+    # Charts
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        needpct = schedule.get("needpct", [])
+        fig_needpct = create_needpct_chart(needpct)
+        st.plotly_chart(fig_needpct, use_container_width=True)
+    
+    with col2:
+        fig_volume = create_volume_distribution_chart(schedule)
+        st.plotly_chart(fig_volume, use_container_width=True)
+    
+    # Additional metrics
+    st.subheader("📈 Diagnostics")
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("WCI", f"{diagnostics.get('wci', 0):.3f}")
+        st.caption("Weight Center Index (0=early, 1=late)")
+    
+    with col2:
+        st.metric("Sign Flips", diagnostics.get('sign_flips', 0))
+        st.caption("NeedPct trend changes")
+    
+    with col3:
+        st.metric("Gini", f"{diagnostics.get('gini', 0):.3f}")
+        st.caption("Volume concentration")
+    
+    with col4:
+        st.metric("Entropy", f"{diagnostics.get('entropy', 0):.3f}")
+        st.caption("Volume diversity")
+    
+    # Exit speed score
+    needpct = schedule.get("needpct", [])
+    if needpct:
+        avg_need = np.mean(needpct)
+        exit_speed = 1.0 / (1.0 + avg_need / 100.0)  # Normalize to [0,1]
+        st.metric("Exit Speed Score", f"{exit_speed:.3f}")
+        st.caption("1 / (1 + mean(needpct/100)) - Higher is faster exit")
+    
+    # Sanity checks
+    st.subheader("⚠️ Sanity Checks")
+    sanity_badges = create_sanity_badges(sanity)
+    st.write(sanity_badges)
+    
+    # Penalties breakdown
+    if penalties:
+        st.subheader("⚖️ Penalties Breakdown")
+        penalty_df = pd.DataFrame([
+            {"Penalty": k.replace("P_", "").title(), "Value": f"{v:.3f}"}
+            for k, v in penalties.items()
+        ])
+        st.dataframe(penalty_df, hide_index=True)
+    
+    # Download options
+    st.subheader("💾 Download")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # CSV download for schedule
+        schedule_df = pd.DataFrame({
+            "Order": range(1, len(schedule.get("volume_pct", [])) + 1),
+            "Indent_Pct": schedule.get("indent_pct", []),
+            "Volume_Pct": schedule.get("volume_pct", []),
+            "Martingale_Pct": schedule.get("martingale_pct", []),
+            "NeedPct": schedule.get("needpct", []),
+            "Order_Price": schedule.get("order_prices", [])[1:] if len(schedule.get("order_prices", [])) > 1 else []
+        })
+        
+        csv_data = schedule_df.to_csv(index=False)
+        st.download_button(
+            "Download Schedule CSV",
+            csv_data,
+            f"dca_schedule_rank_{result.get('rank', 'unknown')}.csv",
+            "text/csv"
+        )
+    
+    with col2:
+        # JSON download for complete result
+        json_data = json.dumps(result, indent=2, ensure_ascii=False)
+        st.download_button(
+            "Download Full JSON",
+            json_data,
+            f"dca_result_rank_{result.get('rank', 'unknown')}.json",
+            "application/json"
+        )
+
+
+def render_results_section(experiment_id: Optional[int] = None):
+    """Main function to render the complete results section."""
+    st.header("🎯 DCA/Martingale Results - İşlemden En Hızlı Çıkış")
+    
+    # Import here to avoid circular imports
+    from martingale_lab.storage.experiments_store import ExperimentsStore
+    
+    store = ExperimentsStore()
+    
+    if experiment_id:
+        # Get experiment summary
+        summary = store.get_experiment_summary(experiment_id)
+        if summary:
+            display_summary_card(summary)
+        
+        # Display filters
+        filters = display_results_filters()
+        
+        # Get and display results
+        results = store.get_top_results(experiment_id=experiment_id, limit=100, filters=filters)
+        display_results_table(results)
+        
+    else:
+        st.info("Please select an experiment to view results.")
+        
+        # Show available experiments
+        with sqlite3.connect(store.db_path) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id, created_at, adapter, best_score, total_evals FROM experiments WHERE deleted = 0 ORDER BY created_at DESC LIMIT 10"
+            )
+            experiments = cur.fetchall()
+        
+        if experiments:
+            st.subheader("Recent Experiments")
+            exp_df = pd.DataFrame(experiments, columns=["ID", "Created", "Adapter", "Best Score", "Total Evals"])
+            st.dataframe(exp_df, hide_index=True)
+        else:
+            st.warning("No experiments found. Run an optimization first.")
