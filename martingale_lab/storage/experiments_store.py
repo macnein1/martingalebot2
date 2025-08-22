@@ -97,6 +97,8 @@ class ExperimentsStore:
                   max_need REAL NOT NULL,
                   var_need REAL NOT NULL,
                   tail REAL NOT NULL,
+                  shape_reward REAL,
+                  cvar80 REAL,
                   params_json TEXT NOT NULL,
                   schedule_json TEXT NOT NULL,
                   sanity_json TEXT NOT NULL,
@@ -200,17 +202,19 @@ class ExperimentsStore:
                 cur.execute(
                     """
                     INSERT INTO results (
-                        experiment_id, stable_id, score, max_need, var_need, tail,
+                        experiment_id, stable_id, score, max_need, var_need, tail, shape_reward, cvar80,
                         params_json, schedule_json, sanity_json, diagnostics_json, 
                         penalties_json, knobs_json, created_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(stable_id) DO UPDATE SET
                       experiment_id=excluded.experiment_id,
                       score=excluded.score,
                       max_need=excluded.max_need,
                       var_need=excluded.var_need,
                       tail=excluded.tail,
+                      shape_reward=excluded.shape_reward,
+                      cvar80=excluded.cvar80,
                       params_json=excluded.params_json,
                       schedule_json=excluded.schedule_json,
                       sanity_json=excluded.sanity_json,
@@ -226,6 +230,8 @@ class ExperimentsStore:
                         float(item.get("max_need", 0.0)),
                         float(item.get("var_need", 0.0)),
                         float(item.get("tail", 0.0)),
+                        float(item.get("shape_reward", 0.0)),
+                        float(item.get("cvar_need", 0.0)),  # Store as cvar80
                         json.dumps(_jsonify(params), separators=(",", ":"), ensure_ascii=False),
                         json.dumps(_jsonify(item.get("schedule", {})), separators=(",", ":"), ensure_ascii=False),
                         json.dumps(_jsonify(item.get("sanity", {})), separators=(",", ":"), ensure_ascii=False),

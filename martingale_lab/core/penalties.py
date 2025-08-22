@@ -1,457 +1,430 @@
 """
-Penalty functions for optimization constraints.
-Enhanced with practical defaults and comprehensive penalty system.
+Penalties and Rewards for DCA/Martingale Optimization
+Implements Gini, entropy, monotonicity, smoothness, and wave pattern calculations
+using numba-compatible pure NumPy functions.
 """
+from __future__ import annotations
+
 import numpy as np
-from typing import List, Tuple, Dict, Any, Optional
-from .types import Schedule
+from numba import njit
+from typing import Dict, Any, Optional
+import math
 
 
-# Practical default penalty weights
-DEFAULT_PENALTY_WEIGHTS = {
-    'penalty_gini': 0.5,        # Prevent concentration in single order
-    'penalty_entropy': 0.2,     # Encourage diversity
-    'penalty_monotone': 1.0,    # Enforce indent monotonicity (critical)
-    'penalty_step_smooth': 0.1, # Smooth NeedPct transitions
-    'penalty_tail_cap': 2.0,    # Limit last order volume
-    'penalty_extreme_vol': 1.5, # Prevent extreme volume values
-    'penalty_need_variance': 0.3 # Penalize high NeedPct variance
-}
-
-
-def monotone_violation(sequence: np.ndarray) -> float:
+@njit(cache=True, fastmath=True)
+def gini_coefficient(x: np.ndarray) -> float:
     """
-    Calculate monotonicity violation penalty.
-    Returns 0.0 if sequence is monotonically non-decreasing.
+    Calculate Gini coefficient for inequality measurement.
     
     Args:
-        sequence: Array to check for monotonicity
+        x: Array of values (e.g., volumes, martingales)
         
     Returns:
-        Violation penalty (0.0 if monotonic)
+        Gini coefficient [0,1] where 0=perfect equality, 1=maximum inequality
     """
-    if len(sequence) <= 1:
+    if x.size == 0:
         return 0.0
     
-    violations = 0.0
-    for i in range(len(sequence) - 1):
-        if sequence[i] > sequence[i + 1]:
-            violations += (sequence[i] - sequence[i + 1])
+    # Handle negative values by shifting
+    x_shifted = x - np.min(x) + 1e-12
     
-    return violations
-
-
-def tail_cap_penalty(volumes: np.ndarray, max_last_order_pct: float = 0.25) -> float:
-    """
-    Penalize if last order's volume exceeds maximum percentage.
+    # Sort values
+    x_sorted = np.sort(x_shifted)
+    n = len(x_sorted)
     
-    Args:
-        volumes: Volume array
-        max_last_order_pct: Maximum allowed percentage for last order
-        
-    Returns:
-        Penalty value
-    """
-    if len(volumes) == 0:
+    # Calculate Gini using the formula:
+    # G = (2 * sum(i * x_i) / (n * sum(x_i))) - (n + 1) / n
+    cumsum_x = np.cumsum(x_sorted)
+    total_sum = cumsum_x[-1]
+    
+    if total_sum <= 1e-12:
         return 0.0
     
-    last_volume_pct = volumes[-1]
-    if last_volume_pct > max_last_order_pct:
-        return (last_volume_pct - max_last_order_pct) * 10  # Strong penalty
+    # Weighted sum: sum(i * x_i) where i starts from 1
+    weighted_sum = 0.0
+    for i in range(n):
+        weighted_sum += (i + 1) * x_sorted[i]
     
-    return 0.0
+    gini = (2.0 * weighted_sum) / (n * total_sum) - (n + 1.0) / n
+    
+    return max(0.0, min(1.0, gini))
 
 
-def extreme_volume_penalty(volumes: np.ndarray, min_vol: float = 0.01, 
-                          max_vol: float = 0.5) -> float:
+@njit(cache=True, fastmath=True)
+def entropy_normalized(x: np.ndarray, eps: float = 1e-12) -> float:
     """
-    Penalize volumes outside reasonable bounds.
+    Calculate normalized entropy for diversity measurement.
     
     Args:
-        volumes: Volume array
-        min_vol: Minimum reasonable volume
-        max_vol: Maximum reasonable volume
+        x: Array of values (e.g., volumes)
+        eps: Small epsilon to avoid log(0)
         
     Returns:
-        Penalty for extreme volumes
+        Normalized entropy [0,1] where 0=no diversity, 1=maximum diversity
     """
+    if x.size <= 1:
+        return 0.0
+    
+    # Normalize to probabilities
+    x_sum = np.sum(x)
+    if x_sum <= eps:
+        return 0.0
+    
+    p = x / x_sum
+    
+    # Calculate entropy
+    entropy = 0.0
+    for i in range(len(p)):
+        if p[i] > eps:
+            entropy -= p[i] * math.log(p[i])
+    
+    # Normalize by maximum possible entropy (log(n))
+    max_entropy = math.log(len(p))
+    if max_entropy <= eps:
+        return 0.0
+    
+    return entropy / max_entropy
+
+
+@njit(cache=True, fastmath=True)
+def monotonicity_penalty(x: np.ndarray) -> float:
+    """
+    Calculate penalty for non-monotonic sequences.
+    
+    Args:
+        x: Array that should be monotonically increasing
+        
+    Returns:
+        Penalty value >= 0 (0 = perfectly monotonic)
+    """
+    if x.size <= 1:
+        return 0.0
+    
     penalty = 0.0
+    for i in range(1, len(x)):
+        if x[i] < x[i-1]:
+            penalty += x[i-1] - x[i]
     
-    for vol in volumes:
-        if vol < min_vol:
-            penalty += (min_vol - vol) * 5  # Penalty for too small
-        elif vol > max_vol:
-            penalty += (vol - max_vol) * 5  # Penalty for too large
+    # Normalize by the range of x
+    x_range = np.max(x) - np.min(x)
+    if x_range > 1e-12:
+        penalty = penalty / x_range
     
     return penalty
 
 
-def need_pct_smoothness_penalty(need_pct_values: np.ndarray, 
-                               max_jump_pct: float = 5.0) -> float:
+@njit(cache=True, fastmath=True)
+def smoothness_penalty(x: np.ndarray) -> float:
     """
-    Penalize large jumps in NeedPct values between consecutive orders.
+    Calculate penalty for non-smooth (jumpy) sequences.
     
     Args:
-        need_pct_values: Array of NeedPct values
-        max_jump_pct: Maximum allowed jump between consecutive values
+        x: Array to check for smoothness
         
     Returns:
-        Smoothness penalty
+        Penalty value >= 0 (0 = perfectly smooth)
     """
-    if len(need_pct_values) <= 1:
+    if x.size <= 2:
         return 0.0
     
+    # Calculate second differences
     penalty = 0.0
-    for i in range(len(need_pct_values) - 1):
-        jump = abs(need_pct_values[i + 1] - need_pct_values[i])
-        if jump > max_jump_pct:
-            penalty += (jump - max_jump_pct) * 0.5
+    for i in range(2, len(x)):
+        # Second difference: (x[i] - x[i-1]) - (x[i-1] - x[i-2])
+        second_diff = x[i] - 2*x[i-1] + x[i-2]
+        penalty += abs(second_diff)
+    
+    # Normalize by the range of x
+    x_range = np.max(x) - np.min(x)
+    if x_range > 1e-12:
+        penalty = penalty / x_range
     
     return penalty
 
 
-def need_pct_variance_penalty(need_pct_values: np.ndarray, 
-                             max_variance: float = 25.0) -> float:
+@njit(cache=True, fastmath=True)
+def tail_penalty_combined(volumes: np.ndarray, martingales: np.ndarray, 
+                         weight_vol: float = 0.7, weight_mart: float = 0.3) -> float:
     """
-    Penalize high variance in NeedPct values.
+    Calculate combined tail penalty using Gini coefficients of volumes and martingales.
     
     Args:
-        need_pct_values: Array of NeedPct values
-        max_variance: Maximum allowed variance
+        volumes: Volume percentages
+        martingales: Martingale percentages
+        weight_vol: Weight for volume Gini
+        weight_mart: Weight for martingale Gini
         
     Returns:
-        Variance penalty
+        Combined tail penalty [0,1]
     """
-    if len(need_pct_values) <= 1:
+    # Normalize volumes to [0,1]
+    vol_normalized = volumes / 100.0
+    
+    # Normalize martingales to [0,1] (skip first element which is 0)
+    mart_normalized = martingales / 100.0
+    
+    vol_gini = gini_coefficient(vol_normalized)
+    mart_gini = gini_coefficient(mart_normalized)
+    
+    return weight_vol * vol_gini + weight_mart * mart_gini
+
+
+@njit(cache=True, fastmath=True)
+def shape_reward_late_surge(volumes: np.ndarray) -> float:
+    """
+    Calculate shape reward for late surge pattern.
+    Rewards volume distributions that increase towards the middle-end, then slightly decrease.
+    
+    Args:
+        volumes: Volume percentages
+        
+    Returns:
+        Shape reward [0,1] where 1=perfect late surge pattern
+    """
+    n = len(volumes)
+    if n <= 2:
         return 0.0
     
-    variance = np.var(need_pct_values)
-    if variance > max_variance:
-        return (variance - max_variance) * 0.1
+    # Create late surge template: low start, peak around 70-80%, slight decrease at end
+    template = np.empty(n)
+    for i in range(n):
+        t = float(i) / (n - 1)  # normalized position [0,1]
+        if t < 0.7:
+            # Gradual increase to position 0.7
+            template[i] = 0.3 + 0.7 * (t / 0.7)
+        else:
+            # Slight decrease after position 0.7
+            template[i] = 1.0 - 0.2 * ((t - 0.7) / 0.3)
+    
+    # Normalize template
+    template_sum = np.sum(template)
+    if template_sum > 1e-12:
+        template = template / template_sum
+    
+    # Normalize volumes
+    vol_normalized = volumes / np.sum(volumes)
+    
+    # Calculate cosine similarity
+    dot_product = np.sum(vol_normalized * template)
+    norm_vol = math.sqrt(np.sum(vol_normalized * vol_normalized))
+    norm_template = math.sqrt(np.sum(template * template))
+    
+    if norm_vol > 1e-12 and norm_template > 1e-12:
+        cosine_sim = dot_product / (norm_vol * norm_template)
+        return max(0.0, cosine_sim)
     
     return 0.0
 
 
-class GiniPenalty:
-    """Gini coefficient penalty for volume distribution inequality."""
-    
-    @staticmethod
-    def calculate_gini(volumes: np.ndarray) -> float:
-        """Calculate Gini coefficient for volume distribution."""
-        if len(volumes) <= 1:
-            return 0.0
-        
-        sorted_volumes = np.sort(volumes)
-        n = len(sorted_volumes)
-        cumsum = np.cumsum(sorted_volumes)
-        
-        # Gini coefficient calculation
-        return (n + 1 - 2 * np.sum(cumsum) / cumsum[-1]) / n
-    
-    @staticmethod
-    def penalty(volumes: np.ndarray, target_gini: float = 0.3, 
-                weight: float = 1.0) -> float:
-        """Calculate Gini penalty."""
-        gini = GiniPenalty.calculate_gini(volumes)
-        return weight * abs(gini - target_gini)
-
-
-class EntropyPenalty:
-    """Entropy penalty for volume distribution diversity."""
-    
-    @staticmethod
-    def calculate_entropy(volumes: np.ndarray) -> float:
-        """Calculate entropy of volume distribution."""
-        if len(volumes) <= 1:
-            return 0.0
-        
-        # Normalize volumes to probabilities
-        total = np.sum(volumes)
-        if total == 0:
-            return 0.0
-        
-        probabilities = volumes / total
-        # Remove zero probabilities for log calculation
-        probabilities = probabilities[probabilities > 0]
-        
-        return -np.sum(probabilities * np.log(probabilities))
-    
-    @staticmethod
-    def max_entropy(num_levels: int) -> float:
-        """Calculate maximum possible entropy for given number of levels."""
-        return np.log(num_levels)
-    
-    @staticmethod
-    def penalty(volumes: np.ndarray, weight: float = 1.0) -> float:
-        """Calculate entropy penalty (higher entropy is better)."""
-        entropy = EntropyPenalty.calculate_entropy(volumes)
-        max_entropy = EntropyPenalty.max_entropy(len(volumes))
-        
-        # Penalize low entropy (lack of diversity)
-        return weight * (max_entropy - entropy)
-
-
-class TailPenalty:
-    """Tail risk penalty for extreme volume values."""
-    
-    @staticmethod
-    def calculate_tail_risk(volumes: np.ndarray, percentile: float = 0.95) -> float:
-        """Calculate tail risk at given percentile."""
-        if len(volumes) == 0:
-            return 0.0
-        
-        threshold = np.percentile(volumes, percentile * 100)
-        tail_volumes = volumes[volumes > threshold]
-        
-        if len(tail_volumes) == 0:
-            return 0.0
-        
-        return np.mean(tail_volumes)
-    
-    @staticmethod
-    def penalty(volumes: np.ndarray, max_tail_risk: float = 1000.0, 
-                weight: float = 1.0) -> float:
-        """Calculate tail risk penalty."""
-        tail_risk = TailPenalty.calculate_tail_risk(volumes)
-        return weight * max(0, tail_risk - max_tail_risk)
-
-
-class MonotonePenalty:
-    """Monotonicity penalty for non-increasing sequences."""
-    
-    @staticmethod
-    def penalty(sequence: np.ndarray, weight: float = 1.0) -> float:
-        """Calculate monotonicity penalty."""
-        return weight * monotone_violation(sequence)
-
-
-class SmoothnessPenalty:
-    """Smoothness penalty for abrupt changes in sequence."""
-    
-    @staticmethod
-    def penalty(sequence: np.ndarray, max_change: float = 0.5, 
-                weight: float = 1.0) -> float:
-        """Calculate smoothness penalty."""
-        if len(sequence) <= 1:
-            return 0.0
-        
-        # Calculate relative changes
-        diffs = np.abs(np.diff(sequence))
-        relative_changes = diffs / (sequence[:-1] + 1e-8)  # Avoid division by zero
-        
-        # Penalize changes larger than max_change
-        violations = np.sum(relative_changes > max_change)
-        
-        return weight * violations
-
-
-class ComprehensivePenaltySystem:
+@njit(cache=True, fastmath=True)
+def shape_reward_double_hump(volumes: np.ndarray) -> float:
     """
-    Comprehensive penalty system with practical defaults and detailed breakdown.
+    Calculate shape reward for double hump pattern.
+    Rewards volume distributions with two peaks.
     
-    Implements the scoring formula:
-    J = α·max_need + β·var_need + γ·tail
-      + λ1·Gini(volume) + λ2·(H_max - Entropy(volume))
-      + λ3·MonotoneViol(indent) + λ4·SmoothnessPenalty(needpct)
-      + λ5·TailCapPenalty(volume_last)
+    Args:
+        volumes: Volume percentages
+        
+    Returns:
+        Shape reward [0,1] where 1=perfect double hump pattern
     """
+    n = len(volumes)
+    if n <= 4:
+        return 0.0
     
-    def __init__(self, weights: Optional[Dict[str, float]] = None,
-                 objective_weights: Optional[Dict[str, float]] = None):
-        """
-        Initialize penalty system with weights.
-        
-        Args:
-            weights: Penalty weights (uses defaults if None)
-            objective_weights: Objective function weights (α, β, γ)
-        """
-        self.penalty_weights = {**DEFAULT_PENALTY_WEIGHTS, **(weights or {})}
-        self.objective_weights = objective_weights or {
-            'alpha': 0.4,   # max_need weight
-            'beta': 0.3,    # var_need weight  
-            'gamma': 0.3    # tail weight
-        }
+    # Create double hump template
+    template = np.empty(n)
+    for i in range(n):
+        t = float(i) / (n - 1)  # normalized position [0,1]
+        # Two Gaussian-like peaks at t=0.25 and t=0.75
+        peak1 = math.exp(-((t - 0.25) / 0.15)**2)
+        peak2 = math.exp(-((t - 0.75) / 0.15)**2)
+        template[i] = peak1 + peak2 + 0.1  # Add small baseline
     
-    def calculate_comprehensive_score(self, 
-                                    max_need: float,
-                                    var_need: float, 
-                                    tail: float,
-                                    volumes: np.ndarray,
-                                    indent_pct: np.ndarray,
-                                    need_pct_values: np.ndarray) -> Dict[str, float]:
-        """
-        Calculate comprehensive score with detailed breakdown.
-        
-        Args:
-            max_need: Maximum NeedPct value
-            var_need: Variance of NeedPct values
-            tail: Tail risk measure
-            volumes: Volume distribution
-            indent_pct: Indent percentages
-            need_pct_values: NeedPct values for smoothness
-            
-        Returns:
-            Dictionary with score breakdown
-        """
-        # Primary objectives
-        objective_score = (
-            self.objective_weights['alpha'] * max_need +
-            self.objective_weights['beta'] * var_need +
-            self.objective_weights['gamma'] * tail
-        )
-        
-        # Penalty calculations
-        penalties = {}
-        
-        # Gini penalty
-        gini_coeff = GiniPenalty.calculate_gini(volumes)
-        penalties['gini'] = self.penalty_weights['penalty_gini'] * gini_coeff
-        
-        # Entropy penalty (encourage diversity)
-        entropy = EntropyPenalty.calculate_entropy(volumes)
-        max_entropy = EntropyPenalty.max_entropy(len(volumes))
-        penalties['entropy'] = self.penalty_weights['penalty_entropy'] * (max_entropy - entropy)
-        
-        # Monotone penalty (critical - indent must be non-decreasing)
-        penalties['monotone'] = (
-            self.penalty_weights['penalty_monotone'] * 
-            monotone_violation(indent_pct)
-        )
-        
-        # Smoothness penalty for NeedPct transitions
-        penalties['step_smooth'] = (
-            self.penalty_weights['penalty_step_smooth'] * 
-            need_pct_smoothness_penalty(need_pct_values)
-        )
-        
-        # Tail cap penalty (limit last order volume)
-        penalties['tail_cap'] = (
-            self.penalty_weights['penalty_tail_cap'] * 
-            tail_cap_penalty(volumes)
-        )
-        
-        # Extreme volume penalty
-        penalties['extreme_vol'] = (
-            self.penalty_weights['penalty_extreme_vol'] * 
-            extreme_volume_penalty(volumes)
-        )
-        
-        # NeedPct variance penalty
-        penalties['need_variance'] = (
-            self.penalty_weights['penalty_need_variance'] * 
-            need_pct_variance_penalty(need_pct_values)
-        )
-        
-        # Total penalty
-        total_penalty = sum(penalties.values())
-        
-        # Final score
-        final_score = objective_score + total_penalty
-        
-        return {
-            'final_score': final_score,
-            'objective_score': objective_score,
-            'total_penalty': total_penalty,
-            'objective_breakdown': {
-                'max_need_component': self.objective_weights['alpha'] * max_need,
-                'var_need_component': self.objective_weights['beta'] * var_need,
-                'tail_component': self.objective_weights['gamma'] * tail
-            },
-            'penalty_breakdown': penalties,
-            'raw_metrics': {
-                'max_need': max_need,
-                'var_need': var_need,
-                'tail': tail,
-                'gini_coefficient': gini_coeff,
-                'entropy': entropy,
-                'max_entropy': max_entropy
-            }
-        }
+    # Normalize template
+    template_sum = np.sum(template)
+    if template_sum > 1e-12:
+        template = template / template_sum
     
-    def get_penalty_summary(self, score_breakdown: Dict[str, Any]) -> str:
-        """
-        Generate human-readable penalty summary.
-        
-        Args:
-            score_breakdown: Result from calculate_comprehensive_score
-            
-        Returns:
-            Formatted summary string
-        """
-        penalties = score_breakdown['penalty_breakdown']
-        
-        summary_lines = [
-            f"Final Score: {score_breakdown['final_score']:.4f}",
-            f"Objective: {score_breakdown['objective_score']:.4f}, Penalties: {score_breakdown['total_penalty']:.4f}",
-            "",
-            "Penalty Breakdown:"
-        ]
-        
-        for penalty_name, value in penalties.items():
-            if value > 0.001:  # Only show significant penalties
-                summary_lines.append(f"  {penalty_name}: {value:.4f}")
-        
-        if score_breakdown['penalty_breakdown']['monotone'] > 0:
-            summary_lines.append("  ⚠️  CRITICAL: Monotonicity violation detected!")
-        
-        return "\n".join(summary_lines)
+    # Normalize volumes
+    vol_normalized = volumes / np.sum(volumes)
+    
+    # Calculate cosine similarity
+    dot_product = np.sum(vol_normalized * template)
+    norm_vol = math.sqrt(np.sum(vol_normalized * vol_normalized))
+    norm_template = math.sqrt(np.sum(template * template))
+    
+    if norm_vol > 1e-12 and norm_template > 1e-12:
+        cosine_sim = dot_product / (norm_vol * norm_template)
+        return max(0.0, cosine_sim)
+    
+    return 0.0
 
 
-class CompositePenalty:
-    """Composite penalty combining multiple penalty functions (legacy compatibility)."""
+@njit(cache=True, fastmath=True)
+def wave_pattern_reward(martingales: np.ndarray, strong_threshold: float = 50.0, 
+                       weak_threshold: float = 10.0) -> float:
+    """
+    Calculate wave pattern reward for alternating strong-weak martingale patterns.
     
-    def __init__(self, weights: dict = None):
-        """Initialize with penalty weights."""
-        self.weights = weights or {
-            'gini': 1.0,
-            'entropy': 0.5,
-            'tail': 1.0,
-            'monotone': 2.0,
-            'smoothness': 1.0
-        }
+    Args:
+        martingales: Martingale percentages (first element should be 0)
+        strong_threshold: Threshold for "strong" martingale
+        weak_threshold: Threshold for "weak" martingale
+        
+    Returns:
+        Wave reward (can be negative for penalties)
+    """
+    if len(martingales) <= 2:
+        return 0.0
     
-    def calculate_total_penalty(self, schedule: Schedule) -> float:
-        """Calculate total penalty for a schedule."""
-        total_penalty = 0.0
-        
-        # Gini penalty
-        if 'gini' in self.weights:
-            total_penalty += GiniPenalty.penalty(
-                schedule.volumes, weight=self.weights['gini']
-            )
-        
-        # Entropy penalty
-        if 'entropy' in self.weights:
-            total_penalty += EntropyPenalty.penalty(
-                schedule.volumes, weight=self.weights['entropy']
-            )
-        
-        # Tail penalty
-        if 'tail' in self.weights:
-            total_penalty += TailPenalty.penalty(
-                schedule.volumes, weight=self.weights['tail']
-            )
-        
-        # Monotone penalty for orders
-        if 'monotone' in self.weights:
-            total_penalty += MonotonePenalty.penalty(
-                schedule.orders, weight=self.weights['monotone']
-            )
-        
-        # Smoothness penalty for volumes
-        if 'smoothness' in self.weights:
-            total_penalty += SmoothnessPenalty.penalty(
-                schedule.volumes, weight=self.weights['smoothness']
-            )
-        
-        return total_penalty
+    reward = 0.0
+    penalty = 0.0
     
-    def get_penalty_breakdown(self, schedule: Schedule) -> dict:
-        """Get detailed breakdown of penalties."""
-        return {
-            'gini': GiniPenalty.penalty(schedule.volumes, weight=self.weights.get('gini', 0)),
-            'entropy': EntropyPenalty.penalty(schedule.volumes, weight=self.weights.get('entropy', 0)),
-            'tail': TailPenalty.penalty(schedule.volumes, weight=self.weights.get('tail', 0)),
-            'monotone': MonotonePenalty.penalty(schedule.orders, weight=self.weights.get('monotone', 0)),
-            'smoothness': SmoothnessPenalty.penalty(schedule.volumes, weight=self.weights.get('smoothness', 0))
-        }
+    # Skip first element (should be 0)
+    for i in range(2, len(martingales)):
+        prev_mart = martingales[i-1]
+        curr_mart = martingales[i]
+        
+        # Reward alternating patterns
+        if prev_mart >= strong_threshold and curr_mart <= weak_threshold:
+            reward += 0.1  # Strong to weak
+        elif prev_mart <= weak_threshold and curr_mart >= strong_threshold:
+            reward += 0.1  # Weak to strong
+        
+        # Penalty for consecutive patterns
+        if prev_mart >= strong_threshold and curr_mart >= strong_threshold:
+            penalty += 0.15  # Consecutive strong
+        elif prev_mart <= weak_threshold and curr_mart <= weak_threshold:
+            penalty += 0.15  # Consecutive weak
+    
+    return reward - penalty
+
+
+@njit(cache=True, fastmath=True)
+def cvar_calculation(need_pct: np.ndarray, q: float = 0.8) -> float:
+    """
+    Calculate Conditional Value at Risk (CVaR) for Need% values.
+    
+    Args:
+        need_pct: Array of Need% values
+        q: Quantile level (default 0.8 for 80th percentile)
+        
+    Returns:
+        CVaR value (mean of values above q-th percentile)
+    """
+    if need_pct.size == 0:
+        return 0.0
+    
+    # Sort values
+    sorted_need = np.sort(need_pct)
+    n = len(sorted_need)
+    
+    # Find q-th percentile index
+    q_index = int(q * n)
+    if q_index >= n:
+        q_index = n - 1
+    
+    # Calculate mean of values above q-th percentile
+    if q_index < n - 1:
+        tail_values = sorted_need[q_index:]
+        return np.mean(tail_values)
+    else:
+        return sorted_need[-1]
+
+
+def compute_all_penalties(volumes: np.ndarray, martingales: np.ndarray, 
+                         indents: np.ndarray, need_pct: np.ndarray,
+                         config: Dict[str, Any]) -> Dict[str, float]:
+    """
+    Compute all penalty and reward components.
+    
+    Args:
+        volumes: Volume percentages
+        martingales: Martingale percentages
+        indents: Indent percentages
+        need_pct: Need percentages
+        config: Configuration dictionary with weights and parameters
+        
+    Returns:
+        Dictionary with all penalty/reward components
+    """
+    # Extract configuration
+    gini_w_vol = config.get('gini_w_vol', 0.7)
+    gini_w_mart = config.get('gini_w_mart', 0.3)
+    shape_template = config.get('shape_template', 'late_surge')
+    q_cvar = config.get('q_cvar', 0.8)
+    strong_threshold = config.get('strong_threshold', 50.0)
+    weak_threshold = config.get('weak_threshold', 10.0)
+    
+    penalties = {}
+    
+    # Basic metrics
+    penalties['max_need'] = float(np.max(need_pct)) if len(need_pct) > 0 else 0.0
+    penalties['var_need'] = float(np.var(need_pct)) if len(need_pct) > 0 else 0.0
+    penalties['cvar_need'] = cvar_calculation(need_pct, q_cvar)
+    
+    # Tail penalty (Gini-based)
+    penalties['tail_penalty'] = tail_penalty_combined(volumes, martingales, gini_w_vol, gini_w_mart)
+    
+    # Individual Gini coefficients
+    penalties['gini_volumes'] = gini_coefficient(volumes / 100.0)
+    penalties['gini_martingales'] = gini_coefficient(martingales / 100.0)
+    
+    # Entropy
+    penalties['entropy_volumes'] = entropy_normalized(volumes)
+    penalties['entropy_martingales'] = entropy_normalized(martingales[1:])  # Skip first 0
+    
+    # Monotonicity and smoothness
+    penalties['monotone_penalty'] = monotonicity_penalty(indents)
+    penalties['smooth_penalty_indents'] = smoothness_penalty(indents)
+    penalties['smooth_penalty_need'] = smoothness_penalty(need_pct)
+    
+    # Shape reward
+    if shape_template == 'late_surge':
+        shape_reward = shape_reward_late_surge(volumes)
+    elif shape_template == 'double_hump':
+        shape_reward = shape_reward_double_hump(volumes)
+    else:  # 'flat' or default
+        shape_reward = 1.0 - gini_coefficient(volumes / 100.0)  # Reward flat distribution
+    
+    penalties['shape_reward'] = shape_reward
+    penalties['shape_penalty'] = 1.0 - shape_reward
+    
+    # Wave pattern reward
+    penalties['wave_reward'] = wave_pattern_reward(martingales, strong_threshold, weak_threshold)
+    penalties['wave_penalty'] = max(0.0, -penalties['wave_reward'])
+    
+    return penalties
+
+
+def compute_composite_score(penalties: Dict[str, float], weights: Dict[str, float]) -> float:
+    """
+    Compute composite score J from penalty components.
+    
+    Args:
+        penalties: Dictionary of penalty/reward components
+        weights: Dictionary of weights for each component
+        
+    Returns:
+        Composite score J (to be minimized)
+    """
+    # Extract weights with defaults
+    alpha = weights.get('alpha', 0.45)      # max_need
+    beta = weights.get('beta', 0.20)        # var_need
+    gamma = weights.get('gamma', 0.20)      # tail_penalty
+    delta = weights.get('delta', 0.10)      # shape_penalty
+    rho = weights.get('rho', 0.05)          # cvar_need
+    eta = weights.get('eta', 0.02)          # monotone_penalty
+    zeta = weights.get('zeta', 0.02)        # smooth_penalty
+    
+    # Compute composite score
+    J = (alpha * penalties['max_need'] +
+         beta * penalties['var_need'] +
+         gamma * penalties['tail_penalty'] +
+         delta * penalties['shape_penalty'] +
+         rho * penalties['cvar_need'] +
+         eta * penalties['monotone_penalty'] +
+         zeta * (penalties['smooth_penalty_indents'] + penalties['smooth_penalty_need']))
+    
+    return float(J)
