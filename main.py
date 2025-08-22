@@ -3,7 +3,6 @@ import time
 from ui.components.parameter_inputs import render_optimization_parameters
 from ui.components.system_performance import render_system_performance
 from ui.components.progress_section import render_progress_section, update_progress
-from ui.components.results_section import render_results_section
 from ui.utils.config import get_icon_html, setup_page_config
 from ui.utils.optimization_bridge import optimization_bridge
 
@@ -24,85 +23,78 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# Create two main columns
-left_col, right_col = st.columns([1, 1])
+# Optimization Parameters Section
+parameters = render_optimization_parameters()
 
-with left_col:
-    # Optimization Parameters Section
-    parameters = render_optimization_parameters()
-    
-    # Start Optimization Button
-    st.markdown("<br>", unsafe_allow_html=True)
-    
-    if st.button(
-        f"{get_icon_html('rocket')} Optimizasyonu Başlat",
-        type="primary",
-        use_container_width=True,
-        key="start_optimization"
-    ):
-        # Validate parameters first
-        validation_result = optimization_bridge.validate_parameters(parameters)
-        if not validation_result['success']:
-            st.error(f"Parameter validation failed: {validation_result['error']}")
-            st.rerun()
-        
-        # Create optimization session
-        session_result = optimization_bridge.create_optimization_session(
-            parameters=parameters,
-            max_iterations=1000,
-            time_limit=300.0
-        )
-        
-        if session_result['success']:
-            # Set up progress callback
-            def progress_callback(progress_data):
-                st.session_state.optimization_progress = progress_data['progress_percentage']
-                st.session_state.current_score = progress_data['current_score']
-                st.session_state.best_score = progress_data['best_score']
-            
-            optimization_bridge.set_progress_callback(progress_callback)
-            
-            # Start optimization
-            start_result = optimization_bridge.start_optimization()
-            if start_result['success']:
-                st.session_state.optimization_running = True
-                st.session_state.optimization_progress = 0
-                st.session_state.session_id = session_result['session_id']
-                st.success("Optimization started successfully!")
-            else:
-                st.error(f"Failed to start optimization: {start_result['error']}")
-        else:
-            st.error(f"Failed to create session: {session_result['error']}")
-        
+# System Performance Section
+st.markdown("<br>", unsafe_allow_html=True)
+metrics = render_system_performance()
+
+# Start Optimization Button
+st.markdown("<br>", unsafe_allow_html=True)
+
+if st.button(
+    f"{get_icon_html('rocket')} Optimizasyonu Başlat",
+    type="primary",
+    use_container_width=True,
+    key="start_optimization"
+):
+    # Validate parameters first
+    validation_result = optimization_bridge.validate_parameters(parameters)
+    if not validation_result['success']:
+        st.error(f"Parameter validation failed: {validation_result['error']}")
         st.rerun()
     
-    # Stop Optimization Button (if running)
-    if st.session_state.get('optimization_running', False):
-        if st.button(
-            "Optimizasyonu Durdur",
-            type="secondary",
-            use_container_width=True,
-            key="stop_optimization"
-        ):
-            stop_result = optimization_bridge.stop_optimization()
-            if stop_result['success']:
-                st.session_state.optimization_running = False
-                st.success("Optimization stopped successfully!")
-            else:
-                st.error(f"Failed to stop optimization: {stop_result['error']}")
-            st.rerun()
-
-with right_col:
-    # System Performance Section
-    metrics = render_system_performance()
+    # Create optimization session
+    session_result = optimization_bridge.create_optimization_session(
+        parameters=parameters,
+        max_iterations=1000,
+        time_limit=300.0
+    )
     
-    # Progress Section
+    if session_result['success']:
+        # Set up progress callback
+        def progress_callback(progress_data):
+            st.session_state.optimization_progress = progress_data['progress_percentage']
+            st.session_state.current_score = progress_data['current_score']
+            st.session_state.best_score = progress_data['best_score']
+        
+        optimization_bridge.set_progress_callback(progress_callback)
+        
+        # Start optimization
+        start_result = optimization_bridge.start_optimization()
+        if start_result['success']:
+            st.session_state.optimization_running = True
+            st.session_state.optimization_progress = 0
+            st.session_state.session_id = session_result['session_id']
+            st.success("Optimization started successfully!")
+        else:
+            st.error(f"Failed to start optimization: {start_result['error']}")
+    else:
+        st.error(f"Failed to create session: {session_result['error']}")
+    
+    st.rerun()
+
+# Stop Optimization Button (if running)
+if st.session_state.get('optimization_running', False):
+    if st.button(
+        "Optimizasyonu Durdur",
+        type="secondary",
+        use_container_width=True,
+        key="stop_optimization"
+    ):
+        stop_result = optimization_bridge.stop_optimization()
+        if stop_result['success']:
+            st.session_state.optimization_running = False
+            st.success("Optimization stopped successfully!")
+        else:
+            st.error(f"Failed to stop optimization: {stop_result['error']}")
+        st.rerun()
+
+# Progress Section (only show when optimization is running)
+if st.session_state.get('optimization_running', False):
     st.markdown("<br>", unsafe_allow_html=True)
     progress_bar = render_progress_section()
-    
-    # Results Section (at the bottom)
-    st.markdown("<br>", unsafe_allow_html=True)
-    render_results_section()
 
 # Handle optimization logic
 if st.session_state.get('optimization_running', False):
