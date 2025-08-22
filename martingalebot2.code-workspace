@@ -1,0 +1,88 @@
+{
+    "folders": [
+        {
+            "path": "."
+        }
+    ],
+    "settings": {
+        "python.defaultInterpreterPath": "/Users/bugra/.pyenv/versions/3.11.5/bin/python",
+        "python.terminal.activateEnvironment": true,
+        "python.analysis.extraPaths": [
+            "/Users/bugra/.pyenv/versions/3.11.5/lib/python3.11/site-packages"
+        ],
+        "python.analysis.autoImportCompletions": true,
+        "python.analysis.typeCheckingMode": "off",
+        "python.analysis.autoSearchPaths": true,
+        "python.analysis.diagnosticMode": "workspace",
+        "python.analysis.stubPath": "/Users/bugra/.pyenv/versions/3.11.5/lib/python3.11/site-packages",
+        "python.analysis.include": [
+            "**/*.py"
+        ],
+        "python.analysis.exclude": [
+            "**/node_modules",
+            "**/__pycache__",
+            "**/site-packages"
+        ],
+        "python.linting.enabled": true,
+        "python.linting.pylintEnabled": false,
+        "python.linting.flake8Enabled": true,
+        "python.formatting.provider": "black",
+        "python.sortImports.args": ["--profile", "black"],
+        "files.exclude": {
+            "**/__pycache__": true,
+            "**/*.pyc": true
+        },
+        "python.analysis.ignore": [
+            "**/site-packages/**"
+        ],
+        "python.analysis.reportMissingImports": "none",
+        "python.analysis.reportMissingTypeStubs": "none",
+        "python.analysis.reportUnusedImport": "none",
+        "python.analysis.reportUnusedClass": "none",
+        "python.analysis.reportUnusedFunction": "none",
+        "python.analysis.reportUnusedVariable": "none",
+        "python.analysis.reportDuplicateImport": "none",
+        "python.analysis.reportOptionalSubscript": "none",
+        "python.analysis.reportOptionalMemberAccess": "none",
+        "python.analysis.reportOptionalCall": "none",
+        "python.analysis.reportOptionalIterable": "none",
+        "python.analysis.reportOptionalContextManager": "none",
+        "python.analysis.reportOptionalOperand": "none",
+        "python.analysis.reportUntypedFunctionDecorator": "none",
+        "python.analysis.reportUntypedClassDecorator": "none",
+        "python.analysis.reportUntypedBaseClass": "none",
+        "python.analysis.reportUntypedNamedTuple": "none",
+        "python.analysis.reportPrivateUsage": "none",
+        "python.analysis.reportConstantRedefinition": "none",
+        "python.analysis.reportIncompatibleMethodOverride": "none",
+        "python.analysis.reportIncompatibleVariableOverride": "none",
+        "python.analysis.reportInconsistentConstructor": "none",
+        "python.analysis.reportOverlappingOverloads": "none",
+        "python.analysis.reportMissingSuperCall": "none",
+        "python.analysis.reportUninitializedInstanceVariable": "none",
+        "python.analysis.reportInvalidStringEscapeSequence": "none",
+        "python.analysis.reportUnknownParameterType": "none",
+        "python.analysis.reportUnknownArgumentType": "none",
+        "python.analysis.reportUnknownLambdaType": "none",
+        "python.analysis.reportUnknownVariableType": "none",
+        "python.analysis.reportUnknownMemberType": "none",
+        "python.analysis.reportMissingTypeArgument": "none",
+        "python.analysis.reportInvalidTypeVarUse": "none",
+        "python.analysis.reportCallInDefaultInitializer": "none",
+        "python.analysis.reportUnnecessaryIsInstance": "none",
+        "python.analysis.reportUnnecessaryCast": "none",
+        "python.analysis.reportUnnecessaryComparison": "none",
+        "python.analysis.reportAssertAlwaysTrue": "none",
+        "python.analysis.reportSelfClsParameterName": "none",
+        "python.analysis.reportImplicitStringConcatenation": "none",
+        "python.analysis.reportUndefinedVariable": "none"
+    },
+    "extensions": {
+        "recommendations": [
+            "ms-python.python",
+            "ms-python.pylance",
+            "ms-python.black-formatter",
+            "ms-python.flake8"
+        ]
+    }
+}

@@ -67,7 +67,7 @@ class CandidateRecord:
 class CheckpointStore:
     """Database store for checkpointing optimization state."""
     
-    def __init__(self, db_path: str = "experiments.db"):
+    def __init__(self, db_path: str = "db_results/experiments.db"):
         self.db_path = db_path
         self.log_ctx: Optional[LogContext] = None
         self._ensure_database()

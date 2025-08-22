@@ -33,7 +33,7 @@ class ExperimentRow:
 
 
 class ExperimentsStore:
-    def __init__(self, db_path: str = "experiments.db"):
+    def __init__(self, db_path: str = "db_results/experiments.db"):
         self.db_path = db_path
         self._init_db()
 

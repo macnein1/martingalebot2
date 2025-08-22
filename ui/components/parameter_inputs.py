@@ -1,5 +1,5 @@
 import streamlit as st
-from utils.config import get_icon_html
+from ui.utils.config import get_icon_html
 
 def render_parameter_input(label: str, key: str, min_val: float, max_val: float, 
                           default_val: float, step: float = 0.01, format_str: str = "%.2f"):

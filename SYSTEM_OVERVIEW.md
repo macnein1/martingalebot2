@@ -162,7 +162,7 @@ run_ctx = make_runctx(seed=42)
 logger, log_ctx = get_logger_for_run(run_ctx.run_id)
 
 # Setup checkpoint store
-store = CheckpointStore("experiments.db")
+store = CheckpointStore("db_results/experiments.db")
 store.set_log_context(log_ctx)
 
 # Start run

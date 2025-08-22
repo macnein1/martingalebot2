@@ -1,101 +1,51 @@
-# Martingale Bot 2 - Optimization System
+# Martingale Optimizer UI
 
-Bu proje, martingale stratejilerini optimize etmek için geliştirilmiş enterprise-seviye bir uygulamadır.
+Bu modül, Martingale Optimizer uygulamasının kullanıcı arayüzünü içerir.
 
-## 🏗️ Mimari Yapı
+## Yapı
 
 ```
-martingalebot2/
-├── martingale_lab/          # Core optimization engine
-│   ├── core/                # Core types and algorithms
-│   ├── optimizer/           # Optimization engines
-│   ├── adapters/           # Adapter patterns
-│   ├── ui_bridge/          # UI communication layer
-│   └── storage/            # Data persistence
-└── ui/                     # Streamlit web interface
-    ├── components/         # UI components
-    ├── pages/             # Application pages
-    └── utils/             # Utility functions
+ui/
+├── main.py                 # Ana uygulama giriş noktası
+├── components/             # Yeniden kullanılabilir UI bileşenleri
+│   ├── parameter_inputs.py    # Parametre giriş bileşenleri
+│   ├── system_performance.py  # Sistem performans monitörü
+│   ├── progress_section.py    # İlerleme takibi
+│   ├── results_section.py     # Sonuç gösterimi
+│   └── sidebar.py             # Kenar çubuğu navigasyonu
+├── pages/                  # Sayfa bileşenleri
+│   ├── calculation_page.py    # Hesaplama sayfası
+│   └── results_page.py        # Sonuçlar sayfası
+├── utils/                  # Yardımcı fonksiyonlar
+│   └── config.py             # Konfigürasyon ve stil ayarları
+└── requirements.txt        # Bağımlılıklar
 ```
 
-## 🚀 Kurulum
+## Kurulum
 
-1. **Dependency'leri yükleyin:**
-```bash
-pip install -r ui/requirements.txt
-```
-
-2. **Uygulamayı başlatın:**
 ```bash
 cd ui
+pip install -r requirements.txt
+```
+
+## Çalıştırma
+
+```bash
 streamlit run main.py
 ```
 
-## 🎯 Özellikler
+## Özellikler
 
-### Core Optimization Engine
-- **Numba-accelerated** hesaplamalar
-- **Batch processing** desteği
-- **Multi-threading** optimizasyon
-- **Gerçek zamanlı** progress tracking
+- **Modüler Yapı**: Her bileşen ayrı dosyalarda tanımlanmıştır
+- **Responsive Tasarım**: Farklı ekran boyutlarına uyumlu
+- **Gerçek Zamanlı Sistem Monitörü**: CPU ve RAM kullanımını takip eder
+- **İlerleme Takibi**: Optimizasyon sürecini görsel olarak takip eder
+- **Sonuç Gösterimi**: Optimizasyon sonuçlarını düzenli şekilde gösterir
 
-### UI Features
-- **Modern ve responsive** tasarım
-- **Parametrik kontrol** arayüzü
-- **Canlı progress** gösterimi
-- **Detaylı sonuç** analizi
-- **Export** özellikleri
+## Gelecek Geliştirmeler
 
-### Optimization Parameters
-- **Min/Max Overlap**: Yüzdelik overlap aralıkları
-- **Min/Max Order**: Sipariş sayısı aralıkları
-- **Risk Factor**: Risk toleransı (0.1-5.0)
-- **Smoothing Factor**: Yumuşatma katsayısı (0.01-1.0)
-- **Tail Weight**: Kuyruk ağırlığı (0.0-1.0)
-
-## 📊 Kullanım
-
-1. **Parameters**: Sol panelde optimizasyon parametrelerini ayarlayın
-2. **Start**: "Optimizasyonu Başlat" butonuna tıklayın
-3. **Monitor**: Sağ panelde progress ve sistem performansını izleyin
-4. **Results**: Optimizasyon tamamlandığında sonuçları inceleyin
-
-## 🔧 Teknik Detaylar
-
-### Bridge Architecture
-- **Service Layer**: Session-based optimization management
-- **Payload Converters**: Type-safe data conversion
-- **Response Builders**: Standardized API responses
-
-### Performance
-- **JIT Compilation**: Numba ile optimize edilmiş kernels
-- **Parallel Processing**: Multi-core değerlendirme
-- **Memory Efficient**: Streaming batch processing
-
-## 📈 Sonuç Metrikleri
-
-- **Total Score**: Genel optimizasyon skoru
-- **Max Score**: Maksimum ihtiyaç skoru
-- **Variance Score**: Varyans bazlı skor
-- **Tail Score**: Kuyruk penaltı skoru
-- **Performance Stats**: Hız ve verimlilik metrikleri
-
-## 🛡️ Error Handling
-
-- **Parameter validation** with detailed error messages
-- **Session management** with automatic cleanup
-- **Graceful degradation** for component failures
-- **Mock services** for development testing
-
-## 🔮 Next Steps
-
-- [ ] Real-time WebSocket updates
-- [ ] Advanced visualization charts
-- [ ] Multi-strategy comparison
-- [ ] Historical data integration
-- [ ] Export to multiple formats
-- [ ] Automated backtesting
-
----
-
-**Enterprise-level** modular design with clear separation of concerns.
+- [ ] Grafik analizleri
+- [ ] Veri dışa aktarma
+- [ ] Otomatik raporlama
+- [ ] Karşılaştırmalı sonuçlar
+- [ ] Performans trendleri

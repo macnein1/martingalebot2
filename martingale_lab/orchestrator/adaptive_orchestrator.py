@@ -69,7 +69,7 @@ class AdaptiveOrchestrator:
         
         # Storage
         self.storage = SQLiteStore(self.config.db_path) if self.config.save_to_db else None
-        self.exp_store = ExperimentsStore("experiments.db") if self.config.save_to_db else None
+        self.exp_store = ExperimentsStore("db_results/experiments.db") if self.config.save_to_db else None
         self.experiment_id: Optional[int] = None
         
         # Session tracking

@@ -1,7 +1,7 @@
 import streamlit as st
 import psutil
-from utils.config import get_icon_html
-from utils.performance_monitor import PerformanceMonitor, display_performance_metrics
+from ui.utils.config import get_icon_html
+from ui.utils.performance_monitor import PerformanceMonitor, display_performance_metrics
 
 def get_system_metrics():
     """Get current system performance metrics"""

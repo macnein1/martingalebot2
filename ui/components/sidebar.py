@@ -1,5 +1,5 @@
 import streamlit as st
-from utils.config import get_icon_html
+from ui.utils.config import get_icon_html
 
 def render_sidebar():
     """Render the sidebar navigation"""
