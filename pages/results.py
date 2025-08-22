@@ -10,6 +10,7 @@ import numpy as np
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 from ui.utils.config import get_icon_html, setup_page_config
+from ui.utils.constants import DB_PATH
 
 # Streamlit page configuration
 st.set_page_config(
@@ -27,10 +28,7 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-DB_PATH = os.path.join(os.path.dirname(__file__), '..', '..', 'martingale_lab', 'orchestrator')  # placeholder not used
-
-
-def _open_db(db_path: str = 'db_results/experiments.db'):
+def _open_db(db_path: str = DB_PATH):
     return sqlite3.connect(db_path)
 
 
@@ -91,27 +89,7 @@ def _sanity(schedule: dict, risk: dict) -> list:
     return msgs
 
 
-# Default DB path - try to find it in common locations
-default_db_path = "db_results/experiments.db"
-possible_paths = [
-    "db_results/experiments.db",
-    "../db_results/experiments.db", 
-    "../../db_results/experiments.db",
-    "martingale_lab/orchestrator/db_results/experiments.db",
-    "../martingale_lab/orchestrator/db_results/experiments.db"
-]
-
-# Try to find existing DB
-found_db = None
-for path in possible_paths:
-    if os.path.exists(path):
-        found_db = path
-        break
-
-if found_db:
-    default_db_path = found_db
-
-db_path = st.text_input("DB path", value=default_db_path)
+db_path = st.text_input("DB path", value=DB_PATH)
 
 if not os.path.exists(db_path):
     st.error(f"DB dosyası bulunamadı: {db_path}")

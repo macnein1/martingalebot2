@@ -1,10 +1,22 @@
 import streamlit as st
 import time
+import logging, sys
 from ui.components.parameter_inputs import render_optimization_parameters
 from ui.components.system_performance import render_system_performance
 from ui.components.progress_section import render_progress_section, update_progress
 from ui.utils.config import get_icon_html, setup_page_config
 from ui.utils.optimization_bridge import optimization_bridge
+from ui.utils.logging_buffer import tail_logs, ensure_ring_handler
+from ui.utils.constants import DB_PATH
+
+# Root logger setup (once)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger("mlab")
+ensure_ring_handler("mlab")
 
 # Streamlit page configuration
 st.set_page_config(
@@ -15,6 +27,14 @@ st.set_page_config(
 
 # Setup page config
 setup_page_config()
+
+# Path/import diagnostics
+try:
+    import martingale_lab as _mlab
+    logger.info("PYTHONPATH entries=%d", len(sys.path))
+    logger.info("martingale_lab.__file__=%s", getattr(_mlab, "__file__", "<unknown>"))
+except Exception:
+    logger.exception("Import martingale_lab failed")
 
 # Main title
 st.markdown(f"""
@@ -39,106 +59,61 @@ if st.button(
     use_container_width=True,
     key="start_optimization"
 ):
-    # Validate parameters first
-    validation_result = optimization_bridge.validate_parameters(parameters)
-    if not validation_result['success']:
-        st.error(f"Parameter validation failed: {validation_result['error']}")
+    try:
+        validation_result = optimization_bridge.validate_parameters(parameters)
+        if not validation_result['success']:
+            st.error(f"Parameter validation failed: {validation_result['error']}")
+            st.stop()
+        start_result = optimization_bridge.start_optimization(parameters, db_path=DB_PATH)
+        if not start_result.get('success'):
+            raise RuntimeError(start_result.get('error', 'unknown'))
+        st.session_state["run_id"] = start_result.get('run_id')
+        st.session_state["job_running"] = True
+        st.success("Optimization started!")
         st.rerun()
-    
-    # Create optimization session
-    session_result = optimization_bridge.create_optimization_session(
-        parameters=parameters,
-        max_iterations=1000,
-        time_limit=300.0
-    )
-    
-    if session_result['success']:
-        # Set up progress callback
-        def progress_callback(progress_data):
-            st.session_state.optimization_progress = progress_data['progress_percentage']
-            st.session_state.current_score = progress_data['current_score']
-            st.session_state.best_score = progress_data['best_score']
-        
-        optimization_bridge.set_progress_callback(progress_callback)
-        
-        # Start optimization
-        start_result = optimization_bridge.start_optimization()
-        if start_result['success']:
-            st.session_state.optimization_running = True
-            st.session_state.optimization_progress = 0
-            st.session_state.session_id = session_result['session_id']
-            st.success("Optimization started successfully!")
-        else:
-            st.error(f"Failed to start optimization: {start_result['error']}")
-    else:
-        st.error(f"Failed to create session: {session_result['error']}")
-    
-    st.rerun()
+    except Exception as e:
+        st.exception(e)
 
 # Stop Optimization Button (if running)
-if st.session_state.get('optimization_running', False):
+if st.session_state.get('job_running', False):
     if st.button(
         "Optimizasyonu Durdur",
         type="secondary",
         use_container_width=True,
         key="stop_optimization"
     ):
-        stop_result = optimization_bridge.stop_optimization()
-        if stop_result['success']:
-            st.session_state.optimization_running = False
+        try:
+            stop_result = optimization_bridge.stop_optimization()
+            if not stop_result.get('success'):
+                raise RuntimeError(stop_result.get('error', 'unknown'))
+            st.session_state["job_running"] = False
             st.success("Optimization stopped successfully!")
-        else:
-            st.error(f"Failed to stop optimization: {stop_result['error']}")
+        except Exception as e:
+            st.exception(e)
         st.rerun()
 
 # Progress Section (only show when optimization is running)
-if st.session_state.get('optimization_running', False):
+if st.session_state.get('job_running', False):
     st.markdown("<br>", unsafe_allow_html=True)
-    progress_bar = render_progress_section()
+    render_progress_section()
 
-# Handle optimization logic
-if st.session_state.get('optimization_running', False):
-    # Check optimization status
-    status_result = optimization_bridge.get_optimization_status()
-    
-    if status_result['success']:
-        status_data = status_result['data']
-        current_status = status_data.get('status', 'unknown')
-        
-        if current_status == 'completed':
-            # Optimization completed, get results
-            results_result = optimization_bridge.get_results()
-            if results_result['success']:
-                st.session_state.optimization_running = False
-                st.session_state.optimization_results = results_result['results']
-                st.session_state.optimization_statistics = results_result['statistics']
+# Live status/logs
+if st.session_state.get("job_running"):
+    try:
+        status_result = optimization_bridge.get_optimization_status()
+        if not status_result.get('success'):
+            raise RuntimeError(status_result.get('error', 'unknown'))
+        with st.status("Running…", expanded=True) as status:
+            for line in tail_logs("mlab", last_n=200):
+                st.write(line)
+            if status_result.get('data', {}).get('status') == 'completed':
+                st.session_state["job_running"] = False
+                status.update(label="Done", state="complete")
                 st.success("Optimization completed successfully!")
-                st.rerun()
             else:
-                st.error(f"Failed to get results: {results_result['error']}")
-                st.session_state.optimization_running = False
+                time.sleep(0.5)
                 st.rerun()
-        
-        elif current_status == 'error':
-            # Optimization failed
-            st.error(f"Optimization failed: {status_data.get('error', {}).get('error_message', 'Unknown error')}")
-            st.session_state.optimization_running = False
-            st.rerun()
-        
-        elif current_status == 'running':
-            # Optimization is still running, update progress
-            if 'progress' in status_data:
-                progress_data = status_data['progress']
-                st.session_state.optimization_progress = progress_data.get('progress_percentage', 0)
-                st.session_state.current_score = progress_data.get('current_score', 0)
-                st.session_state.best_score = progress_data.get('best_score', 0)
-            
-            # Add a small delay to prevent too frequent updates
-            time.sleep(0.5)
-            st.rerun()
-    else:
-        st.error(f"Failed to get optimization status: {status_result['error']}")
-        st.session_state.optimization_running = False
-        st.rerun()
+    except Exception as e:
+        st.exception(e)
 
 

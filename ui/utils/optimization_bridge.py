@@ -1,60 +1,34 @@
 """
-Bridge module for connecting Streamlit UI with Martingale Lab optimization service.
+Bridge module between Streamlit UI and background optimization runner.
+Starts/stops background orchestrator, exposes validation and status helpers.
 """
 import sys
 import os
 import json
 import time
+import logging
 from typing import Dict, Any, Optional, Callable
 from pathlib import Path
+from uuid import uuid4
+from datetime import datetime
+from threading import Thread, Event
 
-# Add martingale_lab to Python path
-project_root = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(project_root))
+from ui.utils.constants import DB_PATH
+from ui.utils.logging_buffer import ensure_ring_handler
+from ui.utils.orchestrator_runner import BackgroundOrchestrator, RunnerConfig
 
-try:
-    from martingale_lab.core.types import Params
-    from martingale_lab.ui_bridge.service import OptimizationService, OptimizationConfig
-    from martingale_lab.ui_bridge.payloads import UIPayloadConverter, UIResponseBuilder
-except ImportError as e:
-    print(f"Warning: Could not import martingale_lab modules: {e}")
-    # Create mock classes for development
-    class MockParams:
-        def __init__(self, **kwargs):
-            for key, value in kwargs.items():
-                setattr(self, key, value)
-    
-    class MockOptimizationConfig:
-        def __init__(self, **kwargs):
-            for key, value in kwargs.items():
-                setattr(self, key, value)
-    
-    class MockOptimizationService:
-        def __init__(self):
-            self.active_sessions = {}
-        
-        def create_session(self, config):
-            return "mock_session_123"
-        
-        def start_optimization(self, session_id):
-            return {"success": True, "message": "Mock optimization started"}
-        
-        def get_session_status(self, session_id):
-            return {"success": True, "data": {"status": "completed"}}
-    
-    Params = MockParams
-    OptimizationConfig = MockOptimizationConfig
-    OptimizationService = MockOptimizationService
-    UIPayloadConverter = None
-    UIResponseBuilder = None
+logger = logging.getLogger("mlab")
+ensure_ring_handler("mlab")
 
 
 class OptimizationBridge:
-    """Bridge between Streamlit UI and Martingale Lab optimization service."""
+    """Bridge owning the lifecycle of a background optimization job."""
     
     def __init__(self):
-        self.service = OptimizationService()
-        self.current_session_id: Optional[str] = None
+        self._thread: Optional[Thread] = None
+        self._stop_event: Optional[Event] = None
+        self._run_id: Optional[str] = None
+        self._last_error: Optional[str] = None
         self.progress_callback: Optional[Callable] = None
     
     def set_progress_callback(self, callback: Callable):
@@ -64,160 +38,91 @@ class OptimizationBridge:
     def create_optimization_session(self, parameters: Dict[str, Any], 
                                   max_iterations: int = 1000,
                                   time_limit: float = 300.0) -> Dict[str, Any]:
-        """Create a new optimization session."""
-        try:
-            # Create Params object from UI parameters
-            params = Params(
-                min_overlap=parameters['min_overlap'],
-                max_overlap=parameters['max_overlap'],
-                min_order=parameters['min_order'],
-                max_order=parameters['max_order'],
-                risk_factor=1.0,  # Default values
-                smoothing_factor=0.1,
-                tail_weight=0.2
-            )
-            
-            # Create optimization config
-            config = OptimizationConfig(
-                params=params,
-                max_iterations=max_iterations,
-                time_limit=time_limit,
-                batch_size=100,
-                early_stopping=True,
-                progress_callback=self.progress_callback
-            )
-            
-            # Create session
-            session_id = self.service.create_session(config)
-            self.current_session_id = session_id
-            
-            return {
-                'success': True,
-                'session_id': session_id,
-                'message': 'Optimization session created successfully'
-            }
-            
-        except Exception as e:
-            return {
-                'success': False,
-                'error': str(e),
-                'message': 'Failed to create optimization session'
-            }
+        """For compatibility with existing UI. No-op that returns a dummy session id."""
+        sid = f"session_{int(time.time())}"
+        return {'success': True, 'session_id': sid, 'message': 'Session stub created'}
     
-    def start_optimization(self) -> Dict[str, Any]:
-        """Start optimization for the current session."""
-        if not self.current_session_id:
-            return {
-                'success': False,
-                'error': 'No active session',
-                'message': 'Please create a session first'
-            }
-        
+    def start_optimization(self, parameters: Optional[Dict[str, Any]] = None, db_path: str = DB_PATH) -> Dict[str, Any]:
+        """Start background orchestrator and return run id."""
+        if self._thread and self._thread.is_alive():
+            return {'success': False, 'error': 'Already running', 'message': 'A job is already running'}
         try:
-            response = self.service.start_optimization(self.current_session_id)
-            return response
-            
+            params = parameters or {}
+            self._run_id = datetime.utcnow().strftime("%Y%m%d-%H%M%S") + "-" + uuid4().hex[:6]
+            self._stop_event = Event()
+            self._last_error = None
+
+            cfg = RunnerConfig(
+                min_overlap=float(params.get('min_overlap', 1.0)),
+                max_overlap=float(params.get('max_overlap', 10.0)),
+                min_order=int(params.get('min_order', 3)),
+                max_order=int(params.get('max_order', 8)),
+                db_path=db_path,
+            )
+            runner = BackgroundOrchestrator(cfg, stop_event=self._stop_event)
+
+            def _target():
+                logger.info("THREAD.START run_id=%s", self._run_id)
+                try:
+                    runner.run(run_id=self._run_id)
+                except Exception:
+                    import traceback
+                    self._last_error = traceback.format_exc()
+                finally:
+                    logger.info("THREAD.END run_id=%s", self._run_id)
+
+            self._thread = Thread(target=_target, daemon=True)
+            self._thread.start()
+            return {'success': True, 'run_id': self._run_id}
         except Exception as e:
-            return {
-                'success': False,
-                'error': str(e),
-                'message': 'Failed to start optimization'
-            }
+            logger.exception("start_optimization failed")
+            return {'success': False, 'error': str(e)}
     
     def stop_optimization(self) -> Dict[str, Any]:
-        """Stop the current optimization session."""
-        if not self.current_session_id:
-            return {
-                'success': False,
-                'error': 'No active session',
-                'message': 'No session to stop'
-            }
-        
+        """Signal stop and wait for the background thread to finish."""
+        if not self._thread:
+            return {'success': False, 'error': 'No job running'}
         try:
-            response = self.service.stop_optimization(self.current_session_id)
-            return response
-            
+            assert self._stop_event is not None
+            self._stop_event.set()
+            self._thread.join(timeout=10.0)
+            stopped = not self._thread.is_alive()
+            return {'success': True, 'stopped': stopped}
         except Exception as e:
-            return {
-                'success': False,
-                'error': str(e),
-                'message': 'Failed to stop optimization'
-            }
+            logger.exception("stop_optimization failed")
+            return {'success': False, 'error': str(e)}
     
     def get_optimization_status(self) -> Dict[str, Any]:
-        """Get status of the current optimization session."""
-        if not self.current_session_id:
-            return {
-                'success': False,
-                'error': 'No active session',
-                'message': 'No session to check'
-            }
-        
+        """Report background thread status."""
         try:
-            response = self.service.get_session_status(self.current_session_id)
-            return response
-            
+            status = 'idle'
+            if self._thread:
+                if self._last_error is not None:
+                    status = 'error'
+                else:
+                    status = 'running' if self._thread.is_alive() else 'completed'
+            data = {'status': status, 'run_id': self._run_id}
+            if self._last_error is not None:
+                data['error'] = self._last_error
+            return {'success': True, 'data': data}
         except Exception as e:
-            return {
-                'success': False,
-                'error': str(e),
-                'message': 'Failed to get optimization status'
-            }
+            logger.exception("get_optimization_status failed")
+            return {'success': False, 'error': str(e)}
     
     def get_results(self) -> Dict[str, Any]:
-        """Get results from the current optimization session."""
-        if not self.current_session_id:
-            return {
-                'success': False,
-                'error': 'No active session',
-                'message': 'No session to get results from'
-            }
-        
+        """Results are persisted in DB; this returns status only."""
         try:
-            response = self.service.get_session_status(self.current_session_id)
-            
-            if response.get('success') and response.get('data', {}).get('results'):
-                return {
-                    'success': True,
-                    'results': response['data']['results'],
-                    'statistics': response['data'].get('statistics', {}),
-                    'message': 'Results retrieved successfully'
-                }
-            else:
-                return {
-                    'success': False,
-                    'error': 'No results available',
-                    'message': 'Optimization may still be running or failed'
-                }
-            
+            completed = self._thread is not None and not self._thread.is_alive()
+            return {'success': True, 'results': {}, 'statistics': {}, 'completed': completed}
         except Exception as e:
-            return {
-                'success': False,
-                'error': str(e),
-                'message': 'Failed to get results'
-            }
+            logger.exception("get_results failed")
+            return {'success': False, 'error': str(e)}
     
     def cleanup_session(self) -> Dict[str, Any]:
-        """Clean up the current optimization session."""
-        if not self.current_session_id:
-            return {
-                'success': False,
-                'error': 'No active session',
-                'message': 'No session to cleanup'
-            }
-        
-        try:
-            response = self.service.cleanup_session(self.current_session_id)
-            if response.get('success'):
-                self.current_session_id = None
-            return response
-            
-        except Exception as e:
-            return {
-                'success': False,
-                'error': str(e),
-                'message': 'Failed to cleanup session'
-            }
+        self._thread = None
+        self._stop_event = None
+        self._run_id = None
+        return {'success': True}
     
     def validate_parameters(self, parameters: Dict[str, Any]) -> Dict[str, Any]:
         """Validate optimization parameters."""

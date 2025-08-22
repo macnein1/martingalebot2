@@ -7,11 +7,26 @@ Schema:
 from __future__ import annotations
 
 import json
+import numpy as np
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+
+def _jsonify(o: Any):
+    # numpy array -> list
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    # numpy scalars -> python scalars
+    if isinstance(o, np.generic):
+        return o.item()
+    # recursive containers
+    if isinstance(o, (list, tuple)):
+        return [ _jsonify(x) for x in o ]
+    if isinstance(o, dict):
+        return { k: _jsonify(v) for k, v in o.items() }
+    return o
 
 @dataclass
 class ExperimentRow:
@@ -34,7 +49,11 @@ class ExperimentRow:
 
 class ExperimentsStore:
     def __init__(self, db_path: str = "db_results/experiments.db"):
+        import os
+        from pathlib import Path
         self.db_path = db_path
+        # Ensure directory exists
+        Path(os.path.dirname(self.db_path) or ".").mkdir(parents=True, exist_ok=True)
         self._init_db()
 
     def _init_db(self) -> None:
@@ -161,10 +180,10 @@ class ExperimentsStore:
                         experiment_id,
                         row["stable_id"],
                         row["score"],
-                        json.dumps(row["params"], separators=(",", ":")),
-                        json.dumps(row["schedule"], separators=(",", ":")),
-                        json.dumps(row["risk"], separators=(",", ":")),
-                        json.dumps(row.get("penalties", {}), separators=(",", ":")),
+                        json.dumps(_jsonify(row["params"]), separators=(",", ":"), ensure_ascii=False),
+                        json.dumps(_jsonify(row["schedule"]), separators=(",", ":"), ensure_ascii=False),
+                        json.dumps(_jsonify(row["risk"]), separators=(",", ":"), ensure_ascii=False),
+                        json.dumps(_jsonify(row.get("penalties", {})), separators=(",", ":"), ensure_ascii=False),
                         now,
                     ),
                 )
