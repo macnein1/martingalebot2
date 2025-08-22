@@ -11,7 +11,7 @@ from typing import Dict, List, Any, Optional, Tuple, Callable
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from martingale_lab.optimizer.dca_evaluation_contract import evaluation_function
+from martingale_lab.optimizer.evaluation_engine import evaluation_function
 from martingale_lab.storage.experiments_store import ExperimentsStore
 
 
