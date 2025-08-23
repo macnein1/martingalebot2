@@ -12,8 +12,10 @@ from martingale_lab.utils.structured_logging import (
     get_structured_logger, EventNames, generate_run_id
 )
 from martingale_lab.orchestrator.adaptive_orchestrator import AdaptiveOrchestrator, OrchConfig
+from martingale_lab.storage.experiments_store import ExperimentsStore
 from ui.utils.logging_buffer import get_live_trace
 from ui.utils.constants import DB_PATH, Status
+from ui.utils.config import make_auto_config, get_system_info
 
 # Initialize structured logger for optimization bridge
 logger = get_structured_logger("mlab.bridge")
@@ -32,29 +34,42 @@ class OptimizationBridge:
         self.is_running = False
         self.current_run_id: Optional[str] = None
         self.progress_callback: Optional[Callable] = None
+        self._start_time: Optional[float] = None
         
-    def start_optimization(self, params: Dict[str, Any], 
-                          progress_callback: Optional[Callable] = None) -> str:
-        """
-        Start optimization in background thread
-        
-        Args:
-            params: Optimization parameters
-            progress_callback: Optional callback for progress updates
-            
-        Returns:
-            run_id: Unique identifier for this optimization run
-        """
-        if self.is_running:
-            raise RuntimeError("Optimization is already running")
-        
-        # Generate run ID
-        run_id = generate_run_id()
-        self.current_run_id = run_id
-        self.progress_callback = progress_callback
-        
-        # Create configuration
-        config = OrchConfig(
+    def _orch_config_from_params(self, run_id: str, params: Dict[str, Any]) -> OrchConfig:
+        """Build OrchConfig from either auto or manual params."""
+        use_auto = str(params.get('config_mode', '')).lower().startswith('auto') or params.get('auto', False)
+        if use_auto:
+            search_space = params.get('search_space') or {
+                'overlap_min': params.get('overlap_min', 10.0),
+                'overlap_max': params.get('overlap_max', 30.0),
+                'orders_min': params.get('orders_min', 5),
+                'orders_max': params.get('orders_max', 15),
+            }
+            sys_info = params.get('sys_info') or get_system_info()
+            dca_cfg = make_auto_config(search_space, sys_info)
+            # Map DCAConfig -> OrchConfig
+            return OrchConfig(
+                run_id=run_id,
+                overlap_min=dca_cfg.overlap_min,
+                overlap_max=dca_cfg.overlap_max,
+                orders_min=dca_cfg.orders_min,
+                orders_max=dca_cfg.orders_max,
+                alpha=dca_cfg.alpha,
+                beta=dca_cfg.beta,
+                gamma=dca_cfg.gamma,
+                lambda_penalty=dca_cfg.lambda_penalty,
+                wave_pattern=dca_cfg.wave_pattern,
+                tail_cap=dca_cfg.tail_cap,
+                min_indent_step=dca_cfg.min_indent_step,
+                softmax_temp=dca_cfg.softmax_temp,
+                batch_size=dca_cfg.n_candidates_per_batch,
+                max_batches=dca_cfg.max_batches,
+                patience=dca_cfg.early_stop_patience,
+                top_k=min(50, int(params.get('top_k', 50)))
+            )
+        # Manual config mapping
+        return OrchConfig(
             run_id=run_id,
             overlap_min=params.get('overlap_min', 10.0),
             overlap_max=params.get('overlap_max', 30.0),
@@ -68,13 +83,36 @@ class OptimizationBridge:
             tail_cap=params.get('tail_cap', 0.40),
             min_indent_step=params.get('min_indent_step', 0.05),
             softmax_temp=params.get('softmax_temp', 1.0),
-            batch_size=params.get('batch_size', 100),
+            batch_size=params.get('batch_size', params.get('n_candidates_per_batch', 100)),
             max_batches=params.get('max_batches', 50),
-            patience=params.get('patience', 5),
-            prune_factor=params.get('prune_factor', 2.0),
+            patience=params.get('patience', params.get('early_stop_patience', 5)),
             top_k=params.get('top_k', 50),
             base_price=params.get('base_price', 100.0)
         )
+        
+    def start_optimization(self, params: Dict[str, Any], 
+                          progress_callback: Optional[Callable] = None) -> str:
+        """
+        Start optimization in background thread
+        
+        Steps:
+        1) Build AutoConfig from search_space + sys_info if Auto selected
+        2) Run AdaptiveOrchestrator in background
+        3) Provide live logs via tail_logs('mlab') through get_live_logs()
+        4) Enrich progress with batches, rows inserted, best_score, evals/sec
+        5) On completion, ensure experiments row best_score/total_evals updated
+        """
+        if self.is_running:
+            raise RuntimeError("Optimization is already running")
+        
+        # Generate run ID
+        run_id = generate_run_id()
+        self.current_run_id = run_id
+        self.progress_callback = progress_callback
+        self._start_time = time.time()
+        
+        # Build orchestrator config
+        config = self._orch_config_from_params(run_id, params)
         
         # Log UI click start
         logger.info(
@@ -152,19 +190,42 @@ class OptimizationBridge:
         try:
             # Define progress callback wrapper
             def progress_wrapper(progress_data: Dict[str, Any]):
-                if self.progress_callback:
-                    try:
-                        self.progress_callback(progress_data)
-                    except Exception as e:
-                        logger.error(
-                            EventNames.ORCH_ERROR,
-                            f"Progress callback error: {str(e)}",
-                            run_id=self.current_run_id,
-                            error=str(e)
-                        )
+                # Enrich with evals/sec and rows inserted
+                try:
+                    now = time.time()
+                    elapsed = max(1e-6, (now - (self._start_time or now)))
+                    eval_count = int(progress_data.get('eval_count', 0))
+                    batch_stats = progress_data.get('batch_stats', {}) or {}
+                    rows_inserted = int(batch_stats.get('evaluated', 0))
+                    enriched = {
+                        'batch_idx': progress_data.get('batch_idx', 0),
+                        'batches_total': orchestrator.config.max_batches,
+                        'best_score': progress_data.get('best_score'),
+                        'eval_count': eval_count,
+                        'rows_inserted': rows_inserted,
+                        'evals_per_sec': eval_count / elapsed,
+                    }
+                    if self.progress_callback:
+                        self.progress_callback(enriched)
+                except Exception as e:
+                    logger.error(
+                        EventNames.ORCH_ERROR,
+                        f"Progress enrichment error: {str(e)}",
+                        run_id=self.current_run_id,
+                        error=str(e)
+                    )
             
             # Run optimization
             result = orchestrator.run_optimization(progress_callback=progress_wrapper)
+            
+            # Ensure DB row has final stats (best_score, total_evals)
+            try:
+                store = ExperimentsStore(self.db_path)
+                store.update_experiment_summary(
+                    orchestrator.exp_id, result.get('best_score', float('inf')), result.get('total_evals', 0), result.get('elapsed_s', 0.0)
+                )
+            except Exception:
+                pass
             
             # Log successful completion
             logger.info(
