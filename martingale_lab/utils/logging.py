@@ -1,228 +1,94 @@
 """
-Structured logging module for martingale optimization.
-Provides JSON logging with rotation and real-time UI integration.
+Clean JSONL logging system for CLI operations.
+Fields: ts (iso), lvl, logger, msg, optional run_id, exp_id, batch_idx, span_id
 """
-import logging
 import json
+import logging
 import sys
-import os
-from pathlib import Path
-from logging.handlers import RotatingFileHandler
-from typing import Dict, Any, Optional
 from datetime import datetime
+from typing import Optional
 
 
-def setup_logging(run_id: str, log_dir: str = "logs") -> logging.Logger:
-    """
-    Set up structured logging with file rotation and console output.
+class JSONLFormatter(logging.Formatter):
+    """JSON Lines formatter for structured logging."""
     
-    Args:
-        run_id: Unique run identifier
-        log_dir: Directory for log files
+    def format(self, record: logging.LogRecord) -> str:
+        log_entry = {
+            "ts": datetime.utcnow().isoformat() + "Z",
+            "lvl": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage()
+        }
         
-    Returns:
-        Configured logger instance
-    """
-    # Create log directory if it doesn't exist
-    Path(log_dir).mkdir(exist_ok=True)
+        # Add extra fields if present
+        if hasattr(record, 'run_id') and record.run_id:
+            log_entry["run_id"] = record.run_id
+        if hasattr(record, 'exp_id') and record.exp_id:
+            log_entry["exp_id"] = record.exp_id
+        if hasattr(record, 'batch_idx') and record.batch_idx is not None:
+            log_entry["batch_idx"] = record.batch_idx
+        if hasattr(record, 'span_id') and record.span_id:
+            log_entry["span_id"] = record.span_id
+        if hasattr(record, 'event') and record.event:
+            log_entry["event"] = record.event
+            
+        # Add any other extra fields
+        if hasattr(record, '__dict__'):
+            for key, value in record.__dict__.items():
+                if key not in ['name', 'msg', 'args', 'levelname', 'levelno', 'pathname', 'filename',
+                               'module', 'lineno', 'funcName', 'created', 'msecs', 'relativeCreated',
+                               'thread', 'threadName', 'processName', 'process', 'getMessage',
+                               'run_id', 'exp_id', 'batch_idx', 'span_id', 'event', 'exc_info', 'exc_text',
+                               'stack_info', 'taskName'] and not key.startswith('_'):
+                    if isinstance(value, (str, int, float, bool, type(None))):
+                        log_entry[key] = value
+                    elif hasattr(value, '__dict__'):
+                        continue  # Skip complex objects
+                    else:
+                        log_entry[key] = str(value)
+        
+        return json.dumps(log_entry, separators=(',', ':'))
+
+
+def get_logger(name: str) -> logging.Logger:
+    """Get a logger with JSONL formatting."""
+    logger = logging.getLogger(name)
     
-    # Create logger
-    logger = logging.getLogger("mlab")
-    logger.setLevel(logging.INFO)
-    
-    # Clear existing handlers
-    logger.handlers.clear()
-    
-    # Custom formatter for clean JSON output
-    formatter = logging.Formatter('%(message)s')
-    
-    # File handler with rotation (10MB files, keep 3 backups)
-    log_file = os.path.join(log_dir, f"{run_id}.log")
-    file_handler = RotatingFileHandler(
-        log_file, 
-        maxBytes=10_000_000,  # 10MB
-        backupCount=3,
-        encoding='utf-8'
-    )
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-    
-    # Console handler for real-time monitoring
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
+    # Only add handler if not already configured
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        formatter = JSONLFormatter()
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
     
     return logger
 
 
-def jlog(logger: logging.Logger, **kwargs: Any) -> None:
-    """
-    Log structured data as JSON.
+def log_with_context(logger: logging.Logger, level: str, message: str, 
+                    run_id: Optional[str] = None, exp_id: Optional[int] = None, 
+                    batch_idx: Optional[int] = None, event: Optional[str] = None, **kwargs):
+    """Log a message with context fields."""
+    extra = {}
+    if run_id:
+        extra['run_id'] = run_id
+    if exp_id:
+        extra['exp_id'] = exp_id
+    if batch_idx is not None:
+        extra['batch_idx'] = batch_idx
+    if event:
+        extra['event'] = event
     
-    Args:
-        logger: Logger instance
-        **kwargs: Key-value pairs to log as JSON
-    """
-    # Add timestamp if not present
-    if 'timestamp' not in kwargs:
-        kwargs['timestamp'] = datetime.utcnow().isoformat()
+    # Add any additional fields
+    extra.update(kwargs)
     
-    # Serialize to JSON with proper encoding
-    log_entry = json.dumps(kwargs, ensure_ascii=False, default=str)
-    logger.info(log_entry)
+    level_func = getattr(logger, level.lower())
+    level_func(message, extra=extra)
 
 
-class LogContext:
-    """Context manager for consistent logging with run context."""
-    
-    def __init__(self, logger: logging.Logger, run_id: str, 
-                 batch_id: Optional[str] = None, candidate_id: Optional[str] = None):
-        self.logger = logger
-        self.base_context = {
-            'run_id': run_id,
-            'batch_id': batch_id,
-            'candidate_id': candidate_id
-        }
-        # Remove None values
-        self.base_context = {k: v for k, v in self.base_context.items() if v is not None}
-    
-    def log(self, event: str, **kwargs: Any) -> None:
-        """Log event with base context."""
-        log_data = {**self.base_context, 'event': event, **kwargs}
-        jlog(self.logger, **log_data)
-    
-    def error(self, event: str, error: Exception, **kwargs: Any) -> None:
-        """Log error with context."""
-        log_data = {
-            **self.base_context, 
-            'event': event,
-            'error': str(error),
-            'error_type': type(error).__name__,
-            **kwargs
-        }
-        jlog(self.logger, **log_data)
-    
-    def timing(self, event: str, duration_ms: float, **kwargs: Any) -> None:
-        """Log timing information."""
-        log_data = {
-            **self.base_context,
-            'event': event,
-            'duration_ms': round(duration_ms, 3),
-            **kwargs
-        }
-        jlog(self.logger, **log_data)
-
-
-class LogReader:
-    """Utility for reading and filtering log files for UI display."""
-    
-    @staticmethod
-    def read_recent_logs(log_file: str, max_lines: int = 100) -> list:
-        """
-        Read recent log entries from file.
-        
-        Args:
-            log_file: Path to log file
-            max_lines: Maximum number of lines to return
-            
-        Returns:
-            List of parsed log entries (newest first)
-        """
-        if not os.path.exists(log_file):
-            return []
-        
-        entries = []
-        try:
-            with open(log_file, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-                
-            # Take last max_lines and reverse for newest first
-            recent_lines = lines[-max_lines:] if len(lines) > max_lines else lines
-            
-            for line in reversed(recent_lines):
-                line = line.strip()
-                if line:
-                    try:
-                        entry = json.loads(line)
-                        entries.append(entry)
-                    except json.JSONDecodeError:
-                        # Handle non-JSON lines gracefully
-                        entries.append({'message': line, 'timestamp': 'unknown'})
-                        
-        except Exception as e:
-            entries.append({'error': f'Failed to read log: {str(e)}'})
-        
-        return entries
-    
-    @staticmethod
-    def filter_logs(entries: list, event_filter: Optional[str] = None, 
-                   run_id_filter: Optional[str] = None) -> list:
-        """
-        Filter log entries by event type or run ID.
-        
-        Args:
-            entries: List of log entries
-            event_filter: Filter by event type (e.g., 'candidate_error', 'batch_end')
-            run_id_filter: Filter by run ID
-            
-        Returns:
-            Filtered list of entries
-        """
-        filtered = entries
-        
-        if event_filter:
-            filtered = [e for e in filtered if e.get('event') == event_filter]
-        
-        if run_id_filter:
-            filtered = [e for e in filtered if e.get('run_id') == run_id_filter]
-        
-        return filtered
-    
-    @staticmethod
-    def get_log_summary(log_file: str) -> Dict[str, Any]:
-        """
-        Get summary statistics from log file.
-        
-        Args:
-            log_file: Path to log file
-            
-        Returns:
-            Dictionary with log statistics
-        """
-        entries = LogReader.read_recent_logs(log_file, max_lines=1000)
-        
-        if not entries:
-            return {'total_entries': 0, 'events': {}, 'errors': 0}
-        
-        event_counts = {}
-        error_count = 0
-        
-        for entry in entries:
-            event = entry.get('event', 'unknown')
-            event_counts[event] = event_counts.get(event, 0) + 1
-            
-            if 'error' in entry or event.endswith('_error'):
-                error_count += 1
-        
-        return {
-            'total_entries': len(entries),
-            'events': event_counts,
-            'errors': error_count,
-            'latest_timestamp': entries[0].get('timestamp', 'unknown') if entries else None
-        }
-
-
-# Convenience function for quick setup
-def get_logger_for_run(run_id: str) -> tuple[logging.Logger, LogContext]:
-    """
-    Quick setup for run-specific logging.
-    
-    Args:
-        run_id: Unique run identifier
-        
-    Returns:
-        Tuple of (logger, log_context)
-    """
-    logger = setup_logging(run_id)
-    log_ctx = LogContext(logger, run_id)
-    return logger, log_ctx
+# Pre-configured loggers
+cli_logger = get_logger("mlab.cli")
+orchestrator_logger = get_logger("mlab.orchestrator") 
+eval_logger = get_logger("mlab.eval")
+db_logger = get_logger("mlab.db")

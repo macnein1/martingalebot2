@@ -3,10 +3,8 @@ SQLite storage for optimization results and traces.
 """
 import sqlite3
 import json
-import numpy as np
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
-import pickle
 
 from ..core.types import Params, Schedule, ScoreBreakdown
 

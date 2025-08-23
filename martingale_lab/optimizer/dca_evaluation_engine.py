@@ -8,11 +8,10 @@ import hashlib
 import json
 import numpy as np
 from typing import Dict, Any, List, Tuple
-import math
 
 from martingale_lab.core.penalties import compute_all_penalties, compute_composite_score
 from martingale_lab.core.constraints import apply_soft_constraints, DEFAULT_CONSTRAINT_WEIGHTS
-from martingale_lab.core.jit_kernels import evaluate_single_candidate, need_curve_calculation
+from martingale_lab.core.jit_kernels import need_curve_calculation
 
 
 def create_stable_id(params: Dict[str, Any]) -> str:

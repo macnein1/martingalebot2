@@ -4,7 +4,6 @@ Common interfaces for martingale optimization.
 from typing import Protocol, List, Dict, Any, Optional
 from dataclasses import dataclass
 from datetime import datetime
-import numpy as np
 
 
 @dataclass

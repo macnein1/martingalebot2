@@ -4,20 +4,13 @@ Implements evaluation_function exactly as defined in README specification.
 """
 from __future__ import annotations
 
-import hashlib
-import json
 import numpy as np
 import time
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional, Tuple
 import math
 
-from martingale_lab.utils.structured_logging import (
-    get_structured_logger, EventNames, Timer, ensure_json_serializable
-)
-
-# Initialize structured logger for evaluation
-logger = get_structured_logger("mlab.eval")
+from martingale_lab.utils.logging import eval_logger as logger
 
 
 def _ensure_json_serializable(obj):
@@ -140,15 +133,17 @@ def evaluation_function(
     
     # Log evaluation call
     logger.info(
-        EventNames.EVAL_CALL,
         "Starting evaluation",
-        overlap=overlap_pct,
-        orders=num_orders,
-        wave_pattern=wave_pattern,
-        alpha=alpha,
-        beta=beta,
-        gamma=gamma,
-        lambda_penalty=lambda_penalty
+        extra={
+            "event": "EVAL_CALL",
+            "overlap": overlap_pct,
+            "orders": num_orders,
+            "wave_pattern": wave_pattern,
+            "alpha": alpha,
+            "beta": beta,
+            "gamma": gamma,
+            "lambda_penalty": lambda_penalty
+        }
     )
     
     try:
@@ -308,15 +303,17 @@ def evaluation_function(
         # Log successful evaluation
         duration_ms = (time.time() - start_time) * 1000
         logger.info(
-            EventNames.EVAL_RETURN,
             "Evaluation completed successfully",
-            score=float(score),
-            max_need=float(max_need),
-            var_need=float(var_need),
-            tail=float(tail),
-            duration_ms=duration_ms,
-            sanity_violations=sum(1 for v in sanity.values() if v),
-            penalty_sum=penalty_sum
+            extra={
+                "event": "EVAL_RETURN",
+                "score": float(score),
+                "max_need": float(max_need),
+                "var_need": float(var_need),
+                "tail": float(tail),
+                "duration_ms": duration_ms,
+                "sanity_violations": sum(1 for v in sanity.values() if v),
+                "penalty_sum": penalty_sum
+            }
         )
         
         # Return complete dict exactly as specified in README
@@ -336,12 +333,14 @@ def evaluation_function(
         # Log evaluation error
         duration_ms = (time.time() - start_time) * 1000
         logger.error(
-            EventNames.EVAL_ERROR,
             f"Evaluation failed: {str(e)}",
-            error=str(e),
-            duration_ms=duration_ms,
-            overlap=overlap_pct,
-            orders=num_orders
+            extra={
+                "event": "EVAL_ERROR",
+                "error": str(e),
+                "duration_ms": duration_ms,
+                "overlap": overlap_pct,
+                "orders": num_orders
+            }
         )
         
         # Never throw - return error state as complete dict

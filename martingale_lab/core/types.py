@@ -2,7 +2,7 @@
 Core data types for martingale optimization.
 """
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Any
+from typing import Dict, Any
 import numpy as np
 
 

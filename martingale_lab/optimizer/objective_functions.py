@@ -2,9 +2,8 @@
 Objective functions for martingale optimization.
 """
 import numpy as np
-from typing import List, Dict, Any, Callable
+from typing import List, Dict, Callable
 from ..core.types import ScoreBreakdown
-from ..core.penalties import CompositePenalty
 
 
 class ObjectiveFunction:

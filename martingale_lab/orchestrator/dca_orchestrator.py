@@ -5,8 +5,6 @@ Integrates new evaluation contract with adaptive search, early pruning, and batc
 from __future__ import annotations
 
 import time
-import logging
-import traceback
 from dataclasses import dataclass
 from typing import Dict, List, Any, Optional, Tuple, Callable
 import numpy as np
@@ -14,8 +12,57 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from martingale_lab.optimizer.evaluation_engine import evaluation_function
 from martingale_lab.storage.experiments_store import ExperimentsStore
-from ui.utils.structured_logging import Events, orch_logger, LogContext, generate_run_id, create_crash_snapshot
-from ui.utils.constants import Status
+from martingale_lab.utils.logging import orchestrator_logger as orch_logger
+
+def generate_run_id() -> str:
+    """Generate a unique run ID"""
+    from datetime import datetime
+    import secrets
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    random_suffix = secrets.token_hex(4).upper()
+    return f"{timestamp}-{random_suffix}"
+
+def create_crash_snapshot(run_id: str, params: Dict[str, Any], error_msg: str) -> str:
+    """Create a crash snapshot file"""
+    from pathlib import Path
+    import json
+    from datetime import datetime
+    
+    crash_dir = Path("db_results/crash_snapshots")
+    crash_dir.mkdir(parents=True, exist_ok=True)
+    
+    snapshot = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "run_id": run_id,
+        "params": params,
+        "error": error_msg
+    }
+    
+    filename = f"{run_id}_{int(time.time())}.json"
+    filepath = crash_dir / filename
+    
+    with open(filepath, 'w') as f:
+        json.dump(snapshot, f, indent=2, default=str)
+    
+    return str(filepath)
+
+class LogContext:
+    """Simple context manager for run/exp/batch IDs"""
+    _run_id = None
+    _exp_id = None
+    _batch_idx = None
+    
+    @classmethod
+    def set_run_id(cls, run_id: str):
+        cls._run_id = run_id
+    
+    @classmethod  
+    def set_exp_id(cls, exp_id: int):
+        cls._exp_id = exp_id
+        
+    @classmethod
+    def set_batch_idx(cls, batch_idx: int):
+        cls._batch_idx = batch_idx
 
 
 @dataclass
@@ -221,12 +268,17 @@ class DCAOrchestrator:
             error_msg = str(e)
             crash_file = create_crash_snapshot(self.run_id, params, error_msg)
             
-            self.logger.event(
-                Events.EVAL_ERROR,
-                error=error_msg,
-                crash_file=crash_file,
-                overlap=params.get("overlap_pct"),
-                orders=params.get("num_orders")
+            self.logger.error(
+                f"Evaluation error: {error_msg}",
+                extra={
+                    "event": "EVAL_ERROR",
+                    "run_id": self.run_id,
+                    "exp_id": self.current_experiment_id,
+                    "error": error_msg,
+                    "crash_file": crash_file,
+                    "overlap": params.get("overlap_pct"),
+                    "orders": params.get("num_orders")
+                }
             )
             
             return {
@@ -311,7 +363,7 @@ class DCAOrchestrator:
         
         # Log pruning event
         self.logger.info(
-            "ORCH.PRUNE",
+            f"ORCH.PRUNE: mode={self.orch_config.prune_mode}, kept={kept}, pruned={pruned}",
             extra={
                 "event": "ORCH.PRUNE",
                 "run_id": self.run_id,
@@ -319,7 +371,7 @@ class DCAOrchestrator:
                 "batch_idx": batch_idx,
                 "mode": self.orch_config.prune_mode,
                 "best": float(best),
-                "threshold": float(thresh) if thresh is not None else np.nan,
+                "threshold": float(thresh) if thresh is not None else float('nan'),
                 "kept": kept,
                 "pruned": pruned
             }
@@ -371,7 +423,7 @@ class DCAOrchestrator:
         if should_stop:
             self.early_stop_reason = reason
             self.logger.info(
-                "ORCH.EARLY_STOP",
+                f"ORCH.EARLY_STOP: {reason}, stalls={self.stalls}",
                 extra={
                     "event": "ORCH.EARLY_STOP",
                     "run_id": self.run_id,
@@ -402,7 +454,7 @@ class DCAOrchestrator:
         
         # Log orchestrator start with config snapshot
         self.logger.info(
-            "ORCH.START",
+            f"ORCH.START: DCAOrchestrator run_id={self.run_id} exp_id={self.current_experiment_id}",
             extra={
                 "event": "ORCH.START",
                 "run_id": self.run_id,
@@ -465,7 +517,7 @@ class DCAOrchestrator:
                 # Log batch summary
                 mode = "exhaustive" if self.orch_config.exhaustive_mode else "adaptive"
                 self.logger.info(
-                    "BATCH_END",
+                    f"BATCH_END: batch={batch_idx}, best={self.best_score:.4f}, evaluated={len(batch_results)}, kept={post_prune_count}",
                     extra={
                         "event": "BATCH_END",
                         "run_id": self.run_id,

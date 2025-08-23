@@ -9,18 +9,28 @@ from datetime import datetime
 from dataclasses import dataclass, asdict
 from typing import Dict, Any, List, Optional, Callable
 import numpy as np
-import os
+from pathlib import Path
 
-from martingale_lab.utils.structured_logging import (
-    get_structured_logger, EventNames, Timer, generate_run_id, generate_span_id,
-    ensure_json_serializable
-)
+from martingale_lab.utils.logging import orchestrator_logger as logger
 from martingale_lab.optimizer.evaluation_engine import evaluation_function
-from martingale_lab.storage.experiments_store import ExperimentsStore
-from ui.utils.constants import DB_PATH, Status, CRASH_SNAPSHOTS_DIR
+from martingale_lab.storage.experiments_store import ExperimentsStore, Status
 
-# Initialize structured logger for orchestrator
-logger = get_structured_logger("mlab.orch")
+# Constants
+DB_PATH = "db_results/experiments.db"
+CRASH_SNAPSHOTS_DIR = Path("db_results/crash_snapshots")
+CRASH_SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+
+def generate_run_id() -> str:
+    """Generate a unique run ID"""
+    from datetime import datetime
+    import secrets
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    random_suffix = secrets.token_hex(4).upper()
+    return f"{timestamp}-{random_suffix}"
+
+def generate_span_id(batch_idx: int) -> str:
+    """Generate a span ID for a batch"""
+    return f"batch_{batch_idx:03d}"
 
 
 @dataclass
@@ -68,7 +78,7 @@ class AdaptiveOrchestrator:
         
         # Initialize with structured logging
         logger.info(
-            EventNames.ORCH_START,
+            "mlab.orch.orch_start",
             f"Initializing orchestrator with run_id {config.run_id}",
             run_id=config.run_id,
             config_json=json.dumps(asdict(config), default=str)
@@ -86,7 +96,7 @@ class AdaptiveOrchestrator:
         )
         
         logger.info(
-            EventNames.BUILD_CONFIG,
+            "mlab.orch.build_config",
             f"Created experiment {self.exp_id}",
             run_id=self.config.run_id,
             exp_id=self.exp_id,
@@ -115,39 +125,57 @@ class AdaptiveOrchestrator:
     def evaluate_candidate(self, candidate: Dict[str, Any], 
                           run_id: str, exp_id: int, span_id: str) -> Optional[Dict[str, Any]]:
         """Evaluate a single candidate with timing and logging"""
-        with Timer() as timer:
-            # Log evaluation call
-            logger.info(
-                EventNames.EVAL_CALL,
-                "Calling evaluation function",
-                run_id=run_id,
-                exp_id=exp_id,
-                span_id=span_id,
-                eval_count=self.eval_count + 1,
-                overlap=candidate['overlap_pct'],
-                orders=candidate['num_orders']
-            )
-            
-            # Call evaluation function
-            result = evaluation_function(**candidate)
-            
-            # Ensure JSON serializable
-            result = ensure_json_serializable(result)
-            
-            # Log evaluation return
-            logger.info(
-                EventNames.EVAL_RETURN,
-                f"Evaluation completed with score {result['score']:.4f}",
-                run_id=run_id,
-                exp_id=exp_id,
-                span_id=span_id,
-                eval_count=self.eval_count + 1,
-                score=result['score'],
-                duration_ms=timer.duration_ms,
-                sanity_violations=sum(1 for v in result.get('sanity', {}).values() if v)
-            )
-            
-            return result
+        start_time = time.time()
+        
+        # Log evaluation call
+        logger.info(
+            "Calling evaluation function",
+            extra={
+                "event": "mlab.orch.eval_call",
+                "run_id": run_id,
+                "exp_id": exp_id,
+                "span_id": span_id,
+                "eval_count": self.eval_count + 1,
+                "overlap": candidate['overlap_pct'],
+                "orders": candidate['num_orders']
+            }
+        )
+        
+        # Call evaluation function
+        result = evaluation_function(**candidate)
+        
+        # Ensure JSON serializable - convert numpy arrays
+        def ensure_json_serializable(obj):
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, np.generic):
+                return obj.item()
+            elif isinstance(obj, dict):
+                return {k: ensure_json_serializable(v) for k, v in obj.items()}
+            elif isinstance(obj, (list, tuple)):
+                return [ensure_json_serializable(item) for item in obj]
+            return obj
+        
+        result = ensure_json_serializable(result)
+        
+        duration_ms = (time.time() - start_time) * 1000
+        
+        # Log evaluation return
+        logger.info(
+            f"Evaluation completed with score {result['score']:.4f}",
+            extra={
+                "event": "mlab.orch.eval_return",
+                "run_id": run_id,
+                "exp_id": exp_id,
+                "span_id": span_id,
+                "eval_count": self.eval_count + 1,
+                "score": result['score'],
+                "duration_ms": duration_ms,
+                "sanity_violations": sum(1 for v in result.get('sanity', {}).values() if v)
+            }
+        )
+        
+        return result
     
     def should_prune(self, score: float) -> bool:
         """Determine if candidate should be pruned"""
@@ -179,7 +207,7 @@ class AdaptiveOrchestrator:
         batch_start = time.time()
         
         logger.info(
-            EventNames.ORCH_BATCH,
+            "mlab.orch.orch_batch",
             f"Starting batch {batch_idx}",
             run_id=self.config.run_id,
             exp_id=self.exp_id,
@@ -209,7 +237,7 @@ class AdaptiveOrchestrator:
             if self.should_prune(score):
                 pruned_count += 1
                 logger.debug(
-                    EventNames.ORCH_PRUNE,
+                    "mlab.orch.orch_prune",
                     f"Pruned candidate with score {score:.4f}",
                     run_id=self.config.run_id,
                     exp_id=self.exp_id,
@@ -225,7 +253,7 @@ class AdaptiveOrchestrator:
             
             if improved:
                 logger.info(
-                    EventNames.ORCH_BATCH,
+                    "mlab.orch.orch_batch",
                     f"New best score: {score:.4f}",
                     run_id=self.config.run_id,
                     exp_id=self.exp_id,
@@ -238,7 +266,7 @@ class AdaptiveOrchestrator:
         if batch_results:
             rows_saved = self.store.upsert_results(self.exp_id, batch_results)
             logger.info(
-                EventNames.ORCH_SAVE_OK,
+                "mlab.orch.orch_save_ok",
                 f"Saved {rows_saved} results from batch {batch_idx}",
                 run_id=self.config.run_id,
                 exp_id=self.exp_id,
@@ -249,7 +277,7 @@ class AdaptiveOrchestrator:
         # Log pruning statistics
         if pruned_count > 0:
             logger.info(
-                EventNames.ORCH_PRUNE,
+                "mlab.orch.orch_prune",
                 f"Pruned {pruned_count} candidates in batch {batch_idx}",
                 run_id=self.config.run_id,
                 exp_id=self.exp_id,
@@ -271,7 +299,7 @@ class AdaptiveOrchestrator:
         self.patience_counter += 1
         if self.patience_counter >= self.config.patience:
             logger.info(
-                EventNames.ORCH_EARLY_STOP,
+                "mlab.orch.orch_early_stop",
                 f"Early stopping after {self.patience_counter} batches without improvement",
                 run_id=self.config.run_id,
                 exp_id=self.exp_id,
@@ -349,7 +377,7 @@ class AdaptiveOrchestrator:
             
             # Log completion
             logger.info(
-                EventNames.ORCH_DONE,
+                "mlab.orch.orch_done",
                 f"Optimization completed successfully",
                 run_id=self.config.run_id,
                 exp_id=self.exp_id,
@@ -381,7 +409,7 @@ class AdaptiveOrchestrator:
             snapshot_path = self.save_crash_snapshot(e, context)
             
             logger.error(
-                EventNames.ORCH_ERROR,
+                "mlab.orch.orch_error",
                 f"Optimization failed: {str(e)}",
                 run_id=self.config.run_id,
                 exp_id=self.exp_id,
@@ -434,7 +462,7 @@ class AdaptiveOrchestrator:
         """Signal orchestrator to stop gracefully"""
         self.should_stop = True
         logger.info(
-            EventNames.ORCH_EARLY_STOP,
+            "mlab.orch.orch_early_stop",
             "Stop signal received",
             run_id=self.config.run_id,
             exp_id=self.exp_id

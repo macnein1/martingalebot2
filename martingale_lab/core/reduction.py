@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import numpy as np
 from numba import njit
-from typing import Dict, List, Any, Tuple, Optional
+from typing import Dict, List, Any, Tuple
 import math
 
 

@@ -15,10 +15,6 @@ numba>=0.58.0
 structlog>=22.0.0
 psutil>=5.9.0
 
-# UI and visualization
-streamlit>=1.28.0
-plotly>=5.15.0
-
 # Testing
 pytest>=6.2.0
 pytest-cov>=3.0.0
