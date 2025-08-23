@@ -37,13 +37,29 @@ def main():
         st.session_state.optimization_results = None
     if 'config_mode' not in st.session_state:
         st.session_state.config_mode = "Auto (önerilen)"
+    if 'current_page' not in st.session_state:
+        st.session_state.current_page = "main"
     
     # Main header
     st.title("🎯 DCA/Martingale Optimizer")
     st.markdown("**İşlemden En Hızlı Çıkış** - Optimized for fastest exit strategies")
     
-    # Single main page: configuration + start + live progress
-    render_main_page()
+    # Navigation buttons
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col1:
+        if st.button("🏠 Main", type="primary" if st.session_state.current_page == "main" else "secondary"):
+            st.session_state.current_page = "main"
+            st.rerun()
+    with col3:
+        if st.button("📋 Results", type="primary" if st.session_state.current_page == "results" else "secondary"):
+            st.session_state.current_page = "results"
+            st.rerun()
+    
+    # Page routing
+    if st.session_state.current_page == "main":
+        render_main_page()
+    else:
+        render_results_page()
 
 
 def render_main_page():
@@ -54,17 +70,21 @@ def render_main_page():
     config_mode = st.radio("Konfigürasyon modu", ["Auto (önerilen)", "Manual"], horizontal=True, key="config_mode")
     auto_mode = config_mode == "Auto (önerilen)"
     
+    # Show auto mode info
+    if auto_mode:
+        st.info("🤖 **Auto Mode**: Sadece Search Space parametrelerini ayarlayın. Diğer tüm ayarlar sistem kaynaklarına göre otomatik hesaplanacak.")
+    
     # Parameter inputs with new DCA contract parameters
     st.subheader("Search Space")
     col1, col2 = st.columns(2)
     
     with col1:
-        overlap_min = st.number_input("Min Overlap %", min_value=1.0, max_value=50.0, value=10.0, step=0.5, key="overlap_min", disabled=auto_mode)
-        overlap_max = st.number_input("Max Overlap %", min_value=1.0, max_value=50.0, value=30.0, step=0.5, key="overlap_max", disabled=auto_mode)
+        overlap_min = st.number_input("Min Overlap %", min_value=1.0, max_value=50.0, value=10.0, step=0.5, key="overlap_min", disabled=False)  # Always enabled
+        overlap_max = st.number_input("Max Overlap %", min_value=1.0, max_value=50.0, value=30.0, step=0.5, key="overlap_max", disabled=False)  # Always enabled
         
     with col2:
-        orders_min = st.number_input("Min Orders", min_value=2, max_value=30, value=5, step=1, key="orders_min", disabled=auto_mode)
-        orders_max = st.number_input("Max Orders", min_value=2, max_value=30, value=15, step=1, key="orders_max", disabled=auto_mode)
+        orders_min = st.number_input("Min Orders", min_value=2, max_value=30, value=5, step=1, key="orders_min", disabled=False)  # Always enabled
+        orders_max = st.number_input("Max Orders", min_value=2, max_value=30, value=15, step=1, key="orders_max", disabled=False)  # Always enabled
     
     with st.expander("Advanced", expanded=False):
         st.subheader("Scoring Weights")
@@ -107,6 +127,27 @@ def render_main_page():
         with col3:
             random_seed = st.number_input("Random Seed", 0, 999999, 42, 1, key="random_seed", disabled=auto_mode)
             top_k_keep = st.number_input("Top K Keep", 1000, 50000, 10000, 1000, key="top_k_keep", disabled=auto_mode)
+        
+        st.subheader("Pruning & Early Stop")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            prune_enabled = st.checkbox("Enable Pruning", value=True, key="prune_enabled", disabled=auto_mode)
+            prune_mode = st.selectbox("Prune Mode", ["quantile", "multiplier", "none"], key="prune_mode", disabled=auto_mode)
+            if prune_mode == "quantile":
+                prune_quantile = st.slider("Prune Quantile", 0.1, 0.9, 0.5, 0.1, key="prune_quantile", disabled=auto_mode)
+            elif prune_mode == "multiplier":
+                prune_multiplier = st.slider("Prune Multiplier", 1.0, 3.0, 1.2, 0.1, key="prune_multiplier", disabled=auto_mode)
+        with col2:
+            prune_min_keep = st.number_input("Min Keep", 10, 1000, 50, 10, key="prune_min_keep", disabled=auto_mode)
+            prune_grace_batches = st.number_input("Grace Batches", 0, 10, 3, 1, key="prune_grace_batches", disabled=auto_mode)
+        with col3:
+            early_stop_enabled = st.checkbox("Enable Early Stop", value=True, key="early_stop_enabled", disabled=auto_mode)
+            early_stop_delta = st.number_input("Early Stop Delta", 1e-8, 1e-3, 1e-6, 1e-7, format="%.1e", key="early_stop_delta", disabled=auto_mode)
+        
+        st.subheader("Exhaustive Mode")
+        exhaustive_mode = st.checkbox("Full Grid (No Pruning, No Early Stop)", value=False, key="exhaustive_mode", disabled=auto_mode)
+        if exhaustive_mode:
+            st.info("🔍 **Exhaustive Mode**: Tüm kombinasyonları tarayacak, kırpma ve erken durma yok.")
     
     # Save configuration
     if st.button("Save Configuration", type="primary"):
@@ -143,7 +184,24 @@ def render_main_page():
                 top_k_keep=top_k_keep
             )
         
+        # Create orchestrator config
+        from martingale_lab.orchestrator.dca_orchestrator import OrchestratorConfig
+        
+        orch_config = OrchestratorConfig(
+            prune_enabled=st.session_state.get("prune_enabled", True),
+            prune_mode=st.session_state.get("prune_mode", "quantile"),
+            prune_quantile=st.session_state.get("prune_quantile", 0.5),
+            prune_multiplier=st.session_state.get("prune_multiplier", 1.2),
+            prune_min_keep=st.session_state.get("prune_min_keep", 50),
+            prune_grace_batches=st.session_state.get("prune_grace_batches", 3),
+            early_stop_enabled=st.session_state.get("early_stop_enabled", True),
+            early_stop_patience=st.session_state.get("early_stop_patience", 10),
+            early_stop_delta=st.session_state.get("early_stop_delta", 1e-6),
+            exhaustive_mode=st.session_state.get("exhaustive_mode", False)
+        )
+        
         st.session_state.dca_config = config
+        st.session_state.orch_config = orch_config
         st.success("Configuration saved successfully!")
         
         # Show configuration summary
@@ -174,6 +232,18 @@ def render_main_page():
                     "max_batches": config.max_batches,
                     "workers": config.n_workers,
                     "early_stop_patience": config.early_stop_patience
+                },
+                "orchestrator": {
+                    "prune_enabled": orch_config.prune_enabled,
+                    "prune_mode": orch_config.prune_mode,
+                    "prune_quantile": orch_config.prune_quantile,
+                    "prune_multiplier": orch_config.prune_multiplier,
+                    "prune_min_keep": orch_config.prune_min_keep,
+                    "prune_grace_batches": orch_config.prune_grace_batches,
+                    "early_stop_enabled": orch_config.early_stop_enabled,
+                    "early_stop_patience": orch_config.early_stop_patience,
+                    "early_stop_delta": orch_config.early_stop_delta,
+                    "exhaustive_mode": orch_config.exhaustive_mode
                 }
             })
     
@@ -253,6 +323,12 @@ def run_optimization(config: DCAConfig, notes: str = ""):
     
     try:
         # Create orchestrator
+        orch_config = st.session_state.get('orch_config')
+        if not orch_config:
+            st.error("Orchestrator configuration not found. Please save configuration first.")
+            st.session_state.optimization_running = False
+            return
+
         orchestrator = create_dca_orchestrator(
             overlap_range=(config.overlap_min, config.overlap_max),
             orders_range=(config.orders_min, config.orders_max),
@@ -269,9 +345,18 @@ def run_optimization(config: DCAConfig, notes: str = ""):
             min_indent_step=config.min_indent_step,
             softmax_temp=config.softmax_temp,
             n_workers=config.n_workers,
-            early_stop_patience=config.early_stop_patience,
             random_seed=config.random_seed,
-            top_k_keep=config.top_k_keep
+            top_k_keep=config.top_k_keep,
+            prune_enabled=orch_config.prune_enabled,
+            prune_mode=orch_config.prune_mode,
+            prune_quantile=orch_config.prune_quantile,
+            prune_multiplier=orch_config.prune_multiplier,
+            prune_min_keep=orch_config.prune_min_keep,
+            prune_grace_batches=orch_config.prune_grace_batches,
+            early_stop_enabled=orch_config.early_stop_enabled,
+            early_stop_patience=orch_config.early_stop_patience,
+            early_stop_delta=orch_config.early_stop_delta,
+            exhaustive_mode=orch_config.exhaustive_mode
         )
         
         # Progress callback
@@ -324,15 +409,29 @@ def run_optimization(config: DCAConfig, notes: str = ""):
             st.metric("Early Stopped", "Yes" if stats['early_stopped'] else "No")
             st.metric("Sanity Violations", f"{stats['sanity_violations']:,}")
         
+        # Show stop reason and prune summary
+        if stats.get('early_stopped'):
+            st.info(f"🛑 **Stop Reason**: Early stop - {stats.get('early_stop_reason', 'no improvement')}")
+        
+        # Show prune summary from logs
+        logs = get_live_trace("mlab", last_n=50)
+        if logs:
+            prune_logs = [log for log in logs if log.get('event') == 'ORCH.PRUNE']
+            if prune_logs:
+                last_prune = prune_logs[-1]
+                st.info(f"✂️ **Prune Summary**: {last_prune.get('mode', 'unknown')} mode, "
+                       f"threshold: {last_prune.get('threshold', 'N/A'):.3f}, "
+                       f"kept: {last_prune.get('kept', 0)}/{last_prune.get('evaluated', 0)}")
+
     except Exception as e:
         st.session_state.optimization_running = False
         st.error(f"Optimization failed: {str(e)}")
 
 
 def render_results_page():
-    """Render the results page (kept for backward import compatibility)."""
-    experiment_id = st.session_state.get('current_experiment_id')
-    render_results_section(experiment_id)
+    """Render the results page."""
+    from ui.pages.results_page import main as results_main
+    results_main()
 
 
 if __name__ == "__main__":

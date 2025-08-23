@@ -19,6 +19,27 @@ from ui.utils.constants import Status
 
 
 @dataclass
+class OrchestratorConfig:
+    """Configuration for orchestrator behavior (pruning, early stopping, etc.)."""
+    # Pruning configuration
+    prune_enabled: bool = True
+    prune_mode: str = "quantile"    # ["quantile", "multiplier", "none"]
+    prune_quantile: float = 0.5     # en kötü %50'yi kes (ör: 0.5)
+    prune_multiplier: float = 1.20  # cand_score <= best_score * 1.20 ise tut
+    prune_min_keep: int = 50        # en az bu kadar adayı KESME
+    prune_grace_batches: int = 3    # ilk N batch'te kırpma YAPMA
+
+    # Early stop configuration
+    early_stop_enabled: bool = True
+    early_stop_patience: int = 10   # kaç batch iyileşme olmazsa dur
+    early_stop_delta: float = 1e-6  # iyileşme eşiği (daha iyi = daha küçük)
+
+    # Full grid/exhaustive mode
+    exhaustive_mode: bool = False   # True => hiç pruning yok, hiç early stop yok
+    exhaustive_progress_total: Optional[int] = None  # toplam kombinasyon (UI progress)
+
+
+@dataclass
 class DCAConfig:
     """Configuration for DCA optimization."""
     # Search space
@@ -63,8 +84,10 @@ class DCAConfig:
 class DCAOrchestrator:
     """Main orchestrator for DCA optimization with new evaluation contract."""
     
-    def __init__(self, config: DCAConfig, store: Optional[ExperimentsStore] = None, run_id: Optional[str] = None):
+    def __init__(self, config: DCAConfig, store: Optional[ExperimentsStore] = None, 
+                 run_id: Optional[str] = None, orch_config: Optional[OrchestratorConfig] = None):
         self.config = config
+        self.orch_config = orch_config or OrchestratorConfig()
         self.store = store or ExperimentsStore()
         self.logger = orch_logger
         self.run_id = run_id or generate_run_id()
@@ -79,7 +102,9 @@ class DCAOrchestrator:
         self.total_evaluations = 0
         self.start_time = 0.0
         self.best_score = float("inf")
-        self.patience_counter = 0
+        self.best_score_so_far = float("inf")
+        self.stalls = 0
+        self.early_stop_reason: Optional[str] = None
         
         # Statistics
         self.stats = {
@@ -246,41 +271,62 @@ class DCAOrchestrator:
         
         return results
     
-    def early_pruning(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Apply early pruning based on partial evaluation metrics."""
+    def apply_pruning(self, results: List[Dict[str, Any]], batch_idx: int) -> List[Dict[str, Any]]:
+        """Apply pruning based on orchestrator configuration."""
         if not results:
             return results
         
-        # Filter out infinite scores and sanity violations
-        valid_results = []
-        for result in results:
-            score = result.get("score", float("inf"))
-            sanity = result.get("sanity", {})
-            
-            # Skip infinite scores
-            if not np.isfinite(score):
-                continue
-            
-            # Skip severe sanity violations (optional - can be made configurable)
-            severe_violations = (
-                sanity.get("max_need_mismatch", False) and
-                sanity.get("collapse_indents", False)
-            )
-            
-            if not severe_violations:
-                valid_results.append(result)
+        # Extract scores
+        scores = np.array([r.get("score", float("inf")) for r in results])
         
-        # Early pruning: keep only candidates with score < current_best * 1.5
-        if self.best_score < float("inf"):
-            threshold = self.best_score * 1.5
-            pruned_results = [r for r in valid_results if r.get("score", float("inf")) < threshold]
-            
-            if len(pruned_results) < len(valid_results):
-                self.logger.info(f"Early pruning: kept {len(pruned_results)}/{len(valid_results)} candidates")
-            
-            return pruned_results
+        # Skip pruning if disabled or in grace period
+        if not self.orch_config.prune_enabled or batch_idx < self.orch_config.prune_grace_batches:
+            return results
         
-        return valid_results
+        # Skip pruning in exhaustive mode
+        if self.orch_config.exhaustive_mode:
+            return results
+        
+        best = np.min(scores)
+        keep_mask = np.ones_like(scores, dtype=bool)
+        thresh = None
+        
+        # Apply pruning based on mode
+        if self.orch_config.prune_mode == "quantile":
+            thresh = np.quantile(scores, self.orch_config.prune_quantile)
+            keep_mask = scores <= thresh + 1e-12
+        elif self.orch_config.prune_mode == "multiplier":
+            thresh = best * self.orch_config.prune_multiplier
+            keep_mask = scores <= thresh + 1e-12
+        
+        # Apply min_keep safety
+        if keep_mask.sum() < self.orch_config.prune_min_keep:
+            # Keep the best prune_min_keep candidates
+            order = np.argsort(scores)
+            keep_mask[:] = False
+            keep_mask[order[:self.orch_config.prune_min_keep]] = True
+        
+        kept = int(keep_mask.sum())
+        pruned = int(len(scores) - kept)
+        
+        # Log pruning event
+        self.logger.info(
+            "ORCH.PRUNE",
+            extra={
+                "event": "ORCH.PRUNE",
+                "run_id": self.run_id,
+                "exp_id": self.current_experiment_id,
+                "batch_idx": batch_idx,
+                "mode": self.orch_config.prune_mode,
+                "best": float(best),
+                "threshold": float(thresh) if thresh is not None else np.nan,
+                "kept": kept,
+                "pruned": pruned
+            }
+        )
+        
+        # Return kept results
+        return [r for i, r in enumerate(results) if keep_mask[i]]
     
     def update_best_candidates(self, new_results: List[Dict[str, Any]]):
         """Update the list of best candidates."""
@@ -293,18 +339,51 @@ class DCAOrchestrator:
         # Keep top K
         self.best_candidates = all_candidates[:self.config.top_k_keep]
         
-        # Update best score
+        # Update best score and early stopping logic
         if self.best_candidates:
             new_best = self.best_candidates[0].get("score", float("inf"))
-            if new_best < self.best_score - self.config.early_stop_threshold:
-                self.best_score = new_best
-                self.patience_counter = 0  # Reset patience
+            
+            # Check for improvement
+            improved = (new_best < self.best_score_so_far - self.orch_config.early_stop_delta)
+            
+            if improved:
+                self.best_score_so_far = new_best
+                self.stalls = 0
             else:
-                self.patience_counter += 1
+                self.stalls += 1
+            
+            self.best_score = new_best
     
-    def should_stop_early(self) -> bool:
+    def should_stop_early(self) -> Tuple[bool, Optional[str]]:
         """Check if early stopping criteria are met."""
-        return self.patience_counter >= self.config.early_stop_patience
+        should_stop = False
+        reason = None
+        
+        if self.orch_config.early_stop_enabled and self.stalls >= self.orch_config.early_stop_patience:
+            should_stop = True
+            reason = f"no_improve_{self.stalls}_batches_delta_{self.orch_config.early_stop_delta}"
+        
+        # Never stop early in exhaustive mode
+        if self.orch_config.exhaustive_mode:
+            should_stop = False
+            reason = None
+        
+        if should_stop:
+            self.early_stop_reason = reason
+            self.logger.info(
+                "ORCH.EARLY_STOP",
+                extra={
+                    "event": "ORCH.EARLY_STOP",
+                    "run_id": self.run_id,
+                    "exp_id": self.current_experiment_id,
+                    "batch_idx": self.batch_count,
+                    "stalls": self.stalls,
+                    "delta": self.orch_config.early_stop_delta,
+                    "best": float(self.best_score_so_far)
+                }
+            )
+        
+        return should_stop, reason
     
     def run_optimization(self, 
                         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -314,26 +393,44 @@ class DCAOrchestrator:
         exp_id = self.create_experiment(notes)
         self.start_time = time.time()
         
+        # Calculate total combinations for exhaustive mode
+        if self.orch_config.exhaustive_mode:
+            overlap_steps = int((self.config.overlap_max - self.config.overlap_min) / 0.5) + 1
+            orders_range = self.config.orders_max - self.config.orders_min + 1
+            total_combinations = overlap_steps * orders_range * self.config.n_candidates_per_batch
+            self.orch_config.exhaustive_progress_total = total_combinations
+        
         # Log orchestrator start with config snapshot
-        self.logger.event(
-            Events.ORCH_START,
-            adapter="DCAOrchestrator",
-            overlap_range=f"{self.config.overlap_min}-{self.config.overlap_max}",
-            orders_range=f"{self.config.orders_min}-{self.config.orders_max}",
-            alpha=self.config.alpha,
-            beta=self.config.beta,
-            gamma=self.config.gamma,
-            lambda_penalty=self.config.lambda_penalty,
-            wave_pattern=self.config.wave_pattern,
-            tail_cap=self.config.tail_cap,
-            n_candidates_per_batch=self.config.n_candidates_per_batch,
-            max_batches=self.config.max_batches
+        self.logger.info(
+            "ORCH.START",
+            extra={
+                "event": "ORCH.START",
+                "run_id": self.run_id,
+                "exp_id": self.current_experiment_id,
+                "adapter": "DCAOrchestrator",
+                "overlap_range": f"{self.config.overlap_min}-{self.config.overlap_max}",
+                "orders_range": f"{self.config.orders_min}-{self.config.orders_max}",
+                "alpha": self.config.alpha,
+                "beta": self.config.beta,
+                "gamma": self.config.gamma,
+                "lambda_penalty": self.config.lambda_penalty,
+                "wave_pattern": self.config.wave_pattern,
+                "tail_cap": self.config.tail_cap,
+                "n_candidates_per_batch": self.config.n_candidates_per_batch,
+                "max_batches": self.config.max_batches,
+                "prune_enabled": self.orch_config.prune_enabled,
+                "prune_mode": self.orch_config.prune_mode,
+                "early_stop_enabled": self.orch_config.early_stop_enabled,
+                "exhaustive_mode": self.orch_config.exhaustive_mode,
+                "exhaustive_progress_total": self.orch_config.exhaustive_progress_total
+            }
         )
         
         try:
             for batch_idx in range(self.config.max_batches):
                 batch_start = time.time()
                 LogContext.set_batch_idx(batch_idx)
+                self.batch_count = batch_idx
                 
                 # Generate parameters for this batch
                 param_batch = self.generate_random_parameters(self.config.n_candidates_per_batch)
@@ -342,20 +439,10 @@ class DCAOrchestrator:
                 batch_results = self.evaluate_batch_parallel(param_batch)
                 self.total_evaluations += len(batch_results)
                 
-                # Apply early pruning
+                # Apply pruning
                 pre_prune_count = len(batch_results)
-                pruned_results = self.early_pruning(batch_results)
+                pruned_results = self.apply_pruning(batch_results, batch_idx)
                 post_prune_count = len(pruned_results)
-                
-                if pre_prune_count > post_prune_count:
-                    pruned_count = pre_prune_count - post_prune_count
-                    self.stats["pruned"] += pruned_count
-                    self.logger.event(
-                        Events.ORCH_PRUNE,
-                        pruned=pruned_count,
-                        kept=post_prune_count,
-                        total=pre_prune_count
-                    )
                 
                 # Update best candidates
                 self.update_best_candidates(pruned_results)
@@ -375,32 +462,42 @@ class DCAOrchestrator:
                     if self.config.wave_pattern and result.get("penalties", {}).get("P_wave", 0) < 0:
                         self.stats["wave_pattern_rewards"] += 1
                 
-                # Progress callback
+                # Log batch summary
+                mode = "exhaustive" if self.orch_config.exhaustive_mode else "adaptive"
+                self.logger.info(
+                    "BATCH_END",
+                    extra={
+                        "event": "BATCH_END",
+                        "run_id": self.run_id,
+                        "exp_id": self.current_experiment_id,
+                        "batch_idx": batch_idx,
+                        "best": float(self.best_score),
+                        "evaluated": len(batch_results),
+                        "kept": post_prune_count,
+                        "pruned": pre_prune_count - post_prune_count,
+                        "mode": mode,
+                        "time_s": batch_time
+                    }
+                )
+                
+                # Call progress callback
                 if progress_callback:
-                    progress_info = {
+                    progress_data = {
                         "batch": batch_idx + 1,
                         "total_batches": self.config.max_batches,
                         "best_score": self.best_score,
                         "total_evaluations": self.total_evaluations,
                         "evaluations_per_second": self.stats["evaluations_per_second"],
+                        "candidates_kept": len(self.best_candidates),
                         "batch_time": batch_time,
-                        "candidates_kept": len(self.best_candidates)
+                        "mode": mode
                     }
-                    progress_callback(progress_info)
-                
-                # Log progress
-                self.logger.info(
-                    f"Batch {batch_idx + 1}/{self.config.max_batches}: "
-                    f"Best={self.best_score:.6f}, "
-                    f"Evaluated={len(batch_results)}, "
-                    f"Kept={len(pruned_results)}, "
-                    f"Total_candidates={len(self.best_candidates)}, "
-                    f"Time={batch_time:.2f}s"
-                )
+                    progress_callback(progress_data)
                 
                 # Check early stopping
-                if self.should_stop_early():
-                    self.logger.info(f"Early stopping after {batch_idx + 1} batches")
+                should_stop, reason = self.should_stop_early()
+                if should_stop:
+                    self.logger.info(f"Early stopping after {batch_idx + 1} batches due to {reason}")
                     self.stats["early_stopped"] = True
                     break
                 
@@ -469,6 +566,17 @@ def create_dca_orchestrator(
     wave_pattern: bool = False,
     n_candidates: int = 1000,
     max_batches: int = 100,
+    # Orchestrator config parameters
+    prune_enabled: bool = True,
+    prune_mode: str = "quantile",
+    prune_quantile: float = 0.5,
+    prune_multiplier: float = 1.20,
+    prune_min_keep: int = 50,
+    prune_grace_batches: int = 3,
+    early_stop_enabled: bool = True,
+    early_stop_patience: int = 10,
+    early_stop_delta: float = 1e-6,
+    exhaustive_mode: bool = False,
     **kwargs
 ) -> DCAOrchestrator:
     """Create a DCA orchestrator with common configurations."""
@@ -484,4 +592,17 @@ def create_dca_orchestrator(
         **kwargs
     )
     
-    return DCAOrchestrator(config)
+    orch_config = OrchestratorConfig(
+        prune_enabled=prune_enabled,
+        prune_mode=prune_mode,
+        prune_quantile=prune_quantile,
+        prune_multiplier=prune_multiplier,
+        prune_min_keep=prune_min_keep,
+        prune_grace_batches=prune_grace_batches,
+        early_stop_enabled=early_stop_enabled,
+        early_stop_patience=early_stop_patience,
+        early_stop_delta=early_stop_delta,
+        exhaustive_mode=exhaustive_mode
+    )
+    
+    return DCAOrchestrator(config, orch_config=orch_config)

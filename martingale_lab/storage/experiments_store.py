@@ -142,74 +142,93 @@ class ExperimentsStore:
             cur.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);")
             cur.execute("INSERT OR IGNORE INTO schema_version(version) VALUES (1);")
 
-            # Ensure experiments table exists (minimal shape)
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS experiments(
-                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  adapter TEXT,
-                  notes TEXT,
-                  best_score REAL DEFAULT NULL,
-                  total_evals INTEGER DEFAULT 0,
-                  created_at TEXT DEFAULT (datetime('now')),
-                  updated_at TEXT DEFAULT (datetime('now'))
-                );
-                """
-            )
+            # Check if experiments table exists and get its current structure
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='experiments';")
+            experiments_exists = cur.fetchone() is not None
+            
+            if not experiments_exists:
+                # Create experiments table with all required columns
+                cur.execute(
+                    """
+                    CREATE TABLE experiments(
+                      id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      run_id TEXT,
+                      adapter TEXT,
+                      config_json TEXT,
+                      started_at TEXT,
+                      finished_at TEXT,
+                      status TEXT DEFAULT 'PENDING',
+                      best_score REAL DEFAULT NULL,
+                      eval_count INTEGER DEFAULT 0,
+                      total_evals INTEGER DEFAULT 0,
+                      notes TEXT,
+                      created_at TEXT DEFAULT (datetime('now')),
+                      updated_at TEXT DEFAULT (datetime('now')),
+                      deleted INTEGER DEFAULT 0,
+                      error_json TEXT
+                    );
+                    """
+                )
+            else:
+                # Add missing columns to existing experiments table
+                add_columns = [
+                    ("run_id", "TEXT"),
+                    ("config_json", "TEXT"),
+                    ("started_at", "TEXT"),
+                    ("finished_at", "TEXT"),
+                    ("status", "TEXT DEFAULT 'PENDING'"),
+                    ("eval_count", "INTEGER DEFAULT 0"),
+                    ("total_evals", "INTEGER DEFAULT 0"),
+                    ("updated_at", "TEXT DEFAULT (datetime('now'))"),
+                    ("deleted", "INTEGER DEFAULT 0"),
+                    ("error_json", "TEXT"),
+                ]
+                for col, coltype in add_columns:
+                    try:
+                        if not column_exists(cur, "experiments", col):
+                            cur.execute(f"ALTER TABLE experiments ADD COLUMN {col} {coltype};")
+                    except Exception:
+                        pass
 
-            # Add missing columns idempotently
-            add_columns = [
-                ("best_score", "REAL DEFAULT NULL"),
-                ("total_evals", "INTEGER DEFAULT 0"),
-                ("updated_at", "TEXT DEFAULT (datetime('now'))"),
-                ("eval_count", "INTEGER DEFAULT 0"),
-                ("status", "TEXT DEFAULT 'PENDING'"),
-                ("finished_at", "TEXT"),
-                ("run_id", "TEXT"),
-                ("adapter", "TEXT"),
-                ("config_json", "TEXT"),
-                ("started_at", "TEXT"),
-                ("deleted", "INTEGER DEFAULT 0"),
-                ("error_json", "TEXT"),
-            ]
-            for col, coltype in add_columns:
-                try:
-                    if not column_exists(cur, "experiments", col):
-                        cur.execute(f"ALTER TABLE experiments ADD COLUMN {col} {coltype};")
-                except Exception:
-                    pass
+            # Check if results table exists and get its current structure
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='results';")
+            results_exists = cur.fetchone() is not None
+            
+            if not results_exists:
+                # Create results table with all required columns
+                cur.execute(
+                    """
+                    CREATE TABLE results(
+                      id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      experiment_id INTEGER,
+                      score REAL,
+                      payload_json TEXT,
+                      sanity_json TEXT,
+                      diagnostics_json TEXT,
+                      penalties_json TEXT,
+                      created_at TEXT DEFAULT (datetime('now')),
+                      FOREIGN KEY(experiment_id) REFERENCES experiments(id)
+                    );
+                    """
+                )
+            else:
+                # Add missing columns to existing results table
+                add_columns = [
+                    ("sanity_json", "TEXT"),
+                    ("diagnostics_json", "TEXT"),
+                    ("penalties_json", "TEXT"),
+                ]
+                for col, coltype in add_columns:
+                    try:
+                        if not column_exists(cur, "results", col):
+                            cur.execute(f"ALTER TABLE results ADD COLUMN {col} {coltype};")
+                    except Exception:
+                        pass
 
-            # Ensure results table exists
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS results(
-                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  experiment_id INTEGER,
-                  score REAL,
-                  payload_json TEXT,
-                  sanity_json TEXT,
-                  diagnostics_json TEXT,
-                  penalties_json TEXT,
-                  created_at TEXT DEFAULT (datetime('now')),
-                  FOREIGN KEY(experiment_id) REFERENCES experiments(id)
-                );
-                """
-            )
-            # Add missing columns to results
-            for col, coltype in [
-                ("sanity_json", "TEXT"),
-                ("diagnostics_json", "TEXT"),
-                ("penalties_json", "TEXT"),
-            ]:
-                try:
-                    if not column_exists(cur, "results", col):
-                        cur.execute(f"ALTER TABLE results ADD COLUMN {col} {coltype};")
-                except Exception:
-                    pass
-
-            # Indices
+            # Create indices
             cur.execute("CREATE INDEX IF NOT EXISTS idx_results_exp ON results(experiment_id);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_experiments_run ON experiments(run_id);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_experiments_created ON experiments(created_at DESC);")
             conn.commit()
 
     def create_experiment(self, adapter: str, cfg: Dict[str, Any], run_id: str) -> int:
@@ -253,29 +272,44 @@ class ExperimentsStore:
     def update_experiment_summary(self, experiment_id: int, best_score: float, total_evals: int, elapsed_s: float) -> None:
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.cursor()
-            # Update both legacy eval_count and new total_evals if present
-            set_fragments = [
-                "best_score = MIN(best_score, ?)",
-                "eval_count = ?",
-                "finished_at = ?",
-                "status = ?",
-                "updated_at = ?"
-            ]
-            params: List[Any] = [best_score, total_evals, datetime.now().isoformat(), Status.COMPLETED, datetime.now().isoformat()]
-            # If total_evals column exists, update it too
-            try:
-                cur.execute("PRAGMA table_info(experiments)")
-                cols = {row[1] for row in cur.fetchall()}
-                if "total_evals" in cols:
-                    set_fragments.append("total_evals = ?")
-                    params.append(total_evals)
-            except Exception:
-                pass
+            
+            # Check which columns exist
+            cur.execute("PRAGMA table_info(experiments)")
+            cols = {row[1] for row in cur.fetchall()}
+            
+            # Build update fragments based on existing columns
+            set_fragments = []
+            params: List[Any] = []
+            
+            if "best_score" in cols:
+                set_fragments.append("best_score = MIN(best_score, ?)")
+                params.append(best_score)
+            
+            if "eval_count" in cols:
+                set_fragments.append("eval_count = ?")
+                params.append(total_evals)
+            
+            if "total_evals" in cols:
+                set_fragments.append("total_evals = ?")
+                params.append(total_evals)
+            
+            if "finished_at" in cols:
+                set_fragments.append("finished_at = ?")
+                params.append(datetime.now().isoformat())
+            
+            if "status" in cols:
+                set_fragments.append("status = ?")
+                params.append(Status.COMPLETED)
+            
+            if "updated_at" in cols:
+                set_fragments.append("updated_at = ?")
+                params.append(datetime.now().isoformat())
 
-            query = f"UPDATE experiments SET {', '.join(set_fragments)} WHERE id = ?"
-            params.append(experiment_id)
-            cur.execute(query, tuple(params))
-            conn.commit()
+            if set_fragments:
+                query = f"UPDATE experiments SET {', '.join(set_fragments)} WHERE id = ?"
+                params.append(experiment_id)
+                cur.execute(query, tuple(params))
+                conn.commit()
 
     def set_experiment_error(self, experiment_id: int, error_payload: Dict[str, Any]) -> None:
         """Persist error details to experiments.error_json."""
@@ -424,6 +458,112 @@ class ExperimentsStore:
                     
             return results
 
+    def get_results(self, experiment_id: int, limit: int = 1000, order_by: str = 'score') -> List[Dict[str, Any]]:
+        """
+        Get results for an experiment with enhanced fields for results page.
+        
+        Returns:
+            List of result dictionaries with normalized fields
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.cursor()
+                
+                # Get results with all required fields
+                query = """
+                SELECT 
+                    r.id, r.score, r.payload_json, r.sanity_json, r.diagnostics_json, r.penalties_json,
+                    r.created_at
+                FROM results r 
+                WHERE r.experiment_id = ? 
+                ORDER BY r.score ASC 
+                LIMIT ?
+                """
+                
+                cur.execute(query, (experiment_id, limit))
+                rows = cur.fetchall()
+                
+                results = []
+                for row in rows:
+                    try:
+                        # Parse JSON fields
+                        payload = json.loads(row[2]) if row[2] else {}
+                        sanity = json.loads(row[3]) if row[3] else {}
+                        diagnostics = json.loads(row[4]) if row[4] else {}
+                        penalties = json.loads(row[5]) if row[5] else {}
+                        
+                        # Extract schedule data
+                        schedule = payload.get('schedule', {})
+                        needpct = schedule.get('needpct', [])
+                        volume_pct = schedule.get('volume_pct', [])
+                        indent_pct = schedule.get('indent_pct', [])
+                        martingale_pct = schedule.get('martingale_pct', [])
+                        
+                        # Calculate derived metrics
+                        max_need = max(needpct) if needpct else 0.0
+                        var_need = np.var(needpct) if len(needpct) > 1 else 0.0
+                        tail = volume_pct[-1] if volume_pct else 0.0
+                        
+                        # Extract overlap and orders from schedule
+                        overlap_pct = schedule.get('overlap_pct', 0.0)
+                        orders = len(volume_pct) if volume_pct else 0
+                        
+                        result = {
+                            "id": row[0],
+                            "score": float(row[1]),
+                            "max_need": float(max_need),
+                            "var_need": float(var_need),
+                            "tail": float(tail),
+                            "overlap_pct": float(overlap_pct),
+                            "orders": int(orders),
+                            "needpct": needpct,
+                            "volume_pct": volume_pct,
+                            "indent_pct": indent_pct,
+                            "martingale_pct": martingale_pct,
+                            "sanity": sanity,
+                            "diagnostics": diagnostics,
+                            "penalties": penalties,
+                            "created_at": row[6],
+                            "_raw": {
+                                "id": row[0],
+                                "score": float(row[1]),
+                                "payload": payload,
+                                "sanity": sanity,
+                                "diagnostics": diagnostics,
+                                "penalties": penalties,
+                                "created_at": row[6]
+                            }
+                        }
+                        results.append(result)
+                        
+                    except Exception as e:
+                        logger.warning(
+                            EventNames.DB_VERIFY,
+                            f"Failed to parse result row {row[0]}: {str(e)}",
+                            exp_id=experiment_id,
+                            result_id=row[0],
+                            error=str(e)
+                        )
+                        continue
+                
+                logger.info(
+                    EventNames.DB_VERIFY,
+                    f"Retrieved {len(results)} results for experiment {experiment_id}",
+                    exp_id=experiment_id,
+                    result_count=len(results)
+                )
+                
+                return results
+                
+        except Exception as e:
+            logger.error(
+                EventNames.DB_ERROR,
+                f"Failed to get results for experiment {experiment_id}: {str(e)}",
+                exp_id=experiment_id,
+                error=str(e)
+            )
+            return []
+
     def get_experiment_summary(self, experiment_id: int) -> Optional[Dict[str, Any]]:
         """Get experiment summary with statistics."""
         with sqlite3.connect(self.db_path) as conn:
@@ -476,3 +616,63 @@ class ExperimentsStore:
             cur = conn.cursor()
             cur.execute("UPDATE experiments SET deleted = 1 WHERE id = ?", (experiment_id,))
             conn.commit()
+
+    def get_experiments(self) -> List[Dict[str, Any]]:
+        """Get all experiments with enhanced fields."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.cursor()
+                
+                # Get experiments with all required fields, handling both total_evals and eval_count
+                query = """
+                SELECT 
+                    e.id, e.created_at, e.adapter, e.best_score, 
+                    COALESCE(e.total_evals, e.eval_count, 0) as total_evals,
+                    e.status, e.config_json, e.notes, e.run_id
+                FROM experiments e 
+                WHERE e.deleted = 0 
+                ORDER BY e.created_at DESC
+                """
+                
+                cur.execute(query)
+                rows = cur.fetchall()
+                
+                experiments = []
+                for row in rows:
+                    try:
+                        experiment = {
+                            "id": row[0],
+                            "created_at": row[1],
+                            "adapter": row[2],
+                            "best_score": float(row[3]) if row[3] is not None else float('inf'),
+                            "total_evals": int(row[4]) if row[4] is not None else 0,
+                            "status": row[5] if row[5] else "UNKNOWN",
+                            "config_json": row[6],
+                            "notes": row[7],
+                            "run_id": row[8]
+                        }
+                        experiments.append(experiment)
+                        
+                    except Exception as e:
+                        logger.warning(
+                            EventNames.DB_VERIFY,
+                            f"Failed to parse experiment row {row[0]}: {str(e)}",
+                            error=str(e)
+                        )
+                        continue
+                
+                logger.info(
+                    EventNames.DB_VERIFY,
+                    f"Retrieved {len(experiments)} experiments",
+                    experiment_count=len(experiments)
+                )
+                
+                return experiments
+                
+        except Exception as e:
+            logger.error(
+                EventNames.DB_ERROR,
+                f"Failed to get experiments: {str(e)}",
+                error=str(e)
+            )
+            return []
