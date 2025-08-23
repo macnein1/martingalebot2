@@ -10,7 +10,7 @@ from martingale_lab.utils.structured_logging import JSONFormatter
 class RingBufferLogHandler(logging.Handler):
     """A thread-safe ring buffer handler that stores recent log records as formatted strings."""
 
-    def __init__(self, name: str, capacity: int = 500):
+    def __init__(self, name: str, capacity: int = 2000):
         super().__init__()
         self.name = name
         self.capacity = capacity
@@ -72,7 +72,7 @@ def ensure_ring_handler(logger_name: str = "mlab", level: int = logging.INFO,
             return _handlers_registry[logger_name]
 
         # Get capacity from environment variable
-        capacity = int(os.getenv("MLAB_TRACE_N", "1000"))
+        capacity = int(os.getenv("MLAB_TRACE_N", "2000"))
         handler = RingBufferLogHandler(name=f"{logger_name}.ring", capacity=capacity)
         
         if use_json:
