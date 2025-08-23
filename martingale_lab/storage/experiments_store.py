@@ -70,6 +70,7 @@ class ExperimentsStore:
         logger.info(EventNames.DB_INIT, f"Initializing database at {db_path}", db_path=db_path)
         
         self._init_db()
+        self.migrate_if_needed()
 
     def _init_db(self) -> None:
         with sqlite3.connect(self.db_path) as conn:
@@ -123,6 +124,93 @@ class ExperimentsStore:
             )
             conn.commit()
 
+    def migrate_if_needed(self) -> None:
+        """Run idempotent schema migrations to add missing objects/columns."""
+        def column_exists(cursor: sqlite3.Cursor, table: str, column: str) -> bool:
+            cursor.execute(f"PRAGMA table_info({table})")
+            return any(row[1] == column for row in cursor.fetchall())
+
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.cursor()
+            # Enable WAL
+            try:
+                cur.execute("PRAGMA journal_mode=WAL;")
+            except Exception:
+                pass
+
+            # Schema version table
+            cur.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);")
+            cur.execute("INSERT OR IGNORE INTO schema_version(version) VALUES (1);")
+
+            # Ensure experiments table exists (minimal shape)
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS experiments(
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  adapter TEXT,
+                  notes TEXT,
+                  best_score REAL DEFAULT NULL,
+                  total_evals INTEGER DEFAULT 0,
+                  created_at TEXT DEFAULT (datetime('now')),
+                  updated_at TEXT DEFAULT (datetime('now'))
+                );
+                """
+            )
+
+            # Add missing columns idempotently
+            add_columns = [
+                ("best_score", "REAL DEFAULT NULL"),
+                ("total_evals", "INTEGER DEFAULT 0"),
+                ("updated_at", "TEXT DEFAULT (datetime('now'))"),
+                ("eval_count", "INTEGER DEFAULT 0"),
+                ("status", "TEXT DEFAULT 'PENDING'"),
+                ("finished_at", "TEXT"),
+                ("run_id", "TEXT"),
+                ("adapter", "TEXT"),
+                ("config_json", "TEXT"),
+                ("started_at", "TEXT"),
+                ("deleted", "INTEGER DEFAULT 0"),
+            ]
+            for col, coltype in add_columns:
+                try:
+                    if not column_exists(cur, "experiments", col):
+                        cur.execute(f"ALTER TABLE experiments ADD COLUMN {col} {coltype};")
+                except Exception:
+                    pass
+
+            # Ensure results table exists
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS results(
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  experiment_id INTEGER,
+                  score REAL,
+                  payload_json TEXT,
+                  sanity_json TEXT,
+                  diagnostics_json TEXT,
+                  penalties_json TEXT,
+                  created_at TEXT DEFAULT (datetime('now')),
+                  FOREIGN KEY(experiment_id) REFERENCES experiments(id)
+                );
+                """
+            )
+            # Add missing columns to results
+            for col, coltype in [
+                ("sanity_json", "TEXT"),
+                ("diagnostics_json", "TEXT"),
+                ("penalties_json", "TEXT"),
+            ]:
+                try:
+                    if not column_exists(cur, "results", col):
+                        cur.execute(f"ALTER TABLE results ADD COLUMN {col} {coltype};")
+                except Exception:
+                    pass
+
+            # Indices
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_results_exp ON results(experiment_id);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_experiments_run ON experiments(run_id);")
+            conn.commit()
+
     def create_experiment(self, adapter: str, cfg: Dict[str, Any], run_id: str) -> int:
         created_at = datetime.now().isoformat()
         
@@ -164,17 +252,28 @@ class ExperimentsStore:
     def update_experiment_summary(self, experiment_id: int, best_score: float, total_evals: int, elapsed_s: float) -> None:
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.cursor()
-            cur.execute(
-                """
-                UPDATE experiments
-                SET best_score = MIN(best_score, ?),
-                    eval_count = ?,
-                    finished_at = ?,
-                    status = ?
-                WHERE id = ?
-                """,
-                (best_score, total_evals, datetime.now().isoformat(), Status.COMPLETED, experiment_id),
-            )
+            # Update both legacy eval_count and new total_evals if present
+            set_fragments = [
+                "best_score = MIN(best_score, ?)",
+                "eval_count = ?",
+                "finished_at = ?",
+                "status = ?",
+                "updated_at = ?"
+            ]
+            params: List[Any] = [best_score, total_evals, datetime.now().isoformat(), Status.COMPLETED, datetime.now().isoformat()]
+            # If total_evals column exists, update it too
+            try:
+                cur.execute("PRAGMA table_info(experiments)")
+                cols = {row[1] for row in cur.fetchall()}
+                if "total_evals" in cols:
+                    set_fragments.append("total_evals = ?")
+                    params.append(total_evals)
+            except Exception:
+                pass
+
+            query = f"UPDATE experiments SET {', '.join(set_fragments)} WHERE id = ?"
+            params.append(experiment_id)
+            cur.execute(query, tuple(params))
             conn.commit()
 
     def upsert_results(self, experiment_id: int, items: List[Dict[str, Any]]) -> int:
@@ -324,12 +423,7 @@ class ExperimentsStore:
                 """
                 SELECT 
                     COUNT(*) as total_results,
-                    MIN(score) as best_score,
-                    AVG(max_need) as avg_max_need,
-                    MIN(max_need) as min_max_need,
-                    MAX(max_need) as max_max_need,
-                    AVG(var_need) as avg_var_need,
-                    AVG(tail) as avg_tail
+                    MIN(score) as best_score
                 FROM results 
                 WHERE experiment_id = ?
                 """,
@@ -337,33 +431,23 @@ class ExperimentsStore:
             )
             stats_row = cur.fetchone()
             
+            # Map fields defensively given evolving schema
+            # Use column names instead of indices when possible
+            cur.execute("PRAGMA table_info(experiments)")
+            cols = [r[1] for r in cur.fetchall()]
+            col_index = {name: idx for idx, name in enumerate(cols)}
+
             return {
                 "id": exp_row[0],
-                "created_at": exp_row[1],
-                "adapter": exp_row[2],
-                "best_score": exp_row[3],
-                "total_evals": exp_row[4],
-                "elapsed_s": exp_row[5],
-                "config": {
-                    "overlap_min": exp_row[6],
-                    "overlap_max": exp_row[7],
-                    "orders_min": exp_row[8],
-                    "orders_max": exp_row[9],
-                    "alpha": exp_row[10],
-                    "beta": exp_row[11],
-                    "gamma": exp_row[12],
-                    "lambda_penalty": exp_row[13],
-                    "wave_pattern": bool(exp_row[14]) if exp_row[14] is not None else False,
-                    "tail_cap": exp_row[15],
-                },
+                "created_at": exp_row[col_index.get("created_at", 1)],
+                "adapter": exp_row[col_index.get("adapter", 2)],
+                "best_score": exp_row[col_index.get("best_score", 3)],
+                "total_evals": exp_row[col_index.get("total_evals", col_index.get("eval_count", 4))],
+                "status": exp_row[col_index.get("status", 6)] if len(exp_row) > 6 else "PENDING",
+                "config_json": exp_row[col_index.get("config_json", 3)] if len(exp_row) > 3 else None,
                 "statistics": {
                     "total_results": stats_row[0] if stats_row else 0,
                     "best_score": stats_row[1] if stats_row else float("inf"),
-                    "avg_max_need": stats_row[2] if stats_row else 0.0,
-                    "min_max_need": stats_row[3] if stats_row else 0.0,
-                    "max_max_need": stats_row[4] if stats_row else 0.0,
-                    "avg_var_need": stats_row[5] if stats_row else 0.0,
-                    "avg_tail": stats_row[6] if stats_row else 0.0,
                 }
             }
 

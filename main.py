@@ -24,6 +24,9 @@ def main():
     # Load page configuration
     setup_page_config()
     
+    # Ensure DB migrations run at app startup
+    _ = ExperimentsStore()
+    
     # Initialize session state
     if 'current_experiment_id' not in st.session_state:
         st.session_state.current_experiment_id = None
@@ -45,7 +48,7 @@ def main():
 def render_main_page():
     """Main page with configuration, start controls, and live progress."""
     st.header("⚙️ Main")
-
+    
     # Mode selection
     config_mode = st.radio("Konfigürasyon modu", ["Auto (önerilen)", "Manual"], horizontal=True, key="config_mode")
     auto_mode = config_mode == "Auto (önerilen)"
@@ -73,7 +76,7 @@ def render_main_page():
             gamma = st.slider("γ (Tail)", 0.0, 1.0, 0.2, 0.1, help="Weight for tail concentration", key="gamma", disabled=auto_mode)
         with col4:
             lambda_penalty = st.slider("λ (Penalty)", 0.0, 0.5, 0.1, 0.05, help="Weight for penalties", key="lambda_penalty", disabled=auto_mode)
-    
+        
         st.subheader("Wave Pattern Settings")
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -82,7 +85,7 @@ def render_main_page():
             wave_strong_threshold = st.number_input("Strong Threshold %", 30.0, 80.0, 50.0, 5.0, help="Martingale % considered 'strong'", key="wave_strong_threshold", disabled=auto_mode)
         with col3:
             wave_weak_threshold = st.number_input("Weak Threshold %", 1.0, 30.0, 10.0, 1.0, help="Martingale % considered 'very weak'", key="wave_weak_threshold", disabled=auto_mode)
-    
+        
         st.subheader("Constraints")
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -91,7 +94,7 @@ def render_main_page():
             min_indent_step = st.number_input("Min Indent Step %", 0.01, 1.0, 0.05, 0.01, help="Minimum indent step percentage", key="min_indent_step", disabled=auto_mode)
         with col3:
             softmax_temp = st.slider("Softmax Temperature", 0.1, 3.0, 1.0, 0.1, help="Temperature for volume distribution", key="softmax_temp", disabled=auto_mode)
-    
+        
         st.subheader("Optimization Settings")
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -172,8 +175,7 @@ def render_main_page():
                     "early_stop_patience": config.early_stop_patience
                 }
             })
-
-
+    
     # Live Optimization section
     st.subheader("🚀 Optimization")
     auto_mode = st.session_state.get("config_mode", "Auto (önerilen)") == "Auto (önerilen)"
