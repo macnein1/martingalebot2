@@ -14,6 +14,8 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 import os
 from pathlib import Path
+import hashlib
+from typing import Iterable, Sequence, Tuple
 
 from martingale_lab.utils.logging import db_logger as logger
 
@@ -76,6 +78,17 @@ class ExperimentsStore:
         self._init_db()
         self.migrate_if_needed()
 
+    def _get_user_version(self, cur) -> int:
+        cur.execute("PRAGMA user_version;")
+        row = cur.fetchone()
+        try:
+            return int(row[0]) if row and row[0] is not None else 0
+        except Exception:
+            return 0
+
+    def _set_user_version(self, cur, v: int) -> None:
+        cur.execute(f"PRAGMA user_version={int(v)};")
+
     def _init_db(self) -> None:
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.cursor()
@@ -129,111 +142,59 @@ class ExperimentsStore:
             conn.commit()
 
     def migrate_if_needed(self) -> None:
-        """Run idempotent schema migrations to add missing objects/columns."""
-        def column_exists(cursor: sqlite3.Cursor, table: str, column: str) -> bool:
-            cursor.execute(f"PRAGMA table_info({table})")
-            return any(row[1] == column for row in cursor.fetchall())
-
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.cursor()
-            # Enable WAL
+        """Run PRAGMA user_version-based idempotent migrations."""
+        with sqlite3.connect(self.db_path) as con:
+            cur = con.cursor()
+            # Enable WAL for better concurrency
             try:
                 cur.execute("PRAGMA journal_mode=WAL;")
             except Exception:
                 pass
 
-            # Schema version table
-            cur.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);")
-            cur.execute("INSERT OR IGNORE INTO schema_version(version) VALUES (1);")
+            v = self._get_user_version(cur)
 
-            # Check if experiments table exists and get its current structure
-            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='experiments';")
-            experiments_exists = cur.fetchone() is not None
-            
-            if not experiments_exists:
-                # Create experiments table with all required columns
+            # v0 -> v1 : results.stable_id + UNIQUE(experiment_id, stable_id)
+            if v < 1:
                 cur.execute(
                     """
-                    CREATE TABLE experiments(
+                    CREATE TABLE IF NOT EXISTS results(
                       id INTEGER PRIMARY KEY AUTOINCREMENT,
-                      run_id TEXT,
-                      adapter TEXT,
-                      config_json TEXT,
-                      started_at TEXT,
-                      finished_at TEXT,
-                      status TEXT DEFAULT 'PENDING',
-                      best_score REAL DEFAULT NULL,
-                      eval_count INTEGER DEFAULT 0,
-                      total_evals INTEGER DEFAULT 0,
-                      notes TEXT,
-                      created_at TEXT DEFAULT (datetime('now')),
-                      updated_at TEXT DEFAULT (datetime('now')),
-                      deleted INTEGER DEFAULT 0,
-                      error_json TEXT
+                      experiment_id INTEGER NOT NULL REFERENCES experiments(id),
+                      score REAL NOT NULL,
+                      payload_json TEXT NOT NULL,
+                      sanity_json TEXT NOT NULL,
+                      diagnostics_json TEXT NOT NULL,
+                      penalties_json TEXT NOT NULL,
+                      created_at TEXT NOT NULL DEFAULT (datetime('now'))
                     );
                     """
                 )
-            else:
-                # Add missing columns to existing experiments table
-                add_columns = [
-                    ("run_id", "TEXT"),
-                    ("config_json", "TEXT"),
-                    ("started_at", "TEXT"),
-                    ("finished_at", "TEXT"),
-                    ("status", "TEXT DEFAULT 'PENDING'"),
-                    ("eval_count", "INTEGER DEFAULT 0"),
-                    ("total_evals", "INTEGER DEFAULT 0"),
-                    ("updated_at", "TEXT DEFAULT (datetime('now'))"),
-                    ("deleted", "INTEGER DEFAULT 0"),
-                    ("error_json", "TEXT"),
-                ]
-                for col, coltype in add_columns:
-                    try:
-                        if not column_exists(cur, "experiments", col):
-                            cur.execute(f"ALTER TABLE experiments ADD COLUMN {col} {coltype};")
-                    except Exception:
-                        pass
-
-            # Check if results table exists and get its current structure
-            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='results';")
-            results_exists = cur.fetchone() is not None
-            
-            if not results_exists:
-                # Create results table with all required columns
+                # add column if missing
+                cur.execute("PRAGMA table_info(results);")
+                cols = {r[1] for r in cur.fetchall()}
+                if "stable_id" not in cols:
+                    cur.execute("ALTER TABLE results ADD COLUMN stable_id TEXT;")
+                # unique index
                 cur.execute(
                     """
-                    CREATE TABLE results(
-                      id INTEGER PRIMARY KEY AUTOINCREMENT,
-                      experiment_id INTEGER,
-                      score REAL,
-                      payload_json TEXT,
-                      sanity_json TEXT,
-                      diagnostics_json TEXT,
-                      penalties_json TEXT,
-                      created_at TEXT DEFAULT (datetime('now')),
-                      FOREIGN KEY(experiment_id) REFERENCES experiments(id)
-                    );
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                    ux_results_exp_stable ON results(experiment_id, stable_id);
                     """
                 )
-            else:
-                # Add missing columns to existing results table
-                add_columns = [
-                    ("sanity_json", "TEXT"),
-                    ("diagnostics_json", "TEXT"),
-                    ("penalties_json", "TEXT"),
-                ]
-                for col, coltype in add_columns:
-                    try:
-                        if not column_exists(cur, "results", col):
-                            cur.execute(f"ALTER TABLE results ADD COLUMN {col} {coltype};")
-                    except Exception:
-                        pass
+                self._set_user_version(cur, 1)
 
-            # Create indices
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_results_exp ON results(experiment_id);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_experiments_run ON experiments(run_id);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_experiments_created ON experiments(created_at DESC);")
-            conn.commit()
+            # v1 -> v2 : experiments.run_id UNIQUE
+            v = self._get_user_version(cur)
+            if v < 2:
+                cur.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                    ux_experiments_run_id ON experiments(run_id);
+                    """
+                )
+                self._set_user_version(cur, 2)
+
+            con.commit()
 
     def create_experiment(self, adapter: str, cfg: Dict[str, Any], run_id: str) -> int:
         created_at = datetime.now().isoformat()
@@ -331,63 +292,58 @@ class ExperimentsStore:
             # Best-effort; do not raise
             pass
 
-    def upsert_results(self, experiment_id: int, items: List[Dict[str, Any]]) -> int:
-        """
-        Upsert results with complete DCA evaluation contract structure.
-        Each item should contain: score, schedule, sanity, diagnostics, penalties.
-        """
-        if not items:
-            return 0
-        now = datetime.now().isoformat()
-        inserted = 0
-        
+    def _stable_id_from_payload(self, payload: Dict[str, Any]) -> str:
+        # Düzenli sıralı json + SHA1
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                cur = conn.cursor()
-                for item in items:
-                    cur.execute(
-                        """
-                        INSERT INTO results (
-                            experiment_id, score, payload_json, sanity_json, 
-                            diagnostics_json, penalties_json, created_at
-                        )
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            experiment_id,
-                            float(item.get("score", float("inf"))),
-                            json.dumps(_jsonify(item), separators=(",", ":"), ensure_ascii=False),
-                            json.dumps(_jsonify(item.get("sanity", {})), separators=(",", ":"), ensure_ascii=False),
-                            json.dumps(_jsonify(item.get("diagnostics", {})), separators=(",", ":"), ensure_ascii=False),
-                            json.dumps(_jsonify(item.get("penalties", {})), separators=(",", ":"), ensure_ascii=False),
-                            now,
-                        ),
-                    )
-                    inserted += 1
-                conn.commit()
-                
-                # Verify insertion
-                cur.execute("SELECT COUNT(*) FROM results WHERE experiment_id = ?", (experiment_id,))
-                count = cur.fetchone()[0]
-                
-                logger.info(
-                    f"Inserted {inserted} results for experiment {experiment_id}",
-                    extra={"event": "mlab.db.upsert_res", "experiment_id": experiment_id, "rows": inserted, "total_rows": count}
+            blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        except Exception:
+            # Fallback to generic serialization
+            blob = json.dumps(_jsonify(payload), sort_keys=True, separators=(",", ":")).encode()
+        return hashlib.sha1(blob).hexdigest()
+
+    def upsert_results(
+        self,
+        experiment_id: int,
+        items: Iterable[Dict[str, Any]],
+    ) -> int:
+        rows: Sequence[Tuple] = []
+        for it in items:
+            # Prefer provided stable_id, else derive from payload or full item
+            stable_id = it.get("stable_id") or self._stable_id_from_payload(it.get("payload", it))
+            payload_obj = it.get("payload", it)
+            rows.append((
+                experiment_id,
+                stable_id,
+                float(it.get("score", float("inf"))),
+                json.dumps(_jsonify(payload_obj), separators=(",", ":")),
+                json.dumps(_jsonify(it.get("sanity", {})), separators=(",", ":")),
+                json.dumps(_jsonify(it.get("diagnostics", {})), separators=(",", ":")),
+                json.dumps(_jsonify(it.get("penalties", {})), separators=(",", ":")),
+            ))
+
+        if not rows:
+            return 0
+
+        with sqlite3.connect(self.db_path) as con:
+            cur = con.cursor()
+            cur.executemany(
+                """
+                INSERT INTO results(
+                    experiment_id, stable_id, score,
+                    payload_json, sanity_json, diagnostics_json, penalties_json
                 )
-                
-                logger.info(
-                    f"Verification successful: {count} total rows",
-                    extra={"event": "mlab.db.verify", "ok": True, "expected": inserted, "actual": count}
-                )
-                
-        except Exception as e:
-            logger.error(
-                f"Database error in upsert_results: {str(e)}",
-                extra={"event": "mlab.db.error", "error": str(e), "operation": "upsert_results", "experiment_id": experiment_id}
+                VALUES(?,?,?,?,?,?,?)
+                ON CONFLICT(experiment_id, stable_id) DO UPDATE SET
+                   score=excluded.score,
+                   payload_json=excluded.payload_json,
+                   sanity_json=excluded.sanity_json,
+                   diagnostics_json=excluded.diagnostics_json,
+                   penalties_json=excluded.penalties_json;
+                """,
+                rows,
             )
-            raise
-            
-        return inserted
+            con.commit()
+            return cur.rowcount
 
     def get_top_results(self, 
                        experiment_id: Optional[int] = None,
