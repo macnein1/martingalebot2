@@ -1,193 +1,256 @@
 """
-Bridge module between Streamlit UI and background optimization runner.
-Starts/stops background orchestrator, exposes validation and status helpers.
+Optimization Bridge for Background Thread Control and Live Trace Streaming
+Provides start/stop optimization control with structured logging integration
 """
-import sys
-import os
-import json
+import threading
 import time
-import logging
 from typing import Dict, Any, Optional, Callable
-from pathlib import Path
-from uuid import uuid4
-from datetime import datetime
-from threading import Thread, Event
+from dataclasses import asdict
+import traceback
 
-from ui.utils.constants import DB_PATH
-from ui.utils.logging_buffer import ensure_ring_handler
-from ui.utils.orchestrator_runner import BackgroundOrchestrator, RunnerConfig
+from martingale_lab.utils.structured_logging import (
+    get_structured_logger, EventNames, generate_run_id
+)
+from martingale_lab.orchestrator.adaptive_orchestrator import AdaptiveOrchestrator, OrchConfig
+from ui.utils.logging_buffer import get_live_trace
+from ui.utils.constants import DB_PATH, Status
 
-logger = logging.getLogger("mlab")
-ensure_ring_handler("mlab")
+# Initialize structured logger for optimization bridge
+logger = get_structured_logger("mlab.bridge")
 
 
 class OptimizationBridge:
-    """Bridge owning the lifecycle of a background optimization job."""
+    """
+    Bridge for controlling optimization in background threads with live trace streaming
+    """
     
-    def __init__(self):
-        self._thread: Optional[Thread] = None
-        self._stop_event: Optional[Event] = None
-        self._run_id: Optional[str] = None
-        self._last_error: Optional[str] = None
+    def __init__(self, db_path: str = DB_PATH):
+        self.db_path = db_path
+        self.current_thread: Optional[threading.Thread] = None
+        self.current_orchestrator: Optional[AdaptiveOrchestrator] = None
+        self.stop_event = threading.Event()
+        self.is_running = False
+        self.current_run_id: Optional[str] = None
         self.progress_callback: Optional[Callable] = None
+        
+    def start_optimization(self, params: Dict[str, Any], 
+                          progress_callback: Optional[Callable] = None) -> str:
+        """
+        Start optimization in background thread
+        
+        Args:
+            params: Optimization parameters
+            progress_callback: Optional callback for progress updates
+            
+        Returns:
+            run_id: Unique identifier for this optimization run
+        """
+        if self.is_running:
+            raise RuntimeError("Optimization is already running")
+        
+        # Generate run ID
+        run_id = generate_run_id()
+        self.current_run_id = run_id
+        self.progress_callback = progress_callback
+        
+        # Create configuration
+        config = OrchConfig(
+            run_id=run_id,
+            overlap_min=params.get('overlap_min', 10.0),
+            overlap_max=params.get('overlap_max', 30.0),
+            orders_min=params.get('orders_min', 5),
+            orders_max=params.get('orders_max', 15),
+            alpha=params.get('alpha', 0.5),
+            beta=params.get('beta', 0.3),
+            gamma=params.get('gamma', 0.2),
+            lambda_penalty=params.get('lambda_penalty', 0.1),
+            wave_pattern=params.get('wave_pattern', True),
+            tail_cap=params.get('tail_cap', 0.40),
+            min_indent_step=params.get('min_indent_step', 0.05),
+            softmax_temp=params.get('softmax_temp', 1.0),
+            batch_size=params.get('batch_size', 100),
+            max_batches=params.get('max_batches', 50),
+            patience=params.get('patience', 5),
+            prune_factor=params.get('prune_factor', 2.0),
+            top_k=params.get('top_k', 50),
+            base_price=params.get('base_price', 100.0)
+        )
+        
+        # Log UI click start
+        logger.info(
+            EventNames.UI_CLICK_START,
+            f"Starting optimization with run_id {run_id}",
+            run_id=run_id,
+            config_snapshot=asdict(config)
+        )
+        
+        # Create orchestrator
+        self.current_orchestrator = AdaptiveOrchestrator(config, self.db_path)
+        
+        # Reset stop event
+        self.stop_event.clear()
+        
+        # Start background thread
+        self.current_thread = threading.Thread(
+            target=self._run_optimization_thread,
+            args=(self.current_orchestrator,),
+            daemon=True
+        )
+        self.is_running = True
+        self.current_thread.start()
+        
+        return run_id
     
-    def set_progress_callback(self, callback: Callable):
-        """Set callback function for progress updates."""
-        self.progress_callback = callback
+    def stop_optimization(self) -> bool:
+        """
+        Stop current optimization gracefully
+        
+        Returns:
+            bool: True if stop signal was sent successfully
+        """
+        if not self.is_running or not self.current_orchestrator:
+            return False
+        
+        # Log UI click stop
+        logger.info(
+            EventNames.UI_CLICK_STOP,
+            "Stop signal sent by user",
+            run_id=self.current_run_id
+        )
+        
+        # Signal orchestrator to stop
+        self.current_orchestrator.stop()
+        self.stop_event.set()
+        
+        # Wait for thread to finish (with timeout)
+        if self.current_thread:
+            self.current_thread.join(timeout=10.0)
+            if self.current_thread.is_alive():
+                logger.warning(
+                    EventNames.UI_CLICK_STOP,
+                    "Thread did not stop gracefully within timeout",
+                    run_id=self.current_run_id
+                )
+        
+        # Log app stop
+        logger.info(
+            EventNames.APP_STOP,
+            "Optimization stopped by user",
+            run_id=self.current_run_id
+        )
+        
+        self.is_running = False
+        self.current_thread = None
+        self.current_orchestrator = None
+        
+        return True
     
-    def create_optimization_session(self, parameters: Dict[str, Any], 
-                                  max_iterations: int = 1000,
-                                  time_limit: float = 300.0) -> Dict[str, Any]:
-        """For compatibility with existing UI. No-op that returns a dummy session id."""
-        sid = f"session_{int(time.time())}"
-        return {'success': True, 'session_id': sid, 'message': 'Session stub created'}
-    
-    def start_optimization(self, parameters: Optional[Dict[str, Any]] = None, db_path: str = DB_PATH) -> Dict[str, Any]:
-        """Start background orchestrator and return run id."""
-        if self._thread and self._thread.is_alive():
-            return {'success': False, 'error': 'Already running', 'message': 'A job is already running'}
+    def _run_optimization_thread(self, orchestrator: AdaptiveOrchestrator):
+        """
+        Run optimization in background thread with error handling
+        """
         try:
-            params = parameters or {}
-            self._run_id = datetime.utcnow().strftime("%Y%m%d-%H%M%S") + "-" + uuid4().hex[:6]
-            self._stop_event = Event()
-            self._last_error = None
-
-            cfg = RunnerConfig(
-                min_overlap=float(params.get('min_overlap', 1.0)),
-                max_overlap=float(params.get('max_overlap', 10.0)),
-                min_order=int(params.get('min_order', 3)),
-                max_order=int(params.get('max_order', 8)),
-                db_path=db_path,
+            # Define progress callback wrapper
+            def progress_wrapper(progress_data: Dict[str, Any]):
+                if self.progress_callback:
+                    try:
+                        self.progress_callback(progress_data)
+                    except Exception as e:
+                        logger.error(
+                            EventNames.ORCH_ERROR,
+                            f"Progress callback error: {str(e)}",
+                            run_id=self.current_run_id,
+                            error=str(e)
+                        )
+            
+            # Run optimization
+            result = orchestrator.run_optimization(progress_callback=progress_wrapper)
+            
+            # Log successful completion
+            logger.info(
+                EventNames.ORCH_DONE,
+                f"Background optimization completed successfully",
+                run_id=self.current_run_id,
+                exp_id=result.get('exp_id'),
+                best_score=result.get('best_score'),
+                total_evals=result.get('total_evals')
             )
-            runner = BackgroundOrchestrator(cfg, stop_event=self._stop_event)
-
-            def _target():
-                logger.info("THREAD.START run_id=%s", self._run_id)
-                try:
-                    runner.run(run_id=self._run_id)
-                except Exception:
-                    import traceback
-                    self._last_error = traceback.format_exc()
-                finally:
-                    logger.info("THREAD.END run_id=%s", self._run_id)
-
-            self._thread = Thread(target=_target, daemon=True)
-            self._thread.start()
-            return {'success': True, 'run_id': self._run_id}
+            
         except Exception as e:
-            logger.exception("start_optimization failed")
-            return {'success': False, 'error': str(e)}
+            # Log error
+            logger.error(
+                EventNames.ORCH_ERROR,
+                f"Background optimization failed: {str(e)}",
+                run_id=self.current_run_id,
+                error=str(e),
+                traceback=traceback.format_exc()
+            )
+        
+        finally:
+            # Clean up
+            self.is_running = False
+            self.current_thread = None
+            self.current_orchestrator = None
     
-    def stop_optimization(self) -> Dict[str, Any]:
-        """Signal stop and wait for the background thread to finish."""
-        if not self._thread:
-            return {'success': False, 'error': 'No job running'}
-        try:
-            assert self._stop_event is not None
-            self._stop_event.set()
-            self._thread.join(timeout=10.0)
-            stopped = not self._thread.is_alive()
-            return {'success': True, 'stopped': stopped}
-        except Exception as e:
-            logger.exception("stop_optimization failed")
-            return {'success': False, 'error': str(e)}
+    def get_status(self) -> Dict[str, Any]:
+        """Get current optimization status"""
+        return {
+            'is_running': self.is_running,
+            'run_id': self.current_run_id,
+            'thread_alive': self.current_thread.is_alive() if self.current_thread else False,
+            'has_orchestrator': self.current_orchestrator is not None
+        }
     
-    def get_optimization_status(self) -> Dict[str, Any]:
-        """Report background thread status."""
-        try:
-            status = 'idle'
-            if self._thread:
-                if self._last_error is not None:
-                    status = 'error'
-                else:
-                    status = 'running' if self._thread.is_alive() else 'completed'
-            data = {'status': status, 'run_id': self._run_id}
-            if self._last_error is not None:
-                data['error'] = self._last_error
-            return {'success': True, 'data': data}
-        except Exception as e:
-            logger.exception("get_optimization_status failed")
-            return {'success': False, 'error': str(e)}
+    def get_live_logs(self, event_filter: Optional[str] = None, 
+                     last_n: int = 50) -> list:
+        """Get live trace logs for UI display"""
+        return get_live_trace("mlab", event_filter=event_filter, last_n=last_n)
     
-    def get_results(self) -> Dict[str, Any]:
-        """Results are persisted in DB; this returns status only."""
-        try:
-            completed = self._thread is not None and not self._thread.is_alive()
-            return {'success': True, 'results': {}, 'statistics': {}, 'completed': completed}
-        except Exception as e:
-            logger.exception("get_results failed")
-            return {'success': False, 'error': str(e)}
+    def get_orchestrator_logs(self, last_n: int = 20) -> list:
+        """Get orchestrator-specific logs"""
+        return self.get_live_logs(event_filter="ORCH", last_n=last_n)
     
-    def cleanup_session(self) -> Dict[str, Any]:
-        self._thread = None
-        self._stop_event = None
-        self._run_id = None
-        return {'success': True}
+    def get_evaluation_logs(self, last_n: int = 10) -> list:
+        """Get evaluation-specific logs"""
+        return self.get_live_logs(event_filter="EVAL", last_n=last_n)
     
-    def validate_parameters(self, parameters: Dict[str, Any]) -> Dict[str, Any]:
-        """Validate optimization parameters."""
-        try:
-            # Basic validation
-            if parameters['min_overlap'] >= parameters['max_overlap']:
-                return {
-                    'success': False,
-                    'error': 'Min overlap must be less than max overlap',
-                    'message': 'Invalid overlap parameters'
-                }
-            
-            if parameters['min_order'] >= parameters['max_order']:
-                return {
-                    'success': False,
-                    'error': 'Min order must be less than max order',
-                    'message': 'Invalid order parameters'
-                }
-            
-            if not (0 <= parameters['min_overlap'] <= 100):
-                return {
-                    'success': False,
-                    'error': 'Min overlap must be between 0 and 100',
-                    'message': 'Invalid min overlap value'
-                }
-            
-            if not (0 <= parameters['max_overlap'] <= 100):
-                return {
-                    'success': False,
-                    'error': 'Max overlap must be between 0 and 100',
-                    'message': 'Invalid max overlap value'
-                }
-            
-            if not (1 <= parameters['min_order'] <= 50):
-                return {
-                    'success': False,
-                    'error': 'Min order must be between 1 and 50',
-                    'message': 'Invalid min order value'
-                }
-            
-            if not (1 <= parameters['max_order'] <= 50):
-                return {
-                    'success': False,
-                    'error': 'Max order must be between 1 and 50',
-                    'message': 'Invalid max order value'
-                }
-            
-            return {
-                'success': True,
-                'message': 'Parameters validated successfully'
-            }
-            
-        except KeyError as e:
-            return {
-                'success': False,
-                'error': f'Missing parameter: {e}',
-                'message': 'Required parameter missing'
-            }
-        except Exception as e:
-            return {
-                'success': False,
-                'error': str(e),
-                'message': 'Parameter validation failed'
-            }
+    def get_database_logs(self, last_n: int = 10) -> list:
+        """Get database-specific logs"""
+        return self.get_live_logs(event_filter="DB", last_n=last_n)
 
 
 # Global bridge instance
-optimization_bridge = OptimizationBridge()
+_bridge_instance: Optional[OptimizationBridge] = None
+
+
+def get_optimization_bridge(db_path: str = DB_PATH) -> OptimizationBridge:
+    """Get or create global optimization bridge instance"""
+    global _bridge_instance
+    if _bridge_instance is None:
+        _bridge_instance = OptimizationBridge(db_path)
+    return _bridge_instance
+
+
+def start_optimization(params: Dict[str, Any], db_path: str = DB_PATH,
+                      progress_callback: Optional[Callable] = None) -> str:
+    """Convenience function to start optimization"""
+    bridge = get_optimization_bridge(db_path)
+    return bridge.start_optimization(params, progress_callback)
+
+
+def stop_optimization() -> bool:
+    """Convenience function to stop optimization"""
+    bridge = get_optimization_bridge()
+    return bridge.stop_optimization()
+
+
+def get_optimization_status() -> Dict[str, Any]:
+    """Convenience function to get optimization status"""
+    bridge = get_optimization_bridge()
+    return bridge.get_status()
+
+
+def get_live_trace_logs(event_filter: Optional[str] = None, last_n: int = 50) -> list:
+    """Convenience function to get live trace logs"""
+    bridge = get_optimization_bridge()
+    return bridge.get_live_logs(event_filter, last_n)

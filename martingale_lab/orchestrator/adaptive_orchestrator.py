@@ -1,449 +1,424 @@
 """
-Adaptive Orchestrator for martingale optimization.
+Adaptive Orchestrator for DCA/Martingale Optimization
+Implements comprehensive logging, identity management, and error handling
 """
+import json
 import time
-import numpy as np
-from typing import List, Dict, Any, Optional, Tuple
-from dataclasses import dataclass
+import traceback
 from datetime import datetime
-import logging
+from dataclasses import dataclass, asdict
+from typing import Dict, Any, List, Optional, Callable
+import numpy as np
+import os
 
-from ..interfaces import (
-    SearchConfig, Candidate, ResultTrace, OptimizerAdapter,
-    SearchResult, TraceResult, OptimizationStats
+from martingale_lab.utils.structured_logging import (
+    get_structured_logger, EventNames, Timer, generate_run_id, generate_span_id,
+    ensure_json_serializable
 )
-from ..core.reduction import TopKHeap, ConvergenceChecker, ResultAggregator
-from ..storage.sqlite_store import SQLiteStore
-from ..storage.experiments_store import ExperimentsStore
+from martingale_lab.optimizer.evaluation_engine import evaluation_function
+from martingale_lab.storage.experiments_store import ExperimentsStore
+from ui.utils.constants import DB_PATH, Status, CRASH_SNAPSHOTS_DIR
+
+# Initialize structured logger for orchestrator
+logger = get_structured_logger("mlab.orch")
 
 
 @dataclass
-class OrchestrationConfig:
-    """Configuration for adaptive orchestration."""
-    # Phase budgets (as percentages of total)
-    warmup_budget: float = 0.3  # 30% for coarse scan
-    focus_budget: float = 0.4   # 40% for focused search
-    fine_tune_budget: float = 0.3  # 30% for fine-tuning
+class OrchConfig:
+    """Configuration for orchestrator run"""
+    run_id: str
+    overlap_min: float = 10.0
+    overlap_max: float = 30.0
+    orders_min: int = 5
+    orders_max: int = 15
+    alpha: float = 0.5
+    beta: float = 0.3
+    gamma: float = 0.2
+    lambda_penalty: float = 0.1
+    wave_pattern: bool = True
+    tail_cap: float = 0.40
+    min_indent_step: float = 0.05
+    softmax_temp: float = 1.0
     
-    # Convergence parameters
-    plateau_threshold: float = 1e-6  # ε for plateau detection
-    plateau_window: int = 5  # Number of batches to check for plateau
-    plateau_expansion: float = 0.2  # %X to expand range when plateau detected
-    
-    # Early stopping
-    early_stop_patience: int = 10  # Batches without improvement
-    min_improvement: float = 1e-4  # Minimum improvement threshold
-    
-    # Batch sizing
-    target_eval_rate: float = 1000.0  # Evaluations per second target
-    min_batch_size: int = 50
-    max_batch_size: int = 1000
-    
-    # Top-N results
-    top_n_results: int = 10
-    
-    # Database
-    save_to_db: bool = True
-    db_path: str = "martingale_optimization.db"
+    # Orchestrator settings
+    batch_size: int = 100
+    max_batches: int = 50
+    patience: int = 5
+    prune_factor: float = 2.0
+    top_k: int = 50
+    base_price: float = 100.0
 
 
 class AdaptiveOrchestrator:
-    """Adaptive orchestration for martingale optimization."""
+    """
+    Orchestrates DCA optimization with comprehensive logging and error handling
+    """
     
-    def __init__(self, 
-                 numba_adapter: OptimizerAdapter,
-                 auto_batch_adapter: OptimizerAdapter,
-                 config: Optional[OrchestrationConfig] = None):
-        """Initialize adaptive orchestrator."""
-        self.numba_adapter = numba_adapter
-        self.auto_batch_adapter = auto_batch_adapter
-        self.config = config or OrchestrationConfig()
+    def __init__(self, config: OrchConfig, db_path: str = DB_PATH):
+        self.config = config
+        self.db_path = db_path
+        self.store = ExperimentsStore(db_path)
+        self.exp_id: Optional[int] = None
+        self.eval_count = 0
+        self.best_score = float('inf')
+        self.best_payload: Optional[Dict[str, Any]] = None
+        self.top_candidates: List[Dict[str, Any]] = []
+        self.patience_counter = 0
+        self.should_stop = False
         
-        # Internal state
-        self.top_k_heap = TopKHeap(self.config.top_n_results)
-        self.convergence_checker = ConvergenceChecker(
-            window_size=self.config.plateau_window,
-            tolerance=self.config.plateau_threshold
+        # Initialize with structured logging
+        logger.info(
+            EventNames.ORCH_START,
+            f"Initializing orchestrator with run_id {config.run_id}",
+            run_id=config.run_id,
+            config_json=json.dumps(asdict(config), default=str)
         )
-        self.result_aggregator = ResultAggregator()
-        
-        # Storage
-        self.storage = SQLiteStore(self.config.db_path) if self.config.save_to_db else None
-        self.exp_store = ExperimentsStore("db_results/experiments.db") if self.config.save_to_db else None
-        self.experiment_id: Optional[int] = None
-        
-        # Session tracking
-        self.session_id = f"session_{int(time.time())}"
-        self.start_time = None
-        self.phase_results: List[Tuple[str, SearchResult, TraceResult]] = []
-        
-        # Logging
-        self.logger = logging.getLogger(__name__)
     
-    def run(self, search_config: SearchConfig, 
-            total_time_budget: Optional[float] = None,
-            total_eval_budget: Optional[int] = None) -> Tuple[SearchResult, TraceResult, OptimizationStats]:
-        """
-        Run adaptive optimization orchestration.
+    def create_experiment(self) -> int:
+        """Create experiment record and return exp_id"""
+        config_dict = asdict(self.config)
+        config_dict.pop('run_id', None)  # Don't duplicate in config_json
         
-        Args:
-            search_config: Search configuration
-            total_time_budget: Total time budget in seconds
-            total_eval_budget: Total evaluation budget
+        self.exp_id = self.store.create_experiment(
+            adapter="adaptive_orchestrator",
+            cfg=config_dict,
+            run_id=self.config.run_id
+        )
+        
+        logger.info(
+            EventNames.BUILD_CONFIG,
+            f"Created experiment {self.exp_id}",
+            run_id=self.config.run_id,
+            exp_id=self.exp_id,
+            config_snapshot=config_dict
+        )
+        
+        return self.exp_id
+    
+    def generate_candidate(self, rng: np.random.Generator) -> Dict[str, Any]:
+        """Generate a single candidate with random parameters"""
+        return {
+            'base_price': self.config.base_price,
+            'overlap_pct': rng.uniform(self.config.overlap_min, self.config.overlap_max),
+            'num_orders': int(rng.integers(self.config.orders_min, self.config.orders_max + 1)),
+            'alpha': self.config.alpha,
+            'beta': self.config.beta,
+            'gamma': self.config.gamma,
+            'lambda_penalty': self.config.lambda_penalty,
+            'wave_pattern': self.config.wave_pattern,
+            'tail_cap': self.config.tail_cap,
+            'min_indent_step': self.config.min_indent_step,
+            'softmax_temp': self.config.softmax_temp,
+            'seed': int(rng.integers(0, 2**31))
+        }
+    
+    def evaluate_candidate(self, candidate: Dict[str, Any], 
+                          run_id: str, exp_id: int, span_id: str) -> Optional[Dict[str, Any]]:
+        """Evaluate a single candidate with timing and logging"""
+        with Timer() as timer:
+            # Log evaluation call
+            logger.info(
+                EventNames.EVAL_CALL,
+                "Calling evaluation function",
+                run_id=run_id,
+                exp_id=exp_id,
+                span_id=span_id,
+                eval_count=self.eval_count + 1,
+                overlap=candidate['overlap_pct'],
+                orders=candidate['num_orders']
+            )
             
-        Returns:
-            Tuple of (candidates, traces, statistics)
-        """
-        self.start_time = time.time()
-        self.logger.info(f"Starting adaptive orchestration with session {self.session_id}")
+            # Call evaluation function
+            result = evaluation_function(**candidate)
+            
+            # Ensure JSON serializable
+            result = ensure_json_serializable(result)
+            
+            # Log evaluation return
+            logger.info(
+                EventNames.EVAL_RETURN,
+                f"Evaluation completed with score {result['score']:.4f}",
+                run_id=run_id,
+                exp_id=exp_id,
+                span_id=span_id,
+                eval_count=self.eval_count + 1,
+                score=result['score'],
+                duration_ms=timer.duration_ms,
+                sanity_violations=sum(1 for v in result.get('sanity', {}).values() if v)
+            )
+            
+            return result
+    
+    def should_prune(self, score: float) -> bool:
+        """Determine if candidate should be pruned"""
+        if self.best_score == float('inf'):
+            return False
+        return score > self.best_score * self.config.prune_factor
+    
+    def update_best(self, result: Dict[str, Any]) -> bool:
+        """Update best score and payload, return True if improved"""
+        score = result['score']
+        improved = score < self.best_score
         
-        # Validate configuration
-        if not search_config.validate():
-            raise ValueError("Invalid search configuration")
+        if improved:
+            self.best_score = score
+            self.best_payload = result.copy()
+            self.patience_counter = 0
         
-        # Calculate budgets
-        time_budgets = self._calculate_phase_budgets(total_time_budget)
-        eval_budgets = self._calculate_eval_budgets(total_eval_budget)
-
-        # Create experiment row (summary)
-        if self.exp_store and self.experiment_id is None:
-            cfg_payload = {
-                "overlap_min": getattr(search_config, "overlap_min", None),
-                "overlap_max": getattr(search_config, "overlap_max", None),
-                "orders_min": getattr(search_config, "min_order", None),
-                "orders_max": getattr(search_config, "max_order", None),
-                "alpha": getattr(search_config, "alpha", None),
-                "beta": getattr(search_config, "beta", None),
-                "gamma": getattr(search_config, "gamma", None),
+        # Maintain top-K candidates
+        self.top_candidates.append(result)
+        self.top_candidates.sort(key=lambda x: x['score'])
+        if len(self.top_candidates) > self.config.top_k:
+            self.top_candidates = self.top_candidates[:self.config.top_k]
+        
+        return improved
+    
+    def run_batch(self, batch_idx: int, rng: np.random.Generator) -> Dict[str, Any]:
+        """Run a single batch of evaluations"""
+        span_id = generate_span_id(batch_idx)
+        batch_start = time.time()
+        
+        logger.info(
+            EventNames.ORCH_BATCH,
+            f"Starting batch {batch_idx}",
+            run_id=self.config.run_id,
+            exp_id=self.exp_id,
+            span_id=span_id,
+            batch_idx=batch_idx,
+            batch_size=self.config.batch_size
+        )
+        
+        batch_results = []
+        pruned_count = 0
+        
+        for i in range(self.config.batch_size):
+            if self.should_stop:
+                break
+                
+            # Generate and evaluate candidate
+            candidate = self.generate_candidate(rng)
+            result = self.evaluate_candidate(candidate, self.config.run_id, self.exp_id, span_id)
+            
+            if result is None:
+                continue
+                
+            self.eval_count += 1
+            score = result['score']
+            
+            # Check for pruning
+            if self.should_prune(score):
+                pruned_count += 1
+                logger.debug(
+                    EventNames.ORCH_PRUNE,
+                    f"Pruned candidate with score {score:.4f}",
+                    run_id=self.config.run_id,
+                    exp_id=self.exp_id,
+                    span_id=span_id,
+                    score=score,
+                    best_score=self.best_score
+                )
+                continue
+            
+            # Update best and add to batch results
+            improved = self.update_best(result)
+            batch_results.append(result)
+            
+            if improved:
+                logger.info(
+                    EventNames.ORCH_BATCH,
+                    f"New best score: {score:.4f}",
+                    run_id=self.config.run_id,
+                    exp_id=self.exp_id,
+                    span_id=span_id,
+                    score=score,
+                    improvement=self.best_score - score if self.best_score != float('inf') else 0
+                )
+        
+        # Save batch results to database
+        if batch_results:
+            rows_saved = self.store.upsert_results(self.exp_id, batch_results)
+            logger.info(
+                EventNames.ORCH_SAVE_OK,
+                f"Saved {rows_saved} results from batch {batch_idx}",
+                run_id=self.config.run_id,
+                exp_id=self.exp_id,
+                span_id=span_id,
+                rows=rows_saved
+            )
+        
+        # Log pruning statistics
+        if pruned_count > 0:
+            logger.info(
+                EventNames.ORCH_PRUNE,
+                f"Pruned {pruned_count} candidates in batch {batch_idx}",
+                run_id=self.config.run_id,
+                exp_id=self.exp_id,
+                span_id=span_id,
+                pruned_count=pruned_count
+            )
+        
+        batch_duration = (time.time() - batch_start) * 1000
+        return {
+            'batch_idx': batch_idx,
+            'evaluated': len(batch_results),
+            'pruned': pruned_count,
+            'best_score': self.best_score,
+            'duration_ms': batch_duration
+        }
+    
+    def check_early_stopping(self) -> bool:
+        """Check if we should stop early due to lack of improvement"""
+        self.patience_counter += 1
+        if self.patience_counter >= self.config.patience:
+            logger.info(
+                EventNames.ORCH_EARLY_STOP,
+                f"Early stopping after {self.patience_counter} batches without improvement",
+                run_id=self.config.run_id,
+                exp_id=self.exp_id,
+                patience=self.config.patience,
+                best_score=self.best_score
+            )
+            return True
+        return False
+    
+    def save_crash_snapshot(self, error: Exception, context: Dict[str, Any]) -> str:
+        """Save crash snapshot for debugging"""
+        snapshot = {
+            'timestamp': datetime.now().isoformat(),
+            'run_id': self.config.run_id,
+            'exp_id': self.exp_id,
+            'error': str(error),
+            'traceback': traceback.format_exc(),
+            'context': context,
+            'config': asdict(self.config),
+            'stats': {
+                'eval_count': self.eval_count,
+                'best_score': self.best_score,
+                'top_candidates_count': len(self.top_candidates)
             }
-            self.experiment_id = self.exp_store.create_experiment(adapter="adaptive", cfg=cfg_payload)
+        }
+        
+        filename = f"{self.config.run_id}_{int(time.time())}.json"
+        filepath = CRASH_SNAPSHOTS_DIR / filename
+        
+        with open(filepath, 'w') as f:
+            json.dump(snapshot, f, indent=2, default=str)
+        
+        return str(filepath)
+    
+    def run_optimization(self, progress_callback: Optional[Callable] = None) -> Dict[str, Any]:
+        """
+        Main optimization loop with comprehensive error handling and logging
+        """
+        start_time = time.time()
         
         try:
-            # Phase 1: Warmup (Coarse Scan)
-            self.logger.info("Phase 1: Warmup (Coarse Scan)")
-            warmup_candidates, warmup_traces = self._run_warmup_phase(
-                search_config, time_budgets['warmup'], eval_budgets['warmup']
+            # Create experiment record
+            if self.exp_id is None:
+                self.create_experiment()
+            
+            # Initialize random generator
+            rng = np.random.default_rng()
+            
+            # Main batch loop
+            for batch_idx in range(self.config.max_batches):
+                if self.should_stop:
+                    break
+                
+                # Run batch
+                batch_stats = self.run_batch(batch_idx, rng)
+                
+                # Update progress callback
+                if progress_callback:
+                    progress_callback({
+                        'batch_idx': batch_idx,
+                        'eval_count': self.eval_count,
+                        'best_score': self.best_score,
+                        'batch_stats': batch_stats
+                    })
+                
+                # Check early stopping
+                if self.check_early_stopping():
+                    break
+            
+            # Update experiment summary
+            elapsed_s = time.time() - start_time
+            self.store.update_experiment_summary(
+                self.exp_id, self.best_score, self.eval_count, elapsed_s
             )
-            self.phase_results.append(('warmup', warmup_candidates, warmup_traces))
-            # Upsert batch results
-            self._upsert_phase_results(warmup_traces)
             
-            # Phase 2: Focus (Narrowed Ranges)
-            self.logger.info("Phase 2: Focus (Narrowed Ranges)")
-            focus_candidates, focus_traces = self._run_focus_phase(
-                search_config, time_budgets['focus'], eval_budgets['focus']
+            # Log completion
+            logger.info(
+                EventNames.ORCH_DONE,
+                f"Optimization completed successfully",
+                run_id=self.config.run_id,
+                exp_id=self.exp_id,
+                best_score=self.best_score,
+                total_evals=self.eval_count,
+                elapsed_ms=(elapsed_s * 1000)
             )
-            self.phase_results.append(('focus', focus_candidates, focus_traces))
-            self._upsert_phase_results(focus_traces)
             
-            # Phase 3: Fine-tuning (Deep Exploration)
-            self.logger.info("Phase 3: Fine-tuning (Deep Exploration)")
-            fine_tune_candidates, fine_tune_traces = self._run_fine_tune_phase(
-                search_config, time_budgets['fine_tune'], eval_budgets['fine_tune']
-            )
-            self.phase_results.append(('fine_tune', fine_tune_candidates, fine_tune_traces))
-            self._upsert_phase_results(fine_tune_traces)
-            
-            # Phase 4: Output (Results and Storage)
-            self.logger.info("Phase 4: Output (Results and Storage)")
-            final_candidates, final_traces, stats = self._run_output_phase()
-            
-            return final_candidates, final_traces, stats
+            return {
+                'status': 'completed',
+                'run_id': self.config.run_id,
+                'exp_id': self.exp_id,
+                'best_score': self.best_score,
+                'total_evals': self.eval_count,
+                'elapsed_s': elapsed_s,
+                'best_payload': self.best_payload
+            }
             
         except Exception as e:
-            self.logger.error(f"Orchestration failed: {e}")
+            # Log error with full context
+            elapsed_s = time.time() - start_time
+            
+            # Save crash snapshot
+            context = {
+                'batch_idx': getattr(self, 'current_batch_idx', -1),
+                'eval_count': self.eval_count,
+                'best_score': self.best_score
+            }
+            snapshot_path = self.save_crash_snapshot(e, context)
+            
+            logger.error(
+                EventNames.ORCH_ERROR,
+                f"Optimization failed: {str(e)}",
+                run_id=self.config.run_id,
+                exp_id=self.exp_id,
+                error=str(e),
+                traceback=traceback.format_exc(),
+                snapshot_path=snapshot_path,
+                stats={
+                    'evals_total': self.eval_count,
+                    'evals_ok': self.eval_count,  # Approximate
+                    'evals_failed': 0,  # Would need to track separately
+                    'elapsed_s': elapsed_s
+                }
+            )
+            
+            # Update experiment status to FAILED
+            if self.exp_id:
+                 try:
+                     import sqlite3
+                     with sqlite3.connect(self.db_path) as conn:
+                         cur = conn.cursor()
+                         cur.execute(
+                             "UPDATE experiments SET status = ?, finished_at = ? WHERE id = ?",
+                             (Status.FAILED, datetime.now().isoformat(), self.exp_id)
+                         )
+                         conn.commit()
+                 except:
+                     pass  # Don't let secondary error mask primary error
+            
+            # Re-raise the original exception
             raise
     
-    def _calculate_phase_budgets(self, total_time: Optional[float]) -> Dict[str, float]:
-        """Calculate time budgets for each phase."""
-        if total_time is None:
-            return {
-                'warmup': None,
-                'focus': None,
-                'fine_tune': None
-            }
-        
-        return {
-            'warmup': total_time * self.config.warmup_budget,
-            'focus': total_time * self.config.focus_budget,
-            'fine_tune': total_time * self.config.fine_tune_budget
-        }
-    
-    def _calculate_eval_budgets(self, total_eval: Optional[int]) -> Dict[str, int]:
-        """Calculate evaluation budgets for each phase."""
-        if total_eval is None:
-            return {
-                'warmup': None,
-                'focus': None,
-                'fine_tune': None
-            }
-        
-        return {
-            'warmup': int(total_eval * self.config.warmup_budget),
-            'focus': int(total_eval * self.config.focus_budget),
-            'fine_tune': int(total_eval * self.config.fine_tune_budget)
-        }
-    
-    def _run_warmup_phase(self, search_config: SearchConfig, 
-                         time_budget: Optional[float], 
-                         eval_budget: Optional[int]) -> Tuple[SearchResult, TraceResult]:
-        """Run warmup phase with coarse scan."""
-        # Use numba adapter for fast JIT evaluation
-        candidates = self.numba_adapter.search(search_config, time_budget)
-        traces = self.numba_adapter.get_trace()
-        
-        # Update top-k heap
-        for candidate in candidates:
-            # Find corresponding trace
-            trace = next((t for t in traces if t.stable_id == candidate.stable_id), None)
-            if trace:
-                self.top_k_heap.push(trace.J, candidate, trace)
-                self.convergence_checker.add_score(trace.J)
-        
-        self.logger.info(f"Warmup completed: {len(candidates)} candidates, {len(traces)} traces")
-        return candidates, traces
-    
-    def _run_focus_phase(self, search_config: SearchConfig,
-                        time_budget: Optional[float],
-                        eval_budget: Optional[int]) -> Tuple[SearchResult, TraceResult]:
-        """Run focus phase with narrowed ranges."""
-        # Get best candidates from warmup
-        best_results = self.top_k_heap.get_top_k()
-        if not best_results:
-            return [], []
-        
-        # Calculate focused search ranges
-        focused_config = self._create_focused_config(search_config, best_results)
-        
-        # Use numba adapter for focused search
-        candidates = self.numba_adapter.search(focused_config, time_budget)
-        traces = self.numba_adapter.get_trace()
-        
-        # Update top-k heap
-        for candidate in candidates:
-            trace = next((t for t in traces if t.stable_id == candidate.stable_id), None)
-            if trace:
-                self.top_k_heap.push(trace.J, candidate, trace)
-                self.convergence_checker.add_score(trace.J)
-        
-        self.logger.info(f"Focus completed: {len(candidates)} candidates, {len(traces)} traces")
-        return candidates, traces
-    
-    def _run_fine_tune_phase(self, search_config: SearchConfig,
-                           time_budget: Optional[float],
-                           eval_budget: Optional[int]) -> Tuple[SearchResult, TraceResult]:
-        """Run fine-tuning phase with deep exploration."""
-        # Get current best results
-        best_results = self.top_k_heap.get_top_k()
-        if not best_results:
-            return [], []
-        
-        # Check for plateau and expand if necessary
-        if self.convergence_checker.is_converged():
-            self.logger.info("Plateau detected, expanding search range")
-            search_config = self._expand_search_range(search_config, best_results)
-        
-        # Use auto-batch adapter for fine-tuning
-        candidates = self.auto_batch_adapter.search(search_config, time_budget)
-        traces = self.auto_batch_adapter.get_trace()
-        
-        # Update top-k heap
-        for candidate in candidates:
-            trace = next((t for t in traces if t.stable_id == candidate.stable_id), None)
-            if trace:
-                self.top_k_heap.push(trace.J, candidate, trace)
-                self.convergence_checker.add_score(trace.J)
-        
-        self.logger.info(f"Fine-tuning completed: {len(candidates)} candidates, {len(traces)} traces")
-        return candidates, traces
-    
-    def _run_output_phase(self) -> Tuple[SearchResult, TraceResult, OptimizationStats]:
-        """Run output phase with results and storage."""
-        # Get final top-N results
-        final_results = self.top_k_heap.get_top_k()
-        candidates = [result[1] for result in final_results]
-        traces = [result[2] for result in final_results]
-        
-        # Calculate statistics
-        stats = self._calculate_final_statistics()
-        
-        # Save to database if enabled
-        if self.storage and self.config.save_to_db:
-            self._save_results_to_db(candidates, traces, stats)
-        # Update experiment summary
-        if self.exp_store and self.experiment_id is not None:
-            best = self.top_k_heap.get_best()[0] if self.top_k_heap.heap else float("inf")
-            total_evals = sum(t.eval_count for t in traces) if traces else 0
-            elapsed_s = stats.get('total_time', 0.0)
-            self.exp_store.update_experiment_summary(self.experiment_id, best_score=best, total_evals=total_evals, elapsed_s=elapsed_s)
-        
-        self.logger.info(f"Output completed: {len(candidates)} final candidates")
-        return candidates, traces, stats
-    
-    def _create_focused_config(self, base_config: SearchConfig, 
-                             best_results: List[Tuple[float, Candidate, ResultTrace]]) -> SearchConfig:
-        """Create focused search configuration based on best results."""
-        # Extract parameter ranges from best results
-        min_overlaps = [r[1].min_overlap for r in best_results]
-        max_overlaps = [r[1].max_overlap for r in best_results]
-        min_orders = [r[1].min_order for r in best_results]
-        max_orders = [r[1].max_order for r in best_results]
-        
-        # Calculate focused ranges with margin
-        margin = 0.1  # 10% margin
-        
-        focused_config = SearchConfig(
-            min_overlap=max(0, min(min_overlaps) * (1 - margin)),
-            max_overlap=min(100, max(max_overlaps) * (1 + margin)),
-            min_order=max(1, min(min_orders) - 1),
-            max_order=min(50, max(max_orders) + 1),
-            seed=base_config.seed,
-            time_budget=base_config.time_budget,
-            eval_budget=base_config.eval_budget,
-            iteration_budget=base_config.iteration_budget,
-            risk_factor=base_config.risk_factor,
-            smoothing_factor=base_config.smoothing_factor,
-            tail_weight=base_config.tail_weight,
-            alpha=base_config.alpha,
-            beta=base_config.beta,
-            gamma=base_config.gamma
+    def stop(self):
+        """Signal orchestrator to stop gracefully"""
+        self.should_stop = True
+        logger.info(
+            EventNames.ORCH_EARLY_STOP,
+            "Stop signal received",
+            run_id=self.config.run_id,
+            exp_id=self.exp_id
         )
-        
-        return focused_config
-    
-    def _expand_search_range(self, base_config: SearchConfig,
-                           best_results: List[Tuple[float, Candidate, ResultTrace]]) -> SearchConfig:
-        """Expand search range when plateau is detected."""
-        expansion_factor = self.config.plateau_expansion
-        
-        # Expand parameter ranges
-        expanded_config = SearchConfig(
-            min_overlap=max(0, base_config.min_overlap * (1 - expansion_factor)),
-            max_overlap=min(100, base_config.max_overlap * (1 + expansion_factor)),
-            min_order=max(1, base_config.min_order - 2),
-            max_order=min(50, base_config.max_order + 2),
-            seed=base_config.seed,
-            time_budget=base_config.time_budget,
-            eval_budget=base_config.eval_budget,
-            iteration_budget=base_config.iteration_budget,
-            risk_factor=base_config.risk_factor,
-            smoothing_factor=base_config.smoothing_factor,
-            tail_weight=base_config.tail_weight,
-            alpha=base_config.alpha,
-            beta=base_config.beta,
-            gamma=base_config.gamma
-        )
-        
-        return expanded_config
-    
-    def _calculate_final_statistics(self) -> OptimizationStats:
-        """Calculate final optimization statistics."""
-        total_time = time.time() - self.start_time if self.start_time else 0
-        
-        # Get all traces from all phases
-        all_traces = []
-        for phase_name, candidates, traces in self.phase_results:
-            all_traces.extend(traces)
-        
-        # Calculate statistics
-        stats = {
-            'session_id': self.session_id,
-            'total_time': total_time,
-            'total_evaluations': sum(t.eval_count for t in all_traces),
-            'total_candidates': sum(len(candidates) for _, candidates, _ in self.phase_results),
-            'phases_completed': len(self.phase_results),
-            'best_score': self.top_k_heap.get_best()[0] if self.top_k_heap.heap else None,
-            'convergence_metrics': self.convergence_checker.get_convergence_metrics(),
-            'phase_results': [
-                {
-                    'phase': phase_name,
-                    'candidates': len(candidates),
-                    'traces': len(traces),
-                    'best_score': max((t.J for t in traces), default=None)
-                }
-                for phase_name, candidates, traces in self.phase_results
-            ]
-        }
-        
-        return stats
-    
-    def _save_results_to_db(self, candidates: SearchResult, 
-                          traces: TraceResult, 
-                          stats: OptimizationStats):
-        """Save results to database."""
-        try:
-            # Save candidates and traces
-            for candidate, trace in zip(candidates, traces):
-                self.storage.save_result(
-                    params=candidate,
-                    score=trace.J,
-                    breakdown=trace,
-                    metadata={'session_id': self.session_id}
-                )
-            
-            # Save top results
-            top_results = [(trace.J, candidate, trace) for candidate, trace in zip(candidates, traces)]
-            self.storage.save_top_results(top_results)
-            
-            self.logger.info(f"Results saved to database: {len(candidates)} candidates")
-            
-        except Exception as e:
-            self.logger.error(f"Failed to save results to database: {e}")
-    
-    def _upsert_phase_results(self, traces: TraceResult) -> None:
-        if not self.exp_store or self.experiment_id is None:
-            return
-        items: List[Dict[str, Any]] = []
-        for t in traces:
-            m = t.to_dict() if hasattr(t, 'to_dict') else {}
-            if not m:
-                # Build from metrics fallback
-                m = {
-                    "stable_id": getattr(t, 'stable_id', None),
-                    "score": getattr(t, 'J', None),
-                    "params": {},
-                    "schedule": {},
-                    "risk": {},
-                    "penalties": {},
-                }
-            else:
-                items.append({
-                    "stable_id": m.get("stable_id"),
-                    "score": m.get("J"),
-                    "params": m.get("candidate", {}) or m.get("params", {}),
-                    "schedule": getattr(getattr(t, 'candidate', None), 'schedule', None) or m.get("schedule", {}),
-                    "risk": {
-                        "max_need": m.get("max_score"),
-                        "var_need": m.get("variance_score"),
-                        "tail": m.get("tail_score"),
-                    },
-                    "penalties": {
-                        "gini": m.get("gini_penalty"),
-                        "entropy": m.get("entropy_penalty"),
-                        "monotone_viol": m.get("monotone_penalty"),
-                        "smooth_viol": m.get("smoothness_penalty"),
-                    }
-                })
-        if items:
-            self.exp_store.upsert_results(self.experiment_id, items)
-    
-    def get_best_candidate(self) -> Optional[Candidate]:
-        """Get the best candidate found."""
-        if not self.top_k_heap.heap:
-            return None
-        return self.top_k_heap.get_best()[1]
-    
-    def get_top_candidates(self, n: int = None) -> List[Candidate]:
-        """Get top-N candidates."""
-        if n is None:
-            n = self.config.top_n_results
-        
-        results = self.top_k_heap.get_top_k()[:n]
-        return [result[1] for result in results]
-    
-    def get_optimization_trace(self) -> TraceResult:
-        """Get complete optimization trace."""
-        all_traces = []
-        for _, _, traces in self.phase_results:
-            all_traces.extend(traces)
-        return all_traces

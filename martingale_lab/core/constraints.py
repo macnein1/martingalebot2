@@ -1,298 +1,491 @@
 """
-Constraints and normalization functions for martingale optimization.
+Constraints and Normalization for DCA/Martingale Optimization
+Implements soft penalty approach with proper bounds checking and normalization functions.
 """
+from __future__ import annotations
+
 import numpy as np
-from typing import Tuple, List, Dict, Any
-from .types import Params, Schedule
+from numba import njit
+from typing import Dict, Any, Tuple
+import math
 
 
-def validate_search_space(cfg: Dict[str, Any]) -> None:
+@njit(cache=True, fastmath=True)
+def normalize_volumes_softmax(raw_volumes: np.ndarray, temperature: float = 1.0) -> np.ndarray:
     """
-    Validate search space configuration parameters.
+    Normalize volumes using softmax to ensure sum = 100%.
     
     Args:
-        cfg: Configuration dictionary with optimization parameters
+        raw_volumes: Raw volume logits
+        temperature: Softmax temperature (higher = more uniform)
         
-    Raises:
-        AssertionError: If any constraint is violated
+    Returns:
+        Normalized volume percentages summing to 100.0
     """
-    assert 0 < cfg.get('overlap_min', 0) < cfg.get('overlap_max', 100) <= 100, \
-        f"Invalid overlap range: {cfg.get('overlap_min')} - {cfg.get('overlap_max')}"
+    if raw_volumes.size == 0:
+        return np.zeros(1, dtype=np.float64)  # Return single element for numba compatibility
     
-    assert 1 <= cfg.get('orders_min', 1) <= cfg.get('orders_max', 100) <= 100, \
-        f"Invalid orders range: {cfg.get('orders_min')} - {cfg.get('orders_max')}"
+    # Apply temperature scaling
+    scaled = raw_volumes / max(temperature, 1e-6)
     
-    # Penalty weight validation
-    alpha = cfg.get('alpha', 0)
-    beta = cfg.get('beta', 0) 
-    gamma = cfg.get('gamma', 0)
-    assert 0 <= alpha <= 1 and 0 <= beta <= 1 and 0 <= gamma <= 1, \
-        f"Invalid penalty weights: α={alpha}, β={beta}, γ={gamma}"
+    # Stabilize by subtracting max
+    max_val = np.max(scaled)
+    exp_vals = np.exp(scaled - max_val)
     
-    # At least one objective should be active
-    assert alpha + beta + gamma > 0, "At least one objective weight must be positive"
+    # Softmax normalization
+    sum_exp = np.sum(exp_vals)
+    if sum_exp <= 1e-12:
+        # Fallback to uniform distribution
+        return np.full(raw_volumes.size, 100.0 / raw_volumes.size)
+    
+    probabilities = exp_vals / sum_exp
+    return probabilities * 100.0
 
 
-def assert_schedule_invariants(schedule: Schedule) -> None:
+@njit(cache=True, fastmath=True)
+def monotonic_softplus_for_indents(raw_indents: np.ndarray, overlap_pct: float, 
+                                  min_step: float = 0.01) -> np.ndarray:
     """
-    Assert critical schedule invariants for early error detection.
+    Convert raw indents to monotonically increasing cumulative indents using softplus.
     
     Args:
-        schedule: Schedule object to validate
+        raw_indents: Raw indent logits
+        overlap_pct: Total overlap percentage to scale to
+        min_step: Minimum step size percentage
         
-    Raises:
-        AssertionError: If any invariant is violated
+    Returns:
+        Cumulative indent percentages [0, i1, i2, ..., overlap_pct]
     """
-    if hasattr(schedule, 'indent_pct'):
-        indent = schedule.indent_pct
-        # Indent should be non-negative and monotonically increasing
-        assert indent[0] >= 0, f"First indent must be non-negative: {indent[0]}"
-        for i in range(len(indent) - 1):
-            assert indent[i] <= indent[i + 1], \
-                f"Indent not monotonic at position {i}: {indent[i]} > {indent[i+1]}"
+    if raw_indents.size == 0:
+        return np.array([0.0], dtype=np.float64)
     
-    if hasattr(schedule, 'volume_pct'):
-        vol = schedule.volume_pct
-        # Volumes should sum to 1 and be non-negative
-        vol_sum = sum(vol)
-        assert abs(vol_sum - 1.0) < 1e-6, f"Volume sum not 1.0: {vol_sum}"
-        assert all(v >= 0 for v in vol), f"Negative volumes found: {[v for v in vol if v < 0]}"
-
-
-def validate_martingale_bounds(martingale_pct: float) -> None:
-    """
-    Validate martingale percentage bounds.
-    
-    Args:
-        martingale_pct: Martingale percentage to validate
+    # Apply softplus to ensure positive steps
+    steps = np.empty(raw_indents.size)
+    for i in range(raw_indents.size):
+        x = raw_indents[i]
+        # Softplus with numerical stability
+        if x > 20:
+            steps[i] = x
+        elif x < -20:
+            steps[i] = math.exp(x)
+        else:
+            steps[i] = math.log1p(math.exp(x))
         
-    Raises:
-        AssertionError: If bounds are violated
-    """
-    assert 0 <= martingale_pct <= 100, f"Martingale % out of bounds: {martingale_pct}"
-
-
-def validate_need_pct_sanity(need_pct_values: np.ndarray) -> None:
-    """
-    Validate NeedPct values are within reasonable bounds.
+        # Ensure minimum step size
+        steps[i] = max(steps[i], min_step)
     
-    Args:
-        need_pct_values: Array of NeedPct values
-        
-    Raises:
-        AssertionError: If values are unreasonable
-    """
-    assert np.all(need_pct_values >= 0), "NeedPct values must be non-negative"
-    assert np.all(need_pct_values <= 50), f"NeedPct values too high (>50%): {np.max(need_pct_values)}"
-    assert not np.any(np.isnan(need_pct_values)), "NaN values in NeedPct"
-    assert not np.any(np.isinf(need_pct_values)), "Infinite values in NeedPct"
+    # Normalize steps to sum to overlap_pct
+    steps_sum = np.sum(steps)
+    if steps_sum <= 1e-12:
+        # Fallback to uniform steps
+        step_size = overlap_pct / raw_indents.size
+        steps = np.full(raw_indents.size, max(step_size, min_step))
+    else:
+        steps = steps * (overlap_pct / steps_sum)
+        # Ensure all steps meet minimum
+        for i in range(steps.size):
+            steps[i] = max(steps[i], min_step)
+    
+    # Create cumulative indents starting from 0
+    cumulative = np.empty(raw_indents.size + 1)
+    cumulative[0] = 0.0
+    for i in range(raw_indents.size):
+        cumulative[i + 1] = cumulative[i] + steps[i]
+    
+    return cumulative
 
 
-def validate_physical_constraints(schedule: Schedule) -> None:
+@njit(cache=True, fastmath=True)
+def sigmoid_martingales(raw_martingales: np.ndarray, min_mart: float = 1.0, 
+                       max_mart: float = 100.0) -> np.ndarray:
     """
-    Validate physical/business constraints on schedule.
+    Convert raw martingale logits to bounded percentages using sigmoid.
     
     Args:
-        schedule: Schedule to validate
+        raw_martingales: Raw martingale logits
+        min_mart: Minimum martingale percentage
+        max_mart: Maximum martingale percentage
         
-    Raises:
-        AssertionError: If constraints are violated
+    Returns:
+        Martingale percentages with first element = 0, rest in [min_mart, max_mart]
     """
+    if raw_martingales.size == 0:
+        return np.array([], dtype=np.float64)
+    
+    martingales = np.empty(raw_martingales.size)
+    martingales[0] = 0.0  # First order has no martingale
+    
+    for i in range(1, raw_martingales.size):
+        # Sigmoid to [0, 1]
+        sigmoid_val = 1.0 / (1.0 + math.exp(-raw_martingales[i]))
+        # Scale to [min_mart, max_mart]
+        martingales[i] = min_mart + (max_mart - min_mart) * sigmoid_val
+    
+    return martingales
+
+
+@njit(cache=True, fastmath=True)
+def assert_increasing(sequence: np.ndarray, tolerance: float = 1e-6) -> float:
+    """
+    Calculate penalty for non-increasing sequences (soft constraint).
+    
+    Args:
+        sequence: Array that should be non-decreasing
+        tolerance: Tolerance for small violations
+        
+    Returns:
+        Penalty value (0 if perfectly increasing)
+    """
+    if sequence.size <= 1:
+        return 0.0
+    
+    violation = 0.0
+    for i in range(1, sequence.size):
+        diff = sequence[i-1] - sequence[i]
+        if diff > tolerance:
+            violation += diff
+    
+    return violation
+
+
+@njit(cache=True, fastmath=True)
+def assert_bounds(values: np.ndarray, min_val: float, max_val: float) -> float:
+    """
+    Calculate penalty for values outside bounds (soft constraint).
+    
+    Args:
+        values: Array of values to check
+        min_val: Minimum allowed value
+        max_val: Maximum allowed value
+        
+    Returns:
+        Penalty value (0 if all values within bounds)
+    """
+    if values.size == 0:
+        return 0.0
+    
+    violation = 0.0
+    for val in values:
+        if val < min_val:
+            violation += min_val - val
+        elif val > max_val:
+            violation += val - max_val
+    
+    return violation
+
+
+@njit(cache=True, fastmath=True)
+def assert_sum_constraint(values: np.ndarray, target_sum: float, tolerance: float = 1e-6) -> float:
+    """
+    Calculate penalty for sum constraint violation (soft constraint).
+    
+    Args:
+        values: Array of values
+        target_sum: Target sum value
+        tolerance: Tolerance for small violations
+        
+    Returns:
+        Penalty value (0 if sum matches target within tolerance)
+    """
+    if values.size == 0:
+        return 0.0
+    
+    actual_sum = np.sum(values)
+    diff = abs(actual_sum - target_sum)
+    
+    if diff <= tolerance:
+        return 0.0
+    
+    return diff
+
+
+@njit(cache=True, fastmath=True)
+def volume_normalization_penalty(volumes: np.ndarray) -> float:
+    """
+    Calculate penalty for volume normalization deviation from 100%.
+    
+    Args:
+        volumes: Volume percentages
+        
+    Returns:
+        Normalization penalty
+    """
+    if volumes.size == 0:
+        return 0.0
+    
+    total = np.sum(volumes)
+    return abs(total - 100.0)
+
+
+@njit(cache=True, fastmath=True)
+def indent_monotonicity_penalty(indents: np.ndarray) -> float:
+    """
+    Calculate penalty for non-monotonic indent sequence.
+    
+    Args:
+        indents: Cumulative indent percentages
+        
+    Returns:
+        Monotonicity penalty
+    """
+    return assert_increasing(indents)
+
+
+@njit(cache=True, fastmath=True)
+def martingale_bounds_penalty(martingales: np.ndarray, min_mart: float = 1.0, 
+                             max_mart: float = 100.0) -> float:
+    """
+    Calculate penalty for martingale values outside bounds.
+    
+    Args:
+        martingales: Martingale percentages
+        min_mart: Minimum allowed martingale (for orders > 1)
+        max_mart: Maximum allowed martingale
+        
+    Returns:
+        Bounds penalty
+    """
+    if martingales.size <= 1:
+        return 0.0
+    
+    penalty = 0.0
+    
+    # First martingale should be 0
+    if martingales[0] != 0.0:
+        penalty += abs(martingales[0])
+    
+    # Rest should be in [min_mart, max_mart]
+    for i in range(1, martingales.size):
+        if martingales[i] < min_mart:
+            penalty += min_mart - martingales[i]
+        elif martingales[i] > max_mart:
+            penalty += martingales[i] - max_mart
+    
+    return penalty
+
+
+@njit(cache=True, fastmath=True)
+def volume_bounds_penalty(volumes: np.ndarray, min_vol: float = 0.1, 
+                         max_vol: float = 80.0) -> float:
+    """
+    Calculate penalty for volume values outside reasonable bounds.
+    
+    Args:
+        volumes: Volume percentages
+        min_vol: Minimum reasonable volume percentage
+        max_vol: Maximum reasonable volume percentage
+        
+    Returns:
+        Bounds penalty
+    """
+    return assert_bounds(volumes, min_vol, max_vol)
+
+
+@njit(cache=True, fastmath=True)
+def indent_bounds_penalty(indents: np.ndarray, overlap_pct: float) -> float:
+    """
+    Calculate penalty for indent values outside [0, overlap_pct] bounds.
+    
+    Args:
+        indents: Cumulative indent percentages
+        overlap_pct: Maximum allowed overlap
+        
+    Returns:
+        Bounds penalty
+    """
+    return assert_bounds(indents, 0.0, overlap_pct)
+
+
+@njit(cache=True, fastmath=True)
+def tail_cap_penalty(volumes: np.ndarray, max_last_pct: float = 40.0) -> float:
+    """
+    Calculate penalty for excessive volume concentration in last order.
+    
+    Args:
+        volumes: Volume percentages
+        max_last_pct: Maximum allowed percentage for last order
+        
+    Returns:
+        Tail cap penalty
+    """
+    if volumes.size == 0:
+        return 0.0
+    
+    last_volume = volumes[-1]
+    if last_volume > max_last_pct:
+        return (last_volume - max_last_pct) * 2.0  # Strong penalty
+    
+    return 0.0
+
+
+@njit(cache=True, fastmath=True)
+def head_cap_penalty(volumes: np.ndarray, max_first_pct: float = 60.0) -> float:
+    """
+    Calculate penalty for excessive volume concentration in first order.
+    
+    Args:
+        volumes: Volume percentages
+        max_first_pct: Maximum allowed percentage for first order
+        
+    Returns:
+        Head cap penalty
+    """
+    if volumes.size == 0:
+        return 0.0
+    
+    first_volume = volumes[0]
+    if first_volume > max_first_pct:
+        return (first_volume - max_first_pct) * 1.5  # Moderate penalty
+    
+    return 0.0
+
+
+def compute_all_constraint_penalties(indents: np.ndarray, volumes: np.ndarray, 
+                                   martingales: np.ndarray, overlap_pct: float,
+                                   config: Dict[str, Any]) -> Dict[str, float]:
+    """
+    Compute all constraint penalties for a candidate solution.
+    
+    Args:
+        indents: Cumulative indent percentages
+        volumes: Volume percentages
+        martingales: Martingale percentages
+        overlap_pct: Maximum overlap percentage
+        config: Configuration dictionary
+        
+    Returns:
+        Dictionary of constraint penalties
+    """
+    # Extract configuration with defaults
+    min_vol = config.get('min_volume_pct', 0.1)
+    max_vol = config.get('max_volume_pct', 80.0)
+    min_mart = config.get('min_martingale_pct', 1.0)
+    max_mart = config.get('max_martingale_pct', 100.0)
+    max_last_vol = config.get('tail_cap_pct', 40.0)
+    max_first_vol = config.get('head_cap_pct', 60.0)
+    
+    penalties = {}
+    
     # Volume constraints
-    if hasattr(schedule, 'volumes'):
-        volumes = schedule.volumes
-        assert np.all(volumes >= 0), "All volumes must be non-negative"
-        assert np.sum(volumes) > 0, "Total volume must be positive"
+    penalties['volume_normalization'] = volume_normalization_penalty(volumes)
+    penalties['volume_bounds'] = volume_bounds_penalty(volumes, min_vol, max_vol)
+    penalties['tail_cap'] = tail_cap_penalty(volumes, max_last_vol)
+    penalties['head_cap'] = head_cap_penalty(volumes, max_first_vol)
     
-    # Order constraints  
-    if hasattr(schedule, 'orders'):
-        orders = schedule.orders
-        assert np.all(orders >= 1), "All orders must be at least 1"
-        assert np.all(orders <= 1000), "Orders too large (>1000)"
+    # Indent constraints
+    penalties['indent_monotonicity'] = indent_monotonicity_penalty(indents)
+    penalties['indent_bounds'] = indent_bounds_penalty(indents, overlap_pct)
     
-    # Overlap constraints
-    if hasattr(schedule, 'overlaps'):
-        overlaps = schedule.overlaps
-        assert np.all(overlaps >= 0), "Overlaps must be non-negative"
-        assert np.all(overlaps <= 100), "Overlaps must be <= 100%"
+    # Martingale constraints
+    penalties['martingale_bounds'] = martingale_bounds_penalty(martingales, min_mart, max_mart)
+    
+    return penalties
 
 
-class ConstraintValidator:
-    """Validates and enforces constraints on optimization parameters."""
+def apply_soft_constraints(raw_indents: np.ndarray, raw_volumes: np.ndarray, 
+                          raw_martingales: np.ndarray, overlap_pct: float,
+                          config: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, float]]:
+    """
+    Apply soft constraints and normalization to raw parameters.
     
-    @staticmethod
-    def validate_params(params: Params) -> bool:
-        """Validate parameter constraints."""
-        return (
-            0 <= params.min_overlap <= params.max_overlap <= 100 and
-            1 <= params.min_order <= params.max_order <= 50 and
-            params.risk_factor > 0 and
-            0 <= params.smoothing_factor <= 1 and
-            0 <= params.tail_weight <= 1
-        )
+    Args:
+        raw_indents: Raw indent logits
+        raw_volumes: Raw volume logits
+        raw_martingales: Raw martingale logits
+        overlap_pct: Maximum overlap percentage
+        config: Configuration dictionary
+        
+    Returns:
+        Tuple of (normalized_indents, normalized_volumes, normalized_martingales, penalties)
+    """
+    # Extract configuration
+    softmax_temp = config.get('softmax_temperature', 1.0)
+    min_step = config.get('min_indent_step', 0.01)
+    min_mart = config.get('min_martingale_pct', 1.0)
+    max_mart = config.get('max_martingale_pct', 100.0)
     
-    @staticmethod
-    def validate_params_strict(params: Params) -> None:
-        """Strict parameter validation with detailed error messages."""
-        if not (0 <= params.min_overlap <= params.max_overlap <= 100):
-            raise ValueError(f"Invalid overlap range: {params.min_overlap} - {params.max_overlap}")
-        
-        if not (1 <= params.min_order <= params.max_order <= 50):
-            raise ValueError(f"Invalid order range: {params.min_order} - {params.max_order}")
-        
-        if params.risk_factor <= 0:
-            raise ValueError(f"Risk factor must be positive: {params.risk_factor}")
-        
-        if not (0 <= params.smoothing_factor <= 1):
-            raise ValueError(f"Smoothing factor out of range [0,1]: {params.smoothing_factor}")
-        
-        if not (0 <= params.tail_weight <= 1):
-            raise ValueError(f"Tail weight out of range [0,1]: {params.tail_weight}")
+    # Apply normalization
+    volumes = normalize_volumes_softmax(raw_volumes, softmax_temp)
+    indents = monotonic_softplus_for_indents(raw_indents, overlap_pct, min_step)
+    martingales = sigmoid_martingales(raw_martingales, min_mart, max_mart)
     
-    @staticmethod
-    def validate_schedule(schedule: Schedule) -> bool:
-        """Validate schedule constraints."""
-        if schedule.num_levels == 0:
-            return False
-        
-        # Check for positive values
-        if np.any(schedule.orders <= 0) or np.any(schedule.volumes <= 0):
-            return False
-        
-        # Check overlap constraints
-        if np.any(schedule.overlaps < 0) or np.any(schedule.overlaps > 100):
-            return False
-        
-        # Check monotonicity of orders
-        if not np.all(np.diff(schedule.orders) >= 0):
-            return False
-        
-        return True
-
-    @staticmethod
-    def validate_schedule_strict(schedule: Schedule) -> None:
-        """Strict schedule validation with detailed error messages."""
-        if schedule.num_levels == 0:
-            raise ValueError("Schedule must have at least one level")
-        
-        # Apply all invariant checks
-        assert_schedule_invariants(schedule)
-        validate_physical_constraints(schedule)
+    # Calculate constraint penalties
+    penalties = compute_all_constraint_penalties(indents, volumes, martingales, overlap_pct, config)
+    
+    return indents, volumes, martingales, penalties
 
 
-class VolumeConstraints:
-    """Volume-related constraints and calculations."""
+@njit(cache=True, fastmath=True)
+def total_constraint_penalty(penalties: Dict[str, float], weights: Dict[str, float]) -> float:
+    """
+    Calculate total weighted constraint penalty.
     
-    @staticmethod
-    def calculate_martingale_volumes(base_volume: float, multiplier: float, 
-                                   num_levels: int) -> np.ndarray:
-        """Calculate martingale volume progression."""
-        volumes = np.zeros(num_levels)
-        for i in range(num_levels):
-            volumes[i] = base_volume * (multiplier ** i)
-        return volumes
-    
-    @staticmethod
-    def normalize_volumes(volumes: np.ndarray, target_total: float) -> np.ndarray:
-        """Normalize volumes to target total."""
-        current_total = np.sum(volumes)
-        if current_total == 0:
-            return volumes
-        return volumes * (target_total / current_total)
-    
-    @staticmethod
-    def apply_volume_limits(volumes: np.ndarray, min_volume: float, 
-                           max_volume: float) -> np.ndarray:
-        """Apply minimum and maximum volume constraints."""
-        return np.clip(volumes, min_volume, max_volume)
-
-
-class OverlapConstraints:
-    """Overlap-related constraints and calculations."""
-    
-    @staticmethod
-    def generate_overlaps(min_overlap: float, max_overlap: float, 
-                         num_levels: int, distribution: str = 'linear') -> np.ndarray:
-        """Generate overlap values based on distribution type."""
-        if distribution == 'linear':
-            return np.linspace(min_overlap, max_overlap, num_levels)
-        elif distribution == 'exponential':
-            return np.logspace(np.log10(min_overlap), np.log10(max_overlap), num_levels)
-        elif distribution == 'random':
-            return np.random.uniform(min_overlap, max_overlap, num_levels)
-        else:
-            raise ValueError(f"Unknown distribution: {distribution}")
-    
-    @staticmethod
-    def validate_overlap_sequence(overlaps: np.ndarray) -> bool:
-        """Validate overlap sequence constraints."""
-        # Check bounds
-        if np.any(overlaps < 0) or np.any(overlaps > 100):
-            return False
+    Args:
+        penalties: Dictionary of individual penalties
+        weights: Dictionary of penalty weights
         
-        # Check monotonicity (optional - depends on strategy)
-        # if not np.all(np.diff(overlaps) >= 0):
-        #     return False
+    Returns:
+        Total weighted penalty
+    """
+    total = 0.0
+    
+    # Apply weights to penalties
+    for key in penalties:
+        weight = weights.get(key, 1.0)
+        total += weight * penalties[key]
+    
+    return total
+
+
+# Default constraint weights
+DEFAULT_CONSTRAINT_WEIGHTS = {
+    'volume_normalization': 10.0,    # Critical: volumes must sum to 100
+    'volume_bounds': 2.0,            # Important: reasonable volume ranges
+    'tail_cap': 3.0,                 # Important: prevent tail concentration
+    'head_cap': 1.0,                 # Moderate: prevent head concentration
+    'indent_monotonicity': 5.0,      # Critical: indents must be increasing
+    'indent_bounds': 2.0,            # Important: indents within overlap
+    'martingale_bounds': 1.0,        # Moderate: martingale ranges
+}
+
+
+def validate_candidate_hard(indents: np.ndarray, volumes: np.ndarray, 
+                           martingales: np.ndarray, overlap_pct: float,
+                           tolerance: float = 1e-3) -> Tuple[bool, str]:
+    """
+    Hard validation check for candidate feasibility.
+    
+    Args:
+        indents: Cumulative indent percentages
+        volumes: Volume percentages
+        martingales: Martingale percentages
+        overlap_pct: Maximum overlap percentage
+        tolerance: Tolerance for numerical errors
         
-        return True
-
-
-class OrderConstraints:
-    """Order-related constraints and calculations."""
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    # Check volume sum
+    volume_sum = float(np.sum(volumes))
+    if abs(volume_sum - 100.0) > tolerance:
+        return False, f"Volume sum {volume_sum:.3f} != 100.0"
     
-    @staticmethod
-    def generate_orders(min_order: int, max_order: int, 
-                       num_levels: int, distribution: str = 'linear') -> np.ndarray:
-        """Generate order values based on distribution type."""
-        if distribution == 'linear':
-            return np.linspace(min_order, max_order, num_levels, dtype=int)
-        elif distribution == 'exponential':
-            orders = np.logspace(np.log10(min_order), np.log10(max_order), num_levels)
-            return np.round(orders).astype(int)
-        elif distribution == 'random':
-            return np.random.randint(min_order, max_order + 1, num_levels)
-        else:
-            raise ValueError(f"Unknown distribution: {distribution}")
+    # Check indent monotonicity
+    for i in range(1, len(indents)):
+        if indents[i] < indents[i-1] - tolerance:
+            return False, f"Non-monotonic indents at position {i}"
     
-    @staticmethod
-    def validate_order_sequence(orders: np.ndarray) -> bool:
-        """Validate order sequence constraints."""
-        # Check bounds
-        if np.any(orders < 1):
-            return False
-        
-        # Check monotonicity
-        if not np.all(np.diff(orders) >= 0):
-            return False
-        
-        return True
-
-
-class Normalizer:
-    """Normalization utilities for optimization parameters."""
+    # Check indent bounds
+    if np.any(indents < -tolerance) or np.any(indents > overlap_pct + tolerance):
+        return False, f"Indents outside [0, {overlap_pct}] bounds"
     
-    @staticmethod
-    def normalize_params(params: Params) -> np.ndarray:
-        """Normalize parameters to [0, 1] range for optimization."""
-        return np.array([
-            params.min_overlap / 100.0,
-            params.max_overlap / 100.0,
-            (params.min_order - 1) / 49.0,  # Assuming max_order <= 50
-            (params.max_order - 1) / 49.0,
-            params.risk_factor / 10.0,  # Assuming max risk_factor <= 10
-            params.smoothing_factor,
-            params.tail_weight
-        ])
+    # Check martingale first element
+    if abs(martingales[0]) > tolerance:
+        return False, f"First martingale {martingales[0]:.3f} != 0.0"
     
-    @staticmethod
-    def denormalize_params(normalized: np.ndarray) -> Params:
-        """Denormalize parameters from [0, 1] range."""
-        return Params(
-            min_overlap=normalized[0] * 100.0,
-            max_overlap=normalized[1] * 100.0,
-            min_order=int(round(normalized[2] * 49.0)) + 1,
-            max_order=int(round(normalized[3] * 49.0)) + 1,
-            risk_factor=normalized[4] * 10.0,
-            smoothing_factor=normalized[5],
-            tail_weight=normalized[6]
-        )
+    # Check martingale bounds (for orders > 1)
+    for i in range(1, len(martingales)):
+        if martingales[i] < 1.0 - tolerance or martingales[i] > 100.0 + tolerance:
+            return False, f"Martingale {i} value {martingales[i]:.3f} outside [1, 100] bounds"
+    
+    return True, "Valid"
