@@ -395,6 +395,23 @@ class AdaptiveOrchestrator:
                     'elapsed_s': elapsed_s
                 }
             )
+            # Persist error to DB if possible
+            try:
+                if self.exp_id:
+                    error_payload = {
+                        'error': str(e),
+                        'traceback': traceback.format_exc(),
+                        'snapshot_path': snapshot_path,
+                        'stats': {
+                            'evals_total': self.eval_count,
+                            'best_score': self.best_score,
+                            'elapsed_s': elapsed_s,
+                        }
+                    }
+                    store = ExperimentsStore(self.db_path)
+                    store.set_experiment_error(self.exp_id, error_payload)
+            except Exception:
+                pass
             
             # Update experiment status to FAILED
             if self.exp_id:

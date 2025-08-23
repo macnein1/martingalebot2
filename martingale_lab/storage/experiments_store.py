@@ -170,6 +170,7 @@ class ExperimentsStore:
                 ("config_json", "TEXT"),
                 ("started_at", "TEXT"),
                 ("deleted", "INTEGER DEFAULT 0"),
+                ("error_json", "TEXT"),
             ]
             for col, coltype in add_columns:
                 try:
@@ -275,6 +276,25 @@ class ExperimentsStore:
             params.append(experiment_id)
             cur.execute(query, tuple(params))
             conn.commit()
+
+    def set_experiment_error(self, experiment_id: int, error_payload: Dict[str, Any]) -> None:
+        """Persist error details to experiments.error_json."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    "UPDATE experiments SET error_json = ?, updated_at = ?, status = ? WHERE id = ?",
+                    (
+                        json.dumps(_jsonify(error_payload), separators=(",", ":"), ensure_ascii=False),
+                        datetime.now().isoformat(),
+                        Status.FAILED,
+                        experiment_id,
+                    ),
+                )
+                conn.commit()
+        except Exception as e:
+            # Best-effort; do not raise
+            pass
 
     def upsert_results(self, experiment_id: int, items: List[Dict[str, Any]]) -> int:
         """

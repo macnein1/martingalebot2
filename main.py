@@ -17,6 +17,7 @@ from ui.utils.config import make_auto_config, get_system_info  # new import
 # Import DCA components
 from martingale_lab.orchestrator.dca_orchestrator import create_dca_orchestrator, DCAConfig
 from martingale_lab.storage.experiments_store import ExperimentsStore
+from ui.utils.logging_buffer import get_live_trace
 
 
 def main():
@@ -208,6 +209,14 @@ def render_main_page():
         stop_optimization = st.button("Stop Optimization", disabled=not st.session_state.optimization_running)
     with c3:
         clear_results = st.button("Clear Results")
+
+    # Live status box with logs and last batch summary
+    with st.status("Live Logs & Batch Summary", state="running" if st.session_state.optimization_running else "complete"):
+        logs = get_live_trace("mlab", last_n=20)
+        if logs:
+            st.write("Recent Events:")
+            for log in logs[-20:]:
+                st.write(f"{log.get('event','')} | {log.get('msg','')} | score={log.get('best_score','')} rows={log.get('rows','')} evals={log.get('eval_count','')}")
 
     if start_optimization and not st.session_state.optimization_running:
         if auto_mode:
