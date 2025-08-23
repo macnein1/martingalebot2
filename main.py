@@ -14,10 +14,12 @@ from ui.components.progress_section import render_progress_section
 from ui.components.results_section import render_results_section
 from ui.components.system_performance import render_system_performance
 from ui.utils.config import setup_page_config
+from ui.utils.config import make_auto_config, get_system_info  # new import
 
 # Import DCA components
 from martingale_lab.orchestrator.dca_orchestrator import create_dca_orchestrator, DCAConfig
 from martingale_lab.storage.experiments_store import ExperimentsStore
+
 
 def main():
     """Main application entry point."""
@@ -31,6 +33,8 @@ def main():
         st.session_state.optimization_running = False
     if 'optimization_results' not in st.session_state:
         st.session_state.optimization_results = None
+    if 'config_mode' not in st.session_state:
+        st.session_state.config_mode = "Auto (önerilen)"
     
     # Main header
     st.title("🎯 DCA/Martingale Optimizer")
@@ -57,100 +61,108 @@ def main():
 def render_configuration_page():
     """Render the configuration page."""
     st.header("⚙️ Configuration")
+
+    # Mode selection
+    config_mode = st.radio("Konfigürasyon modu", ["Auto (önerilen)", "Manual"], horizontal=True, key="config_mode")
+    auto_mode = config_mode == "Auto (önerilen)"
     
     # Parameter inputs with new DCA contract parameters
     st.subheader("Search Space")
     col1, col2 = st.columns(2)
     
     with col1:
-        overlap_min = st.number_input("Min Overlap %", min_value=1.0, max_value=50.0, value=10.0, step=0.5)
-        overlap_max = st.number_input("Max Overlap %", min_value=1.0, max_value=50.0, value=30.0, step=0.5)
+        overlap_min = st.number_input("Min Overlap %", min_value=1.0, max_value=50.0, value=10.0, step=0.5, key="overlap_min", disabled=auto_mode)
+        overlap_max = st.number_input("Max Overlap %", min_value=1.0, max_value=50.0, value=30.0, step=0.5, key="overlap_max", disabled=auto_mode)
         
     with col2:
-        orders_min = st.number_input("Min Orders", min_value=2, max_value=30, value=5, step=1)
-        orders_max = st.number_input("Max Orders", min_value=2, max_value=30, value=15, step=1)
+        orders_min = st.number_input("Min Orders", min_value=2, max_value=30, value=5, step=1, key="orders_min", disabled=auto_mode)
+        orders_max = st.number_input("Max Orders", min_value=2, max_value=30, value=15, step=1, key="orders_max", disabled=auto_mode)
     
     # Scoring weights
     st.subheader("Scoring Weights")
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        alpha = st.slider("α (Max Need)", 0.0, 1.0, 0.5, 0.1, help="Weight for maximum need percentage")
+        alpha = st.slider("α (Max Need)", 0.0, 1.0, 0.5, 0.1, help="Weight for maximum need percentage", key="alpha", disabled=auto_mode)
     with col2:
-        beta = st.slider("β (Var Need)", 0.0, 1.0, 0.3, 0.1, help="Weight for need variance")
+        beta = st.slider("β (Var Need)", 0.0, 1.0, 0.3, 0.1, help="Weight for need variance", key="beta", disabled=auto_mode)
     with col3:
-        gamma = st.slider("γ (Tail)", 0.0, 1.0, 0.2, 0.1, help="Weight for tail concentration")
+        gamma = st.slider("γ (Tail)", 0.0, 1.0, 0.2, 0.1, help="Weight for tail concentration", key="gamma", disabled=auto_mode)
     with col4:
-        lambda_penalty = st.slider("λ (Penalty)", 0.0, 0.5, 0.1, 0.05, help="Weight for penalties")
+        lambda_penalty = st.slider("λ (Penalty)", 0.0, 0.5, 0.1, 0.05, help="Weight for penalties", key="lambda_penalty", disabled=auto_mode)
     
     # Wave pattern settings
     st.subheader("Wave Pattern Settings")
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        wave_pattern = st.checkbox("Enable Wave Pattern", value=False, 
-                                 help="Encourage alternating strong-weak martingale patterns")
+        wave_pattern = st.checkbox("Enable Wave Pattern", value=False, help="Encourage alternating strong-weak martingale patterns", key="wave_pattern", disabled=auto_mode)
     with col2:
-        wave_strong_threshold = st.number_input("Strong Threshold %", 30.0, 80.0, 50.0, 5.0,
-                                              help="Martingale % considered 'strong'")
+        wave_strong_threshold = st.number_input("Strong Threshold %", 30.0, 80.0, 50.0, 5.0, help="Martingale % considered 'strong'", key="wave_strong_threshold", disabled=auto_mode)
     with col3:
-        wave_weak_threshold = st.number_input("Weak Threshold %", 1.0, 30.0, 10.0, 1.0,
-                                            help="Martingale % considered 'very weak'")
+        wave_weak_threshold = st.number_input("Weak Threshold %", 1.0, 30.0, 10.0, 1.0, help="Martingale % considered 'very weak'", key="wave_weak_threshold", disabled=auto_mode)
     
     # Constraints
     st.subheader("Constraints")
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        tail_cap = st.slider("Tail Cap", 0.2, 0.8, 0.4, 0.05, 
-                           help="Maximum volume % for last order")
+        tail_cap = st.slider("Tail Cap", 0.2, 0.8, 0.4, 0.05, help="Maximum volume % for last order", key="tail_cap", disabled=auto_mode)
     with col2:
-        min_indent_step = st.number_input("Min Indent Step %", 0.01, 1.0, 0.05, 0.01,
-                                        help="Minimum indent step percentage")
+        min_indent_step = st.number_input("Min Indent Step %", 0.01, 1.0, 0.05, 0.01, help="Minimum indent step percentage", key="min_indent_step", disabled=auto_mode)
     with col3:
-        softmax_temp = st.slider("Softmax Temperature", 0.1, 3.0, 1.0, 0.1,
-                                help="Temperature for volume distribution")
+        softmax_temp = st.slider("Softmax Temperature", 0.1, 3.0, 1.0, 0.1, help="Temperature for volume distribution", key="softmax_temp", disabled=auto_mode)
     
     # Optimization settings
     st.subheader("Optimization Settings")
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        n_candidates = st.number_input("Candidates per Batch", 100, 10000, 1000, 100)
-        max_batches = st.number_input("Max Batches", 10, 1000, 100, 10)
+        n_candidates = st.number_input("Candidates per Batch", 100, 10000, 1000, 100, key="n_candidates", disabled=auto_mode)
+        max_batches = st.number_input("Max Batches", 10, 1000, 100, 10, key="max_batches", disabled=auto_mode)
     
     with col2:
-        n_workers = st.number_input("Parallel Workers", 1, 16, 4, 1)
-        early_stop_patience = st.number_input("Early Stop Patience", 5, 50, 10, 1)
+        n_workers = st.number_input("Parallel Workers", 1, 16, 4, 1, key="n_workers", disabled=auto_mode)
+        early_stop_patience = st.number_input("Early Stop Patience", 5, 50, 10, 1, key="early_stop_patience", disabled=auto_mode)
     
     with col3:
-        random_seed = st.number_input("Random Seed", 0, 999999, 42, 1)
-        top_k_keep = st.number_input("Top K Keep", 1000, 50000, 10000, 1000)
+        random_seed = st.number_input("Random Seed", 0, 999999, 42, 1, key="random_seed", disabled=auto_mode)
+        top_k_keep = st.number_input("Top K Keep", 1000, 50000, 10000, 1000, key="top_k_keep", disabled=auto_mode)
     
     # Save configuration
     if st.button("Save Configuration", type="primary"):
-        config = DCAConfig(
-            overlap_min=overlap_min,
-            overlap_max=overlap_max,
-            orders_min=orders_min,
-            orders_max=orders_max,
-            alpha=alpha,
-            beta=beta,
-            gamma=gamma,
-            lambda_penalty=lambda_penalty,
-            wave_pattern=wave_pattern,
-            wave_strong_threshold=wave_strong_threshold,
-            wave_weak_threshold=wave_weak_threshold,
-            tail_cap=tail_cap,
-            min_indent_step=min_indent_step,
-            softmax_temp=softmax_temp,
-            n_candidates_per_batch=n_candidates,
-            max_batches=max_batches,
-            n_workers=n_workers,
-            early_stop_patience=early_stop_patience,
-            random_seed=random_seed,
-            top_k_keep=top_k_keep
-        )
+        if auto_mode:
+            # Build from auto config using current search space values
+            search_space = {
+                "overlap_min": st.session_state.get("overlap_min", 10.0),
+                "overlap_max": st.session_state.get("overlap_max", 30.0),
+                "orders_min": st.session_state.get("orders_min", 5),
+                "orders_max": st.session_state.get("orders_max", 15),
+            }
+            config = make_auto_config(search_space)
+        else:
+            config = DCAConfig(
+                overlap_min=overlap_min,
+                overlap_max=overlap_max,
+                orders_min=orders_min,
+                orders_max=orders_max,
+                alpha=alpha,
+                beta=beta,
+                gamma=gamma,
+                lambda_penalty=lambda_penalty,
+                wave_pattern=wave_pattern,
+                wave_strong_threshold=wave_strong_threshold,
+                wave_weak_threshold=wave_weak_threshold,
+                tail_cap=tail_cap,
+                min_indent_step=min_indent_step,
+                softmax_temp=softmax_temp,
+                n_candidates_per_batch=n_candidates,
+                max_batches=max_batches,
+                n_workers=n_workers,
+                early_stop_patience=early_stop_patience,
+                random_seed=random_seed,
+                top_k_keep=top_k_keep
+            )
         
         st.session_state.dca_config = config
         st.success("Configuration saved successfully!")
@@ -159,30 +171,30 @@ def render_configuration_page():
         with st.expander("Configuration Summary"):
             st.json({
                 "search_space": {
-                    "overlap_range": f"{overlap_min}-{overlap_max}%",
-                    "orders_range": f"{orders_min}-{orders_max}",
+                    "overlap_range": f"{config.overlap_min}-{config.overlap_max}%",
+                    "orders_range": f"{config.orders_min}-{config.orders_max}",
                 },
                 "scoring": {
-                    "alpha": alpha,
-                    "beta": beta,
-                    "gamma": gamma,
-                    "lambda": lambda_penalty
+                    "alpha": config.alpha,
+                    "beta": config.beta,
+                    "gamma": config.gamma,
+                    "lambda": config.lambda_penalty
                 },
                 "wave_pattern": {
-                    "enabled": wave_pattern,
-                    "strong_threshold": wave_strong_threshold,
-                    "weak_threshold": wave_weak_threshold
+                    "enabled": config.wave_pattern,
+                    "strong_threshold": config.wave_strong_threshold,
+                    "weak_threshold": config.wave_weak_threshold
                 },
                 "constraints": {
-                    "tail_cap": tail_cap,
-                    "min_indent_step": min_indent_step,
-                    "softmax_temp": softmax_temp
+                    "tail_cap": config.tail_cap,
+                    "min_indent_step": config.min_indent_step,
+                    "softmax_temp": config.softmax_temp
                 },
                 "optimization": {
-                    "candidates_per_batch": n_candidates,
-                    "max_batches": max_batches,
-                    "workers": n_workers,
-                    "early_stop_patience": early_stop_patience
+                    "candidates_per_batch": config.n_candidates_per_batch,
+                    "max_batches": config.max_batches,
+                    "workers": config.n_workers,
+                    "early_stop_patience": config.early_stop_patience
                 }
             })
 
@@ -190,15 +202,25 @@ def render_configuration_page():
 def render_optimization_page():
     """Render the optimization page."""
     st.header("🚀 Optimization")
-    
-    # Check if configuration exists
-    if 'dca_config' not in st.session_state:
-        st.warning("Please configure the optimization parameters first.")
-        if st.button("Go to Configuration"):
-            st.rerun()
-        return
-    
-    config = st.session_state.dca_config
+
+    auto_mode = st.session_state.get("config_mode", "Auto (önerilen)") == "Auto (önerilen)"
+
+    # Build a config for display/run if auto mode, else require saved config
+    if auto_mode:
+        search_space = {
+            "overlap_min": st.session_state.get("overlap_min", 10.0),
+            "overlap_max": st.session_state.get("overlap_max", 30.0),
+            "orders_min": st.session_state.get("orders_min", 5),
+            "orders_max": st.session_state.get("orders_max", 15),
+        }
+        config = make_auto_config(search_space)
+    else:
+        if 'dca_config' not in st.session_state:
+            st.warning("Please configure the optimization parameters first.")
+            if st.button("Go to Configuration"):
+                st.rerun()
+            return
+        config = st.session_state.dca_config
     
     # Show current configuration summary
     with st.expander("Current Configuration"):
@@ -225,6 +247,15 @@ def render_optimization_page():
     
     # Handle optimization control
     if start_optimization and not st.session_state.optimization_running:
+        # If auto mode, rebuild config right before starting
+        if auto_mode:
+            search_space = {
+                "overlap_min": st.session_state.get("overlap_min", 10.0),
+                "overlap_max": st.session_state.get("overlap_max", 30.0),
+                "orders_min": st.session_state.get("orders_min", 5),
+                "orders_max": st.session_state.get("orders_max", 15),
+            }
+            config = make_auto_config(search_space)
         run_optimization(config, notes)
     
     if stop_optimization:
