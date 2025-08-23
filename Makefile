@@ -129,8 +129,6 @@ install:
 # Check if CLI module can be imported
 check:
 	$(PYTHON) -c "from martingale_lab.cli.optimize import main; print('CLI module imports successfully')"
-<<<<<<< Current (Your changes)
-=======
 
 # Show recent log files
 logs:
@@ -150,4 +148,3 @@ tail-log:
 	else \
 		echo "No logs directory found"; \
 	fi
->>>>>>> Incoming (Background Agent changes)
