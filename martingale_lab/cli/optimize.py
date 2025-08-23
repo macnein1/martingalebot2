@@ -5,14 +5,20 @@ Command line interface for running martingale optimization experiments.
 """
 import argparse
 import sys
+import time
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from martingale_lab.orchestrator.dca_orchestrator import (
     DCAOrchestrator, DCAConfig, OrchestratorConfig
 )
 from martingale_lab.storage.experiments_store import ExperimentsStore
-from martingale_lab.utils.logging import cli_logger
+from martingale_lab.utils.logging import (
+    configure_logging, configure_eval_sampling, get_cli_logger
+)
+
+# Use the new centralized logging system
+cli_logger = get_cli_logger()
 
 
 def parse_args() -> argparse.Namespace:
@@ -82,6 +88,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wave-pattern", action="store_true",
                        help="Enable wave pattern optimization")
     
+    # Logging configuration
+    parser.add_argument("--log-level", default="INFO", 
+                       choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                       help="Console log level")
+    parser.add_argument("--log-json", action="store_true",
+                       help="Use JSON format for console output")
+    parser.add_argument("--log-file", default=None,
+                       help="Write detailed logs to file (JSON format)")
+    parser.add_argument("--log-eval-sample", type=float, default=0.0,
+                       help="Per-evaluation log sampling rate (0.0-1.0)")
+    parser.add_argument("--log-every-batch", type=int, default=1,
+                       help="Log batch summary every N batches")
+    
+    # Time constraints
+    parser.add_argument("--max-time-sec", type=int, default=None,
+                       help="Maximum runtime in seconds (clean shutdown on timeout)")
+    
     return parser.parse_args()
 
 
@@ -131,7 +154,12 @@ def create_orchestrator_config(args: argparse.Namespace) -> tuple[DCAConfig, Orc
         n_workers=args.workers,
         
         # Random seed
-        random_seed=args.seed
+        random_seed=args.seed,
+        
+        # Logging configuration
+        log_eval_sample=args.log_eval_sample,
+        log_every_batch=args.log_every_batch,
+        max_time_sec=args.max_time_sec
     )
     
     orch_config = OrchestratorConfig(
@@ -190,23 +218,20 @@ def log_config_summary(dca_config: DCAConfig, orch_config: OrchestratorConfig, r
     )
 
 
-def progress_callback(progress_data: Dict[str, Any]) -> None:
-    """Progress callback for optimization."""
-    cli_logger.info(
-        f"Batch {progress_data['batch']}/{progress_data['total_batches']} | "
-        f"Best: {progress_data['best_score']:.6f} | "
-        f"Evals: {progress_data['total_evaluations']} | "
-        f"Speed: {progress_data['evaluations_per_second']:.1f}/s",
-        extra={
-            "event": "CLI.PROGRESS",
-            "batch": progress_data['batch'],
-            "total_batches": progress_data['total_batches'],
-            "best_score": progress_data['best_score'],
-            "total_evaluations": progress_data['total_evaluations'],
-            "evaluations_per_second": progress_data['evaluations_per_second'],
-            "candidates_kept": progress_data['candidates_kept'],
-            "batch_time": progress_data['batch_time']
-        }
+def progress_callback(progress_data: Dict[str, Any], args: argparse.Namespace) -> None:
+    """Progress callback for optimization with new batch aggregator."""
+    from martingale_lab.utils.logging import BatchAggregator
+    
+    # Use the new batch aggregator for consistent logging
+    BatchAggregator.log_batch_summary(
+        batch_idx=progress_data['batch'] - 1,  # Convert to 0-based
+        total_batches=progress_data['total_batches'],
+        best_score=progress_data['best_score'],
+        evaluations=progress_data.get('batch_evaluations', 0),
+        candidates_kept=progress_data['candidates_kept'],
+        prune_mode=progress_data.get('prune_mode', 'unknown'),
+        evaluations_per_second=progress_data['evaluations_per_second'],
+        log_every_batch=args.log_every_batch
     )
 
 
@@ -215,6 +240,19 @@ def main() -> int:
     try:
         # Parse arguments
         args = parse_args()
+        
+        # Configure centralized logging system FIRST
+        configure_logging(
+            level=args.log_level,
+            json_console=args.log_json,
+            log_file=args.log_file
+        )
+        
+        # Configure evaluation sampling
+        configure_eval_sampling(
+            sample_rate=args.log_eval_sample,
+            seed=args.seed
+        )
         
         # Setup database
         store = setup_database(args.db)
@@ -237,17 +275,22 @@ def main() -> int:
                 "event": "CLI.START",
                 "run_id": run_id,
                 "db_path": args.db,
-                "notes": args.notes
+                "notes": args.notes,
+                "log_level": args.log_level,
+                "log_eval_sample": args.log_eval_sample,
+                "max_time_sec": args.max_time_sec
             }
         )
         
         # Log config summary
         log_config_summary(dca_config, orch_config, run_id)
         
-        # Run optimization
+        # Run optimization with timeout handling
+        start_time = time.time()
         results = orchestrator.run_optimization(
-            progress_callback=progress_callback,
-            notes=args.notes or f"CLI optimization run {run_id}"
+            progress_callback=lambda data: progress_callback(data, args),
+            notes=args.notes or f"CLI optimization run {run_id}",
+            max_time_sec=args.max_time_sec
         )
         
         # Log completion
@@ -264,7 +307,8 @@ def main() -> int:
                 "evaluations_per_second": stats["evaluations_per_second"],
                 "batches_completed": stats["batches_completed"],
                 "early_stopped": stats["early_stopped"],
-                "candidates_found": stats["candidates_found"]
+                "candidates_found": stats["candidates_found"],
+                "timeout_reached": stats.get("timeout_reached", False)
             }
         )
         
@@ -276,6 +320,8 @@ def main() -> int:
         print(f"Total Evaluations: {stats['total_evaluations']}", file=sys.stderr)
         print(f"Time: {stats['total_time']:.1f}s", file=sys.stderr)
         print(f"Speed: {stats['evaluations_per_second']:.1f} evals/s", file=sys.stderr)
+        if stats.get("timeout_reached", False):
+            print(f"⚠️  Stopped due to timeout ({args.max_time_sec}s)", file=sys.stderr)
         print(f"Database: {args.db}", file=sys.stderr)
         
         return 0

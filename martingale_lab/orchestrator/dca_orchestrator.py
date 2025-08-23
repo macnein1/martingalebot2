@@ -12,7 +12,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from martingale_lab.optimizer.evaluation_engine import evaluation_function
 from martingale_lab.storage.experiments_store import ExperimentsStore
-from martingale_lab.utils.logging import orchestrator_logger as orch_logger
+from martingale_lab.utils.logging import (
+    get_orchestrator_logger, BatchAggregator, log_with_context
+)
+
+# Use the new centralized logging system
+orch_logger = get_orchestrator_logger()
 
 def generate_run_id() -> str:
     """Generate a unique run ID"""
@@ -126,6 +131,11 @@ class DCAConfig:
     
     # Random seed
     random_seed: Optional[int] = None
+    
+    # Logging configuration
+    log_eval_sample: float = 0.0  # Per-evaluation log sampling rate (0.0-1.0)
+    log_every_batch: int = 1      # Log batch summary every N batches
+    max_time_sec: Optional[int] = None  # Maximum runtime in seconds
 
 
 class DCAOrchestrator:
@@ -439,11 +449,16 @@ class DCAOrchestrator:
     
     def run_optimization(self, 
                         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
-                        notes: Optional[str] = None) -> Dict[str, Any]:
-        """Run the complete DCA optimization process."""
+                        notes: Optional[str] = None,
+                        max_time_sec: Optional[int] = None) -> Dict[str, Any]:
+        """Run the complete DCA optimization process with timeout support."""
         # Initialize experiment
         exp_id = self.create_experiment(notes)
         self.start_time = time.time()
+        
+        # Use config max_time_sec if not provided in call
+        if max_time_sec is None:
+            max_time_sec = self.config.max_time_sec
         
         # Calculate total combinations for exhaustive mode
         if self.orch_config.exhaustive_mode:
@@ -453,36 +468,41 @@ class DCAOrchestrator:
             self.orch_config.exhaustive_progress_total = total_combinations
         
         # Log orchestrator start with config snapshot
-        self.logger.info(
-            f"ORCH.START: DCAOrchestrator run_id={self.run_id} exp_id={self.current_experiment_id}",
-            extra={
-                "event": "ORCH.START",
-                "run_id": self.run_id,
-                "exp_id": self.current_experiment_id,
-                "adapter": "DCAOrchestrator",
-                "overlap_range": f"{self.config.overlap_min}-{self.config.overlap_max}",
-                "orders_range": f"{self.config.orders_min}-{self.config.orders_max}",
-                "alpha": self.config.alpha,
-                "beta": self.config.beta,
-                "gamma": self.config.gamma,
-                "lambda_penalty": self.config.lambda_penalty,
-                "wave_pattern": self.config.wave_pattern,
-                "tail_cap": self.config.tail_cap,
-                "n_candidates_per_batch": self.config.n_candidates_per_batch,
-                "max_batches": self.config.max_batches,
-                "prune_enabled": self.orch_config.prune_enabled,
-                "prune_mode": self.orch_config.prune_mode,
-                "early_stop_enabled": self.orch_config.early_stop_enabled,
-                "exhaustive_mode": self.orch_config.exhaustive_mode,
-                "exhaustive_progress_total": self.orch_config.exhaustive_progress_total
-            }
+        log_with_context(
+            self.logger, "info",
+            f"DCA Orchestration starting: run_id={self.run_id} exp_id={self.current_experiment_id}",
+            run_id=self.run_id,
+            exp_id=self.current_experiment_id,
+            event="ORCH.START",
+            adapter="DCAOrchestrator",
+            overlap_range=f"{self.config.overlap_min}-{self.config.overlap_max}",
+            orders_range=f"{self.config.orders_min}-{self.config.orders_max}",
+            max_time_sec=max_time_sec,
+            batch_size=self.config.n_candidates_per_batch,
+            max_batches=self.config.max_batches
         )
+        
+        timeout_reached = False
         
         try:
             for batch_idx in range(self.config.max_batches):
                 batch_start = time.time()
                 LogContext.set_batch_idx(batch_idx)
                 self.batch_count = batch_idx
+                
+                # Check timeout before starting batch
+                if max_time_sec and (time.time() - self.start_time) >= max_time_sec:
+                    timeout_reached = True
+                    log_with_context(
+                        self.logger, "info",
+                        f"Timeout reached ({max_time_sec}s), stopping optimization",
+                        run_id=self.run_id,
+                        exp_id=self.current_experiment_id,
+                        event="ORCH.TIMEOUT",
+                        batch_idx=batch_idx,
+                        elapsed_sec=time.time() - self.start_time
+                    )
+                    break
                 
                 # Generate parameters for this batch
                 param_batch = self.generate_random_parameters(self.config.n_candidates_per_batch)
@@ -514,22 +534,18 @@ class DCAOrchestrator:
                     if self.config.wave_pattern and result.get("penalties", {}).get("P_wave", 0) < 0:
                         self.stats["wave_pattern_rewards"] += 1
                 
-                # Log batch summary
-                mode = "exhaustive" if self.orch_config.exhaustive_mode else "adaptive"
-                self.logger.info(
-                    f"BATCH_END: batch={batch_idx}, best={self.best_score:.4f}, evaluated={len(batch_results)}, kept={post_prune_count}",
-                    extra={
-                        "event": "BATCH_END",
-                        "run_id": self.run_id,
-                        "exp_id": self.current_experiment_id,
-                        "batch_idx": batch_idx,
-                        "best": float(self.best_score),
-                        "evaluated": len(batch_results),
-                        "kept": post_prune_count,
-                        "pruned": pre_prune_count - post_prune_count,
-                        "mode": mode,
-                        "time_s": batch_time
-                    }
+                # Use the new BatchAggregator for consistent logging
+                prune_mode = "exhaustive" if self.orch_config.exhaustive_mode else self.orch_config.prune_mode
+                BatchAggregator.log_batch_summary(
+                    batch_idx=batch_idx,
+                    total_batches=self.config.max_batches,
+                    best_score=self.best_score,
+                    evaluations=len(batch_results),
+                    candidates_kept=post_prune_count,
+                    prune_mode=prune_mode,
+                    evaluations_per_second=self.stats["evaluations_per_second"],
+                    log_every_batch=self.config.log_every_batch,
+                    logger=self.logger
                 )
                 
                 # Call progress callback
@@ -542,36 +558,79 @@ class DCAOrchestrator:
                         "evaluations_per_second": self.stats["evaluations_per_second"],
                         "candidates_kept": len(self.best_candidates),
                         "batch_time": batch_time,
-                        "mode": mode
+                        "batch_evaluations": len(batch_results),
+                        "prune_mode": prune_mode,
+                        "elapsed_time": self.stats["total_time"],
+                        "timeout_remaining": max_time_sec - (time.time() - self.start_time) if max_time_sec else None
                     }
                     progress_callback(progress_data)
                 
                 # Check early stopping
-                should_stop, reason = self.should_stop_early()
+                should_stop, stop_reason = self.should_stop_early()
                 if should_stop:
-                    self.logger.info(f"Early stopping after {batch_idx + 1} batches due to {reason}")
                     self.stats["early_stopped"] = True
                     break
                 
-                # Save intermediate results to database (every 10 batches)
-                if (batch_idx + 1) % 10 == 0:
-                    self.save_results_to_db()
+                # Check timeout after batch completion
+                if max_time_sec and (time.time() - self.start_time) >= max_time_sec:
+                    timeout_reached = True
+                    log_with_context(
+                        self.logger, "info",
+                        f"Timeout reached after batch completion ({max_time_sec}s)",
+                        run_id=self.run_id,
+                        exp_id=self.current_experiment_id,
+                        event="ORCH.TIMEOUT_POST_BATCH",
+                        batch_idx=batch_idx,
+                        elapsed_sec=time.time() - self.start_time
+                    )
+                    break
             
-            # Final save
-            self.save_results_to_db()
+            # Calculate final statistics
+            self.stats["total_time"] = time.time() - self.start_time
+            self.stats["evaluations_per_second"] = self.total_evaluations / max(self.stats["total_time"], 1e-6)
+            self.stats["candidates_found"] = len(self.best_candidates)
+            self.stats["timeout_reached"] = timeout_reached
             
-            # Update experiment summary
-            self.store.update_experiment_summary(
-                exp_id,
-                self.best_score,
-                self.total_evaluations,
-                self.stats["total_time"]
+            # Log completion
+            log_with_context(
+                self.logger, "info",
+                f"DCA Orchestration completed: {self.stats['batches_completed']} batches, {self.total_evaluations} evaluations",
+                run_id=self.run_id,
+                exp_id=self.current_experiment_id,
+                event="ORCH.COMPLETE",
+                best_score=self.best_score,
+                total_evaluations=self.total_evaluations,
+                total_time=self.stats["total_time"],
+                timeout_reached=timeout_reached,
+                early_stopped=self.stats["early_stopped"]
             )
             
             return self.get_optimization_results()
             
         except Exception as e:
-            self.logger.error(f"Optimization failed: {e}")
+            # Create crash snapshot
+            error_context = {
+                "run_id": self.run_id,
+                "experiment_id": self.current_experiment_id,
+                "batch_count": self.batch_count,
+                "total_evaluations": self.total_evaluations,
+                "config": self.config.__dict__,
+                "orch_config": self.orch_config.__dict__
+            }
+            
+            snapshot_path = create_crash_snapshot(self.run_id, error_context, str(e))
+            
+            log_with_context(
+                self.logger, "error",
+                f"DCA Orchestration failed: {str(e)}",
+                run_id=self.run_id,
+                exp_id=self.current_experiment_id,
+                event="ORCH.ERROR",
+                error=str(e),
+                snapshot_path=snapshot_path
+            )
+            
+            # Re-raise the exception
             raise
     
     def save_results_to_db(self):
