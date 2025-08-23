@@ -4,13 +4,17 @@ Implements evaluation_function exactly as defined in README specification.
 """
 from __future__ import annotations
 
+import json
 import numpy as np
 import time
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional, Tuple
 import math
 
-from martingale_lab.utils.logging import eval_logger as logger
+from martingale_lab.utils.logging import get_eval_logger, should_log_eval
+
+# Use the new centralized logging system
+logger = get_eval_logger()
 
 
 def _ensure_json_serializable(obj):
@@ -131,20 +135,21 @@ def evaluation_function(
     """
     start_time = time.time()
     
-    # Log evaluation call
-    logger.info(
-        "Starting evaluation",
-        extra={
-            "event": "EVAL_CALL",
-            "overlap": overlap_pct,
-            "orders": num_orders,
-            "wave_pattern": wave_pattern,
-            "alpha": alpha,
-            "beta": beta,
-            "gamma": gamma,
-            "lambda_penalty": lambda_penalty
-        }
-    )
+    # Log evaluation call only if sampling allows it
+    if should_log_eval():
+        logger.debug(
+            "Starting evaluation",
+            extra={
+                "event": "EVAL_CALL",
+                "overlap": overlap_pct,
+                "orders": num_orders,
+                "wave_pattern": wave_pattern,
+                "alpha": alpha,
+                "beta": beta,
+                "gamma": gamma,
+                "lambda_penalty": lambda_penalty
+            }
+        )
     
     try:
         # Generate random parameters
@@ -199,18 +204,11 @@ def evaluation_function(
         vol_acc = 0.0
         val_acc = 0.0
         
-        for k in range(num_orders):
-            vol_acc += volume_pct[k]
-            val_acc += volume_pct[k] * order_prices[k+1]
-            
-            # Weighted average entry price
-            avg_entry_price = val_acc / max(vol_acc, 1e-12)
-            
-            # Current order price
-            current_price = order_prices[k+1]
-            
-            # Need percentage: (avg_entry / current_price - 1) * 100
-            needpct[k] = (avg_entry_price / max(current_price, 1e-12) - 1.0) * 100.0
+        for i in range(num_orders):
+            vol_acc += volume_pct[i]
+            val_acc += volume_pct[i] * order_prices[i + 1]
+            avg_price = val_acc / vol_acc if vol_acc > 1e-12 else base_price
+            needpct[i] = ((base_price - avg_price) / base_price) * 100.0
         
         # Calculate core metrics
         max_need = float(np.max(needpct))
@@ -300,21 +298,24 @@ def evaluation_function(
         penalty_sum = sum(penalties.values())
         score = alpha * max_need + beta * var_need + gamma * tail + lambda_penalty * penalty_sum
         
-        # Log successful evaluation
+        # Log successful evaluation only if sampling allows it
         duration_ms = (time.time() - start_time) * 1000
-        logger.info(
-            "Evaluation completed successfully",
-            extra={
-                "event": "EVAL_RETURN",
-                "score": float(score),
-                "max_need": float(max_need),
-                "var_need": float(var_need),
-                "tail": float(tail),
-                "duration_ms": duration_ms,
-                "sanity_violations": sum(1 for v in sanity.values() if v),
-                "penalty_sum": penalty_sum
-            }
-        )
+        if should_log_eval():
+            logger.debug(
+                "Evaluation completed successfully",
+                extra={
+                    "event": "EVAL_RETURN",
+                    "score": float(score),
+                    "max_need": float(max_need),
+                    "var_need": float(var_need),
+                    "tail": float(tail),
+                    "duration_ms": duration_ms,
+                    "penalty_sum": penalty_sum,
+                    "sanity_violations": sum(1 for v in sanity.values() if v),
+                    "overlap": overlap_pct,
+                    "orders": num_orders
+                }
+            )
         
         # Return complete dict exactly as specified in README
         return {
@@ -330,18 +331,19 @@ def evaluation_function(
         }
         
     except Exception as e:
-        # Log evaluation error
+        # Log evaluation error only if sampling allows it
         duration_ms = (time.time() - start_time) * 1000
-        logger.error(
-            f"Evaluation failed: {str(e)}",
-            extra={
-                "event": "EVAL_ERROR",
-                "error": str(e),
-                "duration_ms": duration_ms,
-                "overlap": overlap_pct,
-                "orders": num_orders
-            }
-        )
+        if should_log_eval():
+            logger.debug(
+                f"Evaluation failed: {str(e)}",
+                extra={
+                    "event": "EVAL_ERROR",
+                    "error": str(e),
+                    "duration_ms": duration_ms,
+                    "overlap": overlap_pct,
+                    "orders": num_orders
+                }
+            )
         
         # Never throw - return error state as complete dict
         return {
