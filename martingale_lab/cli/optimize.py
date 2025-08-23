@@ -13,6 +13,7 @@ from martingale_lab.orchestrator.dca_orchestrator import (
     DCAOrchestrator, DCAConfig, OrchestratorConfig
 )
 from martingale_lab.storage.experiments_store import ExperimentsStore
+from martingale_lab.storage.checkpoint_store import CheckpointStore
 from martingale_lab.utils.logging import (
     configure_logging, configure_eval_sampling, get_cli_logger
 )
@@ -104,6 +105,12 @@ def parse_args() -> argparse.Namespace:
     # Time constraints
     parser.add_argument("--max-time-sec", type=int, default=None,
                        help="Maximum runtime in seconds (clean shutdown on timeout)")
+    
+    # Resume functionality
+    parser.add_argument("--resume", action="store_true",
+                       help="Resume from the latest available checkpoint")
+    parser.add_argument("--resume-into", type=str, default=None,
+                       help="Resume into a specific run_id (instead of latest)")
     
     return parser.parse_args()
 
@@ -222,16 +229,18 @@ def progress_callback(progress_data: Dict[str, Any], args: argparse.Namespace) -
     """Progress callback for optimization with new batch aggregator."""
     from martingale_lab.utils.logging import BatchAggregator
     
-    # Use the new batch aggregator for consistent logging
+    # Use the new batch aggregator for consistent logging with single-line format
     BatchAggregator.log_batch_summary(
         batch_idx=progress_data['batch'] - 1,  # Convert to 0-based
         total_batches=progress_data['total_batches'],
         best_score=progress_data['best_score'],
         evaluations=progress_data.get('batch_evaluations', 0),
-        candidates_kept=progress_data['candidates_kept'],
+        candidates_kept=progress_data.get('candidates_kept', 0),  # Legacy parameter
         prune_mode=progress_data.get('prune_mode', 'unknown'),
         evaluations_per_second=progress_data['evaluations_per_second'],
-        log_every_batch=args.log_every_batch
+        log_every_batch=args.log_every_batch,
+        kept_in_this_batch=progress_data.get('kept_in_this_batch'),
+        kept_total=progress_data.get('kept_total')
     )
 
 
@@ -257,6 +266,45 @@ def main() -> int:
         # Setup database
         store = setup_database(args.db)
         
+        # Create checkpoint store with same database path
+        checkpoint_store = CheckpointStore(args.db)
+        
+        # Handle resume functionality
+        resume_from = None
+        if args.resume or args.resume_into:
+            # Create a temporary orchestrator to access checkpoint store
+            temp_config = DCAConfig()
+            temp_orchestrator = DCAOrchestrator(
+                config=temp_config, 
+                store=store,
+                checkpoint_store=checkpoint_store
+            )
+            
+            if args.resume_into:
+                # Resume into specific run_id
+                resume_from = args.resume_into
+                cli_logger.info(f"Attempting to resume into run_id: {resume_from}")
+            else:
+                # Find the latest resumable run
+                resumable_runs = temp_orchestrator.get_resumable_runs()
+                if not resumable_runs:
+                    cli_logger.error("No resumable runs found. Use --resume-into <run_id> to specify a specific run.")
+                    return 1
+                
+                # Show available runs
+                print("\n=== Available Resumable Runs ===", file=sys.stderr)
+                for i, run in enumerate(resumable_runs):
+                    print(f"{i+1}. Run ID: {run['run_id']}", file=sys.stderr)
+                    print(f"   Started: {run['started_at']}", file=sys.stderr)
+                    print(f"   Last Batch: {run['last_batch_idx']}", file=sys.stderr)
+                    print(f"   Best Score: {run['best_score']:.6f}" if run['best_score'] else "   Best Score: None", file=sys.stderr)
+                    print(f"   Checkpoint: {run['checkpoint_batch']}" if run['checkpoint_batch'] else "   Checkpoint: None", file=sys.stderr)
+                    print("", file=sys.stderr)
+                
+                # Use the most recent run
+                resume_from = resumable_runs[0]['run_id']
+                cli_logger.info(f"Resuming from most recent run: {resume_from}")
+        
         # Create configurations
         dca_config, orch_config = create_orchestrator_config(args)
         
@@ -264,7 +312,9 @@ def main() -> int:
         orchestrator = DCAOrchestrator(
             config=dca_config,
             store=store,
-            orch_config=orch_config
+            run_id=resume_from if resume_from else None,  # Use resume run_id if provided
+            orch_config=orch_config,
+            checkpoint_store=checkpoint_store
         )
         run_id = orchestrator.run_id
         
@@ -278,19 +328,21 @@ def main() -> int:
                 "notes": args.notes,
                 "log_level": args.log_level,
                 "log_eval_sample": args.log_eval_sample,
-                "max_time_sec": args.max_time_sec
+                "max_time_sec": args.max_time_sec,
+                "resume_from": resume_from
             }
         )
         
         # Log config summary
         log_config_summary(dca_config, orch_config, run_id)
         
-        # Run optimization with timeout handling
+        # Run optimization with timeout handling and resume support
         start_time = time.time()
         results = orchestrator.run_optimization(
             progress_callback=lambda data: progress_callback(data, args),
             notes=args.notes or f"CLI optimization run {run_id}",
-            max_time_sec=args.max_time_sec
+            max_time_sec=args.max_time_sec,
+            resume_from=resume_from
         )
         
         # Log completion
@@ -308,7 +360,8 @@ def main() -> int:
                 "batches_completed": stats["batches_completed"],
                 "early_stopped": stats["early_stopped"],
                 "candidates_found": stats["candidates_found"],
-                "timeout_reached": stats.get("timeout_reached", False)
+                "timeout_reached": stats.get("timeout_reached", False),
+                "resume_from": resume_from
             }
         )
         
@@ -320,6 +373,8 @@ def main() -> int:
         print(f"Total Evaluations: {stats['total_evaluations']}", file=sys.stderr)
         print(f"Time: {stats['total_time']:.1f}s", file=sys.stderr)
         print(f"Speed: {stats['evaluations_per_second']:.1f} evals/s", file=sys.stderr)
+        if resume_from:
+            print(f"🔄 Resumed from: {resume_from}", file=sys.stderr)
         if stats.get("timeout_reached", False):
             print(f"⚠️  Stopped due to timeout ({args.max_time_sec}s)", file=sys.stderr)
         print(f"Database: {args.db}", file=sys.stderr)

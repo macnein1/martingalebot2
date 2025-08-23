@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from ..utils.runctx import RunCtx
-from ..utils.logging import LogContext
 
 
 @dataclass
@@ -68,12 +67,7 @@ class CheckpointStore:
     
     def __init__(self, db_path: str = "db_results/experiments.db"):
         self.db_path = db_path
-        self.log_ctx: Optional[LogContext] = None
         self._ensure_database()
-    
-    def set_log_context(self, log_ctx: LogContext):
-        """Set logging context for database operations."""
-        self.log_ctx = log_ctx
     
     def _ensure_database(self):
         """Create database tables if they don't exist."""
@@ -162,12 +156,27 @@ class CheckpointStore:
                 )
             """)
             
+            # Checkpoints table for resuming optimization runs
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS checkpoints (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    exp_id INTEGER NOT NULL,
+                    batch_idx INTEGER NOT NULL,
+                    checkpoint_data BLOB NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (run_id) REFERENCES runs(id)
+                )
+            """)
+            
             # Create indexes for performance
             conn.execute("CREATE INDEX IF NOT EXISTS idx_candidates_run ON candidates(run_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_candidates_batch ON candidates(run_id, batch_idx)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_candidates_score ON candidates(J DESC)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_metrics_run_batch ON metrics(run_id, batch_idx)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_run ON logs(run_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_checkpoints_run ON checkpoints(run_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_checkpoints_batch ON checkpoints(run_id, batch_idx)")
             
             conn.commit()
     
@@ -190,10 +199,6 @@ class CheckpointStore:
             """, (run_record.id, run_record.started_at, run_record.seed,
                   run_record.code_version, run_record.status, run_record.params_json))
             conn.commit()
-        
-        if self.log_ctx:
-            self.log_ctx.log('run_started', run_id=run_ctx.run_id, 
-                           seed=run_ctx.seed, code_version=run_ctx.code_version)
         
         return run_record
     
@@ -218,9 +223,6 @@ class CheckpointStore:
                   batch_record.started_at, batch_record.eval_count, 
                   batch_record.space_json))
             conn.commit()
-        
-        if self.log_ctx:
-            self.log_ctx.log('batch_started', batch_idx=batch_idx)
         
         return batch_record
     
@@ -270,11 +272,6 @@ class CheckpointStore:
             """, (batch_idx, eval_count, best_score, best_score, run_id))
             
             conn.commit()
-        
-        if self.log_ctx:
-            self.log_ctx.log('batch_finished', batch_idx=batch_idx, 
-                           eval_count=eval_count, best_score=best_score,
-                           success_rate=success_rate)
     
     def finish_run(self, run_id: str, status: str = 'completed'):
         """Mark a run as finished."""
@@ -285,9 +282,6 @@ class CheckpointStore:
                 UPDATE runs SET finished_at = ?, status = ? WHERE id = ?
             """, (finished_at, status, run_id))
             conn.commit()
-        
-        if self.log_ctx:
-            self.log_ctx.log('run_finished', status=status)
     
     def get_resumable_runs(self) -> List[RunRecord]:
         """Get runs that can be resumed (status='running')."""
@@ -404,7 +398,81 @@ class CheckpointStore:
                 
                 conn.commit()
                 
-                if self.log_ctx:
-                    self.log_ctx.log('cleanup_completed', deleted_runs=len(run_ids))
+                return len(run_ids)
         
-        return len(run_ids) if 'run_ids' in locals() else 0
+        return 0
+    
+    def save_run_checkpoint(self, run_id: str, exp_id: int, batch_idx: int, 
+                           checkpoint_data: Dict[str, Any]):
+        """Save a checkpoint for a run after batch completion."""
+        import pickle
+        
+        checkpoint_blob = pickle.dumps(checkpoint_data)
+        
+        with sqlite3.connect(self.db_path) as conn:
+            # Insert or update checkpoint
+            conn.execute("""
+                INSERT OR REPLACE INTO checkpoints 
+                (run_id, exp_id, batch_idx, checkpoint_data, created_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (run_id, exp_id, batch_idx, checkpoint_blob, 
+                  datetime.utcnow().isoformat()))
+            
+            # Update run's last batch index
+            conn.execute("""
+                UPDATE runs 
+                SET last_batch_idx = ?, best_score = ?
+                WHERE id = ?
+            """, (batch_idx, checkpoint_data.get("best_score"), run_id))
+            
+            conn.commit()
+    
+    def load_run_checkpoint(self, run_id: str) -> Optional[Dict[str, Any]]:
+        """Load the latest checkpoint for a run."""
+        import pickle
+        
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute("""
+                SELECT checkpoint_data 
+                FROM checkpoints 
+                WHERE run_id = ? 
+                ORDER BY batch_idx DESC 
+                LIMIT 1
+            """, (run_id,))
+            
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            
+            try:
+                checkpoint_data = pickle.loads(row[0])
+                return checkpoint_data
+            except Exception as e:
+                return None
+    
+    def get_resumable_runs(self) -> List[Dict[str, Any]]:
+        """Get list of runs that can be resumed with their latest checkpoint info."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            
+            cursor = conn.execute("""
+                SELECT r.id, r.started_at, r.last_batch_idx, r.best_score,
+                       c.batch_idx as checkpoint_batch, c.created_at as checkpoint_time
+                FROM runs r
+                LEFT JOIN checkpoints c ON r.id = c.run_id
+                WHERE r.status = 'running'
+                ORDER BY r.started_at DESC
+            """)
+            
+            runs = []
+            for row in cursor.fetchall():
+                runs.append({
+                    'run_id': row['id'],
+                    'started_at': row['started_at'],
+                    'last_batch_idx': row['last_batch_idx'],
+                    'best_score': row['best_score'],
+                    'checkpoint_batch': row['checkpoint_batch'],
+                    'checkpoint_time': row['checkpoint_time']
+                })
+            
+            return runs

@@ -156,21 +156,25 @@ class BatchAggregator:
         prune_mode: str,
         evaluations_per_second: float,
         log_every_batch: int = 1,
-        logger: Optional[logging.Logger] = None
+        logger: Optional[logging.Logger] = None,
+        kept_in_this_batch: Optional[int] = None,
+        kept_total: Optional[int] = None
     ):
         """
-        Log a concise batch summary.
+        Log a concise batch summary with both batch-specific and cumulative statistics.
         
         Args:
             batch_idx: Current batch index (0-based)
             total_batches: Total number of batches
             best_score: Best score so far
             evaluations: Number of evaluations in this batch
-            candidates_kept: Number of candidates kept after pruning
+            candidates_kept: Number of candidates kept after pruning (deprecated, use kept_in_this_batch)
             prune_mode: Pruning mode description
             evaluations_per_second: Current evaluation speed
             log_every_batch: Log every N batches
             logger: Logger instance to use
+            kept_in_this_batch: Number of candidates kept in this specific batch
+            kept_total: Total number of candidates kept across all batches
         """
         if logger is None:
             logger = logging.getLogger("mlab.orchestrator")
@@ -179,21 +183,42 @@ class BatchAggregator:
         if (batch_idx + 1) % max(1, log_every_batch) != 0:
             return
         
-        logger.info(
-            "BATCH %d/%d | best=%.6f evals=%d kept=%d mode=%s speed=%.1f/s",
-            batch_idx + 1, total_batches, best_score, evaluations, 
-            candidates_kept, prune_mode, evaluations_per_second,
-            extra={
-                "event": "BATCH_SUMMARY",
-                "batch_idx": batch_idx,
-                "total_batches": total_batches,
-                "best_score": best_score,
-                "evaluations": evaluations,
-                "candidates_kept": candidates_kept,
-                "prune_mode": prune_mode,
-                "evaluations_per_second": evaluations_per_second
-            }
-        )
+        # Use new parameters if provided, otherwise fall back to old behavior
+        if kept_in_this_batch is not None and kept_total is not None:
+            # New single-line format with both batch and cumulative stats
+            logger.info(
+                "BATCH %d/%d | best=%.6f evals=%d kept_batch=%d kept_total=%d mode=%s speed=%.1f/s",
+                batch_idx + 1, total_batches, best_score, evaluations, 
+                kept_in_this_batch, kept_total, prune_mode, evaluations_per_second,
+                extra={
+                    "event": "BATCH_SUMMARY",
+                    "batch_idx": batch_idx,
+                    "total_batches": total_batches,
+                    "best_score": best_score,
+                    "evaluations": evaluations,
+                    "kept_in_this_batch": kept_in_this_batch,
+                    "kept_total": kept_total,
+                    "prune_mode": prune_mode,
+                    "evaluations_per_second": evaluations_per_second
+                }
+            )
+        else:
+            # Legacy format for backward compatibility
+            logger.info(
+                "BATCH %d/%d | best=%.6f evals=%d kept=%d mode=%s speed=%.1f/s",
+                batch_idx + 1, total_batches, best_score, evaluations, 
+                candidates_kept, prune_mode, evaluations_per_second,
+                extra={
+                    "event": "BATCH_SUMMARY",
+                    "batch_idx": batch_idx,
+                    "total_batches": total_batches,
+                    "best_score": best_score,
+                    "evaluations": evaluations,
+                    "candidates_kept": candidates_kept,
+                    "prune_mode": prune_mode,
+                    "evaluations_per_second": evaluations_per_second
+                }
+            )
 
 
 def log_with_context(

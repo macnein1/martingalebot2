@@ -5,6 +5,7 @@ Integrates new evaluation contract with adaptive search, early pruning, and batc
 from __future__ import annotations
 
 import time
+import pickle
 from dataclasses import dataclass
 from typing import Dict, List, Any, Optional, Tuple, Callable
 import numpy as np
@@ -12,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from martingale_lab.optimizer.evaluation_engine import evaluation_function
 from martingale_lab.storage.experiments_store import ExperimentsStore
+from martingale_lab.storage.checkpoint_store import CheckpointStore
 from martingale_lab.utils.logging import (
     get_orchestrator_logger, BatchAggregator, log_with_context
 )
@@ -142,10 +144,12 @@ class DCAOrchestrator:
     """Main orchestrator for DCA optimization with new evaluation contract."""
     
     def __init__(self, config: DCAConfig, store: Optional[ExperimentsStore] = None, 
-                 run_id: Optional[str] = None, orch_config: Optional[OrchestratorConfig] = None):
+                 run_id: Optional[str] = None, orch_config: Optional[OrchestratorConfig] = None,
+                 checkpoint_store: Optional[CheckpointStore] = None):
         self.config = config
         self.orch_config = orch_config or OrchestratorConfig()
         self.store = store or ExperimentsStore()
+        self.checkpoint_store = checkpoint_store or CheckpointStore()
         self.logger = orch_logger
         self.run_id = run_id or generate_run_id()
         
@@ -162,6 +166,10 @@ class DCAOrchestrator:
         self.best_score_so_far = float("inf")
         self.stalls = 0
         self.early_stop_reason: Optional[str] = None
+        
+        # Checkpoint state
+        self.kept_total = 0  # Total candidates kept across all batches
+        self.rng_state = None  # Random number generator state for resuming
         
         # Statistics
         self.stats = {
@@ -447,13 +455,130 @@ class DCAOrchestrator:
         
         return should_stop, reason
     
+    def save_checkpoint(self, batch_idx: int):
+        """Save checkpoint after batch completion."""
+        try:
+            # Save RNG state
+            rng = np.random.default_rng(self.config.random_seed)
+            self.rng_state = rng.bit_generator.state
+            
+            checkpoint_data = {
+                "run_id": self.run_id,
+                "exp_id": self.current_experiment_id,
+                "batch_idx": batch_idx,
+                "kept_total": self.kept_total,
+                "best_score": self.best_score,
+                "rng_state": self.rng_state,
+                "total_evaluations": self.total_evaluations,
+                "best_candidates_count": len(self.best_candidates),
+                "stalls": self.stalls,
+                "best_score_so_far": self.best_score_so_far
+            }
+            
+            # Save to checkpoint store
+            self.checkpoint_store.save_run_checkpoint(
+                run_id=self.run_id,
+                exp_id=self.current_experiment_id,
+                batch_idx=batch_idx,
+                checkpoint_data=checkpoint_data
+            )
+            
+            self.logger.debug(
+                f"Checkpoint saved: batch={batch_idx}, kept_total={self.kept_total}, best={self.best_score:.6f}",
+                extra={
+                    "event": "CHECKPOINT_SAVED",
+                    "run_id": self.run_id,
+                    "exp_id": self.current_experiment_id,
+                    "batch_idx": batch_idx,
+                    "kept_total": self.kept_total,
+                    "best_score": self.best_score
+                }
+            )
+            
+        except Exception as e:
+            self.logger.warning(
+                f"Failed to save checkpoint: {e}",
+                extra={
+                    "event": "CHECKPOINT_ERROR",
+                    "run_id": self.run_id,
+                    "exp_id": self.current_experiment_id,
+                    "batch_idx": batch_idx,
+                    "error": str(e)
+                }
+            )
+    
+    def load_checkpoint(self, run_id: str) -> Optional[Dict[str, Any]]:
+        """Load checkpoint for resuming optimization."""
+        try:
+            checkpoint_data = self.checkpoint_store.load_run_checkpoint(run_id)
+            if checkpoint_data is None:
+                return None
+            
+            # Restore state
+            self.run_id = checkpoint_data["run_id"]  # Use the checkpoint run_id
+            self.current_experiment_id = checkpoint_data["exp_id"]
+            self.batch_count = checkpoint_data["batch_idx"]
+            self.kept_total = checkpoint_data["kept_total"]
+            self.best_score = checkpoint_data["best_score"]
+            self.rng_state = checkpoint_data["rng_state"]
+            self.total_evaluations = checkpoint_data["total_evaluations"]
+            self.stalls = checkpoint_data["stalls"]
+            self.best_score_so_far = checkpoint_data["best_score_so_far"]
+            
+            # Set logging context
+            LogContext.set_run_id(self.run_id)
+            LogContext.set_exp_id(self.current_experiment_id)
+            
+            self.logger.info(
+                f"Resuming from checkpoint: batch={self.batch_count}, kept_total={self.kept_total}, best={self.best_score:.6f}",
+                extra={
+                    "event": "CHECKPOINT_LOADED",
+                    "run_id": self.run_id,
+                    "exp_id": self.current_experiment_id,
+                    "batch_idx": self.batch_count,
+                    "kept_total": self.kept_total,
+                    "best_score": self.best_score,
+                    "total_evaluations": self.total_evaluations
+                }
+            )
+            
+            return checkpoint_data
+            
+        except Exception as e:
+            self.logger.error(
+                f"Failed to load checkpoint: {e}",
+                extra={
+                    "event": "CHECKPOINT_LOAD_ERROR",
+                    "run_id": run_id,
+                    "error": str(e)
+                }
+            )
+            return None
+    
+    def get_resumable_runs(self) -> List[Dict[str, Any]]:
+        """Get list of runs that can be resumed."""
+        return self.checkpoint_store.get_resumable_runs()
+    
     def run_optimization(self, 
                         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
                         notes: Optional[str] = None,
-                        max_time_sec: Optional[int] = None) -> Dict[str, Any]:
-        """Run the complete DCA optimization process with timeout support."""
-        # Initialize experiment
-        exp_id = self.create_experiment(notes)
+                        max_time_sec: Optional[int] = None,
+                        resume_from: Optional[str] = None) -> Dict[str, Any]:
+        """Run the complete DCA optimization process with timeout support and resume capability."""
+        # Handle resume if requested
+        if resume_from:
+            checkpoint_data = self.load_checkpoint(resume_from)
+            if checkpoint_data is None:
+                raise ValueError(f"No checkpoint found for run_id: {resume_from}")
+            
+            # Start from the next batch after the checkpoint
+            start_batch = checkpoint_data["batch_idx"] + 1
+            self.logger.info(f"Resuming optimization from batch {start_batch}")
+        else:
+            # Initialize experiment for new run
+            exp_id = self.create_experiment(notes)
+            start_batch = 0
+        
         self.start_time = time.time()
         
         # Use config max_time_sec if not provided in call
@@ -479,13 +604,14 @@ class DCAOrchestrator:
             orders_range=f"{self.config.orders_min}-{self.config.orders_max}",
             max_time_sec=max_time_sec,
             batch_size=self.config.n_candidates_per_batch,
-            max_batches=self.config.max_batches
+            max_batches=self.config.max_batches,
+            resume_from=resume_from
         )
         
         timeout_reached = False
         
         try:
-            for batch_idx in range(self.config.max_batches):
+            for batch_idx in range(start_batch, self.config.max_batches):
                 batch_start = time.time()
                 LogContext.set_batch_idx(batch_idx)
                 self.batch_count = batch_idx
@@ -519,6 +645,10 @@ class DCAOrchestrator:
                 # Update best candidates
                 self.update_best_candidates(pruned_results)
                 
+                # Update kept_total counter
+                kept_in_this_batch = len(pruned_results)
+                self.kept_total += kept_in_this_batch
+                
                 # Update statistics
                 batch_time = time.time() - batch_start
                 self.stats["batches_completed"] = batch_idx + 1
@@ -534,19 +664,24 @@ class DCAOrchestrator:
                     if self.config.wave_pattern and result.get("penalties", {}).get("P_wave", 0) < 0:
                         self.stats["wave_pattern_rewards"] += 1
                 
-                # Use the new BatchAggregator for consistent logging
+                # Use the new single-line batch logging format
                 prune_mode = "exhaustive" if self.orch_config.exhaustive_mode else self.orch_config.prune_mode
                 BatchAggregator.log_batch_summary(
                     batch_idx=batch_idx,
                     total_batches=self.config.max_batches,
                     best_score=self.best_score,
                     evaluations=len(batch_results),
-                    candidates_kept=post_prune_count,
+                    candidates_kept=post_prune_count,  # Legacy parameter
                     prune_mode=prune_mode,
                     evaluations_per_second=self.stats["evaluations_per_second"],
                     log_every_batch=self.config.log_every_batch,
-                    logger=self.logger
+                    logger=self.logger,
+                    kept_in_this_batch=kept_in_this_batch,
+                    kept_total=self.kept_total
                 )
+                
+                # Save checkpoint after batch completion
+                self.save_checkpoint(batch_idx)
                 
                 # Call progress callback
                 if progress_callback:
@@ -561,7 +696,9 @@ class DCAOrchestrator:
                         "batch_evaluations": len(batch_results),
                         "prune_mode": prune_mode,
                         "elapsed_time": self.stats["total_time"],
-                        "timeout_remaining": max_time_sec - (time.time() - self.start_time) if max_time_sec else None
+                        "timeout_remaining": max_time_sec - (time.time() - self.start_time) if max_time_sec else None,
+                        "kept_in_this_batch": kept_in_this_batch,
+                        "kept_total": self.kept_total
                     }
                     progress_callback(progress_data)
                 
@@ -602,7 +739,8 @@ class DCAOrchestrator:
                 total_evaluations=self.total_evaluations,
                 total_time=self.stats["total_time"],
                 timeout_reached=timeout_reached,
-                early_stopped=self.stats["early_stopped"]
+                early_stopped=self.stats["early_stopped"],
+                kept_total=self.kept_total
             )
             
             return self.get_optimization_results()
