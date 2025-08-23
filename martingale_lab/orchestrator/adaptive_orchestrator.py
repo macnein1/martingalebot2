@@ -1,4 +1,7 @@
 """
+Experimental / deprecated.
+Not wired into CLI; subject to change.
+
 Adaptive Orchestrator for DCA/Martingale Optimization
 Implements comprehensive logging, identity management, and error handling
 """

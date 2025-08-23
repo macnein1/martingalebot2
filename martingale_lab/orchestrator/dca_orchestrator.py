@@ -9,7 +9,7 @@ import pickle
 from dataclasses import dataclass
 from typing import Dict, List, Any, Optional, Tuple, Callable
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 
 from martingale_lab.optimizer.evaluation_engine import evaluation_function
 from martingale_lab.storage.experiments_store import ExperimentsStore
@@ -20,6 +20,43 @@ from martingale_lab.utils.logging import (
 
 # Use the new centralized logging system
 orch_logger = get_orchestrator_logger()
+
+def _process_eval_worker(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Process-safe evaluation worker (top-level for pickling)."""
+    try:
+        result = evaluation_function(**params)
+        import hashlib, json
+        param_subset = {
+            "base_price": params["base_price"],
+            "overlap_pct": params["overlap_pct"],
+            "num_orders": params["num_orders"],
+            "alpha": params["alpha"],
+            "beta": params["beta"],
+            "gamma": params["gamma"],
+            "lambda_penalty": params["lambda_penalty"],
+            "wave_pattern": params["wave_pattern"],
+            "tail_cap": params["tail_cap"],
+        }
+        stable_id = hashlib.sha1(
+            json.dumps(param_subset, sort_keys=True).encode()
+        ).hexdigest()[:16]
+        result["params"] = param_subset
+        result["stable_id"] = stable_id
+        return result
+    except Exception as e:
+        return {
+            "score": float("inf"),
+            "max_need": float("inf"),
+            "var_need": float("inf"),
+            "tail": float("inf"),
+            "schedule": {},
+            "sanity": {"max_need_mismatch": True, "collapse_indents": True, "tail_overflow": True, "error": True, "reason": str(e)},
+            "diagnostics": {"wci": 0.0, "sign_flips": 0, "gini": 1.0, "entropy": 0.0},
+            "penalties": {},
+            "params": params,
+            "stable_id": None,
+            "error": str(e),
+        }
 
 def generate_run_id() -> str:
     """Generate a unique run ID"""
@@ -145,13 +182,15 @@ class DCAOrchestrator:
     
     def __init__(self, config: DCAConfig, store: Optional[ExperimentsStore] = None, 
                  run_id: Optional[str] = None, orch_config: Optional[OrchestratorConfig] = None,
-                 checkpoint_store: Optional[CheckpointStore] = None):
+                 checkpoint_store: Optional[CheckpointStore] = None,
+                 workers_mode: str = "thread"):
         self.config = config
         self.orch_config = orch_config or OrchestratorConfig()
         self.store = store or ExperimentsStore()
         self.checkpoint_store = checkpoint_store or CheckpointStore()
         self.logger = orch_logger
         self.run_id = run_id or generate_run_id()
+        self.workers_mode = workers_mode if workers_mode in ("thread", "process") else "thread"
         
         # Set context for logging
         LogContext.set_run_id(self.run_id)
@@ -170,6 +209,8 @@ class DCAOrchestrator:
         # Checkpoint state
         self.kept_total = 0  # Total candidates kept across all batches
         self.rng_state = None  # Random number generator state for resuming
+        # Persistent RNG for deterministic continuity across batches
+        self.rng = np.random.default_rng(self.config.random_seed)
         
         # Statistics
         self.stats = {
@@ -210,16 +251,14 @@ class DCAOrchestrator:
     
     def generate_random_parameters(self, n_samples: int) -> List[Dict[str, Any]]:
         """Generate random parameter combinations for evaluation."""
-        rng = np.random.default_rng(self.config.random_seed)
-        
         parameters = []
         for _ in range(n_samples):
             # Random overlap and orders
-            overlap_pct = float(rng.uniform(self.config.overlap_min, self.config.overlap_max))
-            num_orders = int(rng.integers(self.config.orders_min, self.config.orders_max + 1))
+            overlap_pct = float(self.rng.uniform(self.config.overlap_min, self.config.overlap_max))
+            num_orders = int(self.rng.integers(self.config.orders_min, self.config.orders_max + 1))
             
             # Random seed for evaluation
-            eval_seed = int(rng.integers(0, 2**31 - 1))
+            eval_seed = int(self.rng.integers(0, 2**31 - 1))
             
             params = {
                 "base_price": self.config.base_price,
@@ -324,11 +363,12 @@ class DCAOrchestrator:
                 results.append(result)
         else:
             # Parallel evaluation
-            with ThreadPoolExecutor(max_workers=self.config.n_workers) as executor:
-                future_to_params = {
-                    executor.submit(self.evaluate_candidate, params): params
-                    for params in param_batch
-                }
+            Executor = ProcessPoolExecutor if self.workers_mode == "process" else ThreadPoolExecutor
+            with Executor(max_workers=self.config.n_workers) as executor:
+                if self.workers_mode == "process":
+                    future_to_params = {executor.submit(_process_eval_worker, params): params for params in param_batch}
+                else:
+                    future_to_params = {executor.submit(self.evaluate_candidate, params): params for params in param_batch}
                 
                 for future in as_completed(future_to_params):
                     try:
@@ -337,7 +377,8 @@ class DCAOrchestrator:
                     except Exception as e:
                         params = future_to_params[future]
                         self.logger.error(f"Parallel evaluation failed for {params}: {e}")
-                        results.append(self.evaluate_candidate(params))  # Fallback
+                        # Fallback to sequential evaluation for this item
+                        results.append(self.evaluate_candidate(params))
         
         return results
     
@@ -459,8 +500,7 @@ class DCAOrchestrator:
         """Save checkpoint after batch completion."""
         try:
             # Save RNG state
-            rng = np.random.default_rng(self.config.random_seed)
-            self.rng_state = rng.bit_generator.state
+            self.rng_state = self.rng.bit_generator.state
             
             checkpoint_data = {
                 "run_id": self.run_id,
@@ -524,6 +564,13 @@ class DCAOrchestrator:
             self.total_evaluations = checkpoint_data["total_evaluations"]
             self.stalls = checkpoint_data["stalls"]
             self.best_score_so_far = checkpoint_data["best_score_so_far"]
+            # Restore RNG state for deterministic continuation
+            try:
+                if self.rng_state is not None:
+                    self.rng.bit_generator.state = self.rng_state
+            except Exception:
+                # Recreate RNG from seed as fallback
+                self.rng = np.random.default_rng(self.config.random_seed)
             
             # Set logging context
             LogContext.set_run_id(self.run_id)

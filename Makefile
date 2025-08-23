@@ -77,7 +77,7 @@ test: logs-dir
 		--db $(DB_PATH) --seed 42 --notes "quick test" \
 		--log-level INFO \
 		--log-eval-sample 0.0 \
-		--log-every-batch 1
+		--log-every-batch 5
 
 # Test with timeout constraint
 test-timeout: logs-dir

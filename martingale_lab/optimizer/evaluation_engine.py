@@ -17,6 +17,18 @@ from martingale_lab.utils.logging import get_eval_logger, should_log_eval
 logger = get_eval_logger()
 
 
+def batch_evaluate(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Vectorized batch evaluation skeleton. Currently falls back to per-item eval."""
+    if not candidates:
+        return []
+    results: List[Dict[str, Any]] = []
+    for c in candidates:
+        res = evaluation_function(**c)
+        # stable_id can be derived by orchestrator; keep payload minimal here
+        results.append(res)
+    return results
+
+
 def _ensure_json_serializable(obj):
     """Convert numpy arrays and scalars to JSON-serializable types."""
     if isinstance(obj, np.ndarray):
