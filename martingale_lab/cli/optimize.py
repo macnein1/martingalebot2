@@ -17,6 +17,7 @@ from martingale_lab.storage.checkpoint_store import CheckpointStore
 from martingale_lab.utils.logging import (
     configure_logging, configure_eval_sampling, get_cli_logger
 )
+from martingale_lab.utils.runctx import make_runctx
 
 # Use the new centralized logging system
 cli_logger = get_cli_logger()
@@ -29,6 +30,12 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
+    # Orchestrator selection and workers mode
+    parser.add_argument("--orchestrator", choices=["dca"], default="dca",
+                       help="Select orchestrator implementation (dca)")
+    parser.add_argument("--workers-mode", choices=["thread", "process"], default="thread",
+                       help="Worker execution mode for evaluation")
+
     # Search space parameters
     parser.add_argument("--overlap-min", type=float, default=15.0,
                        help="Minimum overlap percentage")
@@ -99,7 +106,7 @@ def parse_args() -> argparse.Namespace:
                        help="Write detailed logs to file (JSON format)")
     parser.add_argument("--log-eval-sample", type=float, default=0.0,
                        help="Per-evaluation log sampling rate (0.0-1.0)")
-    parser.add_argument("--log-every-batch", type=int, default=1,
+    parser.add_argument("--log-every-batch", type=int, default=5,
                        help="Log batch summary every N batches")
     
     # Time constraints
@@ -268,6 +275,16 @@ def main() -> int:
         
         # Create checkpoint store with same database path
         checkpoint_store = CheckpointStore(args.db)
+        # Create run context and start run record (for resume listing)
+        run_ctx = make_runctx(args.seed)
+        try:
+            checkpoint_store.start_run(run_ctx, {
+                "orchestrator": args.orchestrator,
+                "db_path": args.db,
+                "notes": args.notes,
+            })
+        except Exception:
+            pass
         
         # Handle resume functionality
         resume_from = None
@@ -277,7 +294,8 @@ def main() -> int:
             temp_orchestrator = DCAOrchestrator(
                 config=temp_config, 
                 store=store,
-                checkpoint_store=checkpoint_store
+                checkpoint_store=checkpoint_store,
+                workers_mode=args.workers_mode
             )
             
             if args.resume_into:
@@ -312,9 +330,10 @@ def main() -> int:
         orchestrator = DCAOrchestrator(
             config=dca_config,
             store=store,
-            run_id=resume_from if resume_from else None,  # Use resume run_id if provided
+            run_id=resume_from if resume_from else run_ctx.run_id,  # Use resume run_id or new run_id
             orch_config=orch_config,
-            checkpoint_store=checkpoint_store
+            checkpoint_store=checkpoint_store,
+            workers_mode=args.workers_mode
         )
         run_id = orchestrator.run_id
         
@@ -378,11 +397,21 @@ def main() -> int:
         if stats.get("timeout_reached", False):
             print(f"⚠️  Stopped due to timeout ({args.max_time_sec}s)", file=sys.stderr)
         print(f"Database: {args.db}", file=sys.stderr)
+        try:
+            checkpoint_store.finish_run(run_id, status='completed')
+        except Exception:
+            pass
         
         return 0
         
     except KeyboardInterrupt:
         cli_logger.info("Optimization interrupted by user", extra={"event": "CLI.INTERRUPT"})
+        try:
+            # Best-effort mark as cancelled
+            args = parse_args()
+            CheckpointStore(args.db).finish_run(run_id if 'run_id' in locals() else "unknown", status='cancelled')
+        except Exception:
+            pass
         return 130  # Standard exit code for SIGINT
         
     except Exception as e:
@@ -395,6 +424,11 @@ def main() -> int:
             }
         )
         print(f"Error: {e}", file=sys.stderr)
+        try:
+            args = parse_args()
+            CheckpointStore(args.db).finish_run(run_id if 'run_id' in locals() else "unknown", status='failed')
+        except Exception:
+            pass
         return 1
 
 
