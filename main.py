@@ -13,7 +13,7 @@ from ui.components.sidebar import render_sidebar
 from ui.components.progress_section import render_progress_section
 from ui.components.results_section import render_results_section
 from ui.components.system_performance import render_system_performance
-from ui.utils.config import load_page_config
+from ui.utils.config import setup_page_config
 
 # Import DCA components
 from martingale_lab.orchestrator.dca_orchestrator import create_dca_orchestrator, DCAConfig
@@ -22,7 +22,7 @@ from martingale_lab.storage.experiments_store import ExperimentsStore
 def main():
     """Main application entry point."""
     # Load page configuration
-    load_page_config()
+    setup_page_config()
     
     # Initialize session state
     if 'current_experiment_id' not in st.session_state:
@@ -38,6 +38,8 @@ def main():
     
     # Sidebar navigation
     page = render_sidebar()
+    if not page:
+        page = st.sidebar.radio("Navigation", ["Configuration", "Optimization", "Results", "System"], index=0, key="nav_page")
     
     # Main content based on page selection
     if page == "Configuration":
@@ -274,7 +276,7 @@ def run_optimization(config: DCAConfig, notes: str = ""):
         # Progress callback
         def progress_callback(info):
             progress = info["batch"] / info["total_batches"]
-            progress_bar.progress(progress)
+            progress_bar.progress(int(progress * 100))
             
             status_text.text(
                 f"Batch {info['batch']}/{info['total_batches']} - "
