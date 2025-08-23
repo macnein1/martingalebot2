@@ -33,8 +33,8 @@ def create_needpct_sparkline(needpct: List[float], width: int = 100, height: int
 def format_bullets(schedule: Dict[str, Any]) -> List[str]:
     """
     Format bullets exactly as specified:
-    1. Emir: Indent %0.00 Volume %x.xx (no martingale, first order) — NeedPct %n1
-    2. Emir: Indent %p2 Volume %v2 (Martingale %m2) — NeedPct %n2
+    1. Emir: Indent %x Volume %y (no martingale) — NeedPct %n
+    2. Emir: Indent %x Volume %y (Martingale %m) — NeedPct %n
     """
     indent_pct = schedule.get("indent_pct", [])
     volume_pct = schedule.get("volume_pct", [])
@@ -51,7 +51,7 @@ def format_bullets(schedule: Dict[str, Any]) -> List[str]:
         need = needpct[i] if i < len(needpct) else 0.0
         
         if i == 0:
-            bullet = f"{i+1}. Emir: Indent %{indent:.2f}  Volume %{volume:.2f}  (no martingale, first order) — NeedPct %{need:.2f}"
+            bullet = f"{i+1}. Emir: Indent %{indent:.2f}  Volume %{volume:.2f}  (no martingale) — NeedPct %{need:.2f}"
         else:
             bullet = f"{i+1}. Emir: Indent %{indent:.2f}  Volume %{volume:.2f}  (Martingale %{martingale:.2f}) — NeedPct %{need:.2f}"
         
@@ -61,20 +61,15 @@ def format_bullets(schedule: Dict[str, Any]) -> List[str]:
 
 
 def create_sanity_badges(sanity: Dict[str, bool]) -> str:
-    """Create colored badges for sanity check flags."""
+    """Create compact badges for sanity check flags."""
     badges = []
-    
-    if sanity.get("max_need_mismatch", False):
-        badges.append("🔴 Max Need Mismatch")
     if sanity.get("collapse_indents", False):
-        badges.append("🟡 Collapsed Indents")
+        badges.append("indent↧")
     if sanity.get("tail_overflow", False):
-        badges.append("🟠 Tail Overflow")
-    
-    if not badges:
-        badges.append("✅ All Checks Pass")
-    
-    return " | ".join(badges)
+        badges.append("tail↑")
+    if sanity.get("max_need_mismatch", False):
+        badges.append("max≠")
+    return " ".join(badges) if badges else "OK"
 
 
 def create_needpct_chart(needpct: List[float], title: str = "NeedPct Progression") -> go.Figure:
@@ -234,41 +229,40 @@ def display_results_table(results: List[Dict[str, Any]], limit: int = 50):
     
     st.subheader(f"🏆 Top {min(len(results), limit)} Results")
     
-    # Prepare table data
-    table_data = []
-    for i, result in enumerate(results[:limit]):
-        schedule = result.get("schedule", {})
-        sanity = result.get("sanity", {})
-        diagnostics = result.get("diagnostics", {})
+    # Determine maximum number of exit requirements across results
+    max_m = 0
+    for res in results[:limit]:
+        payload = res.get("payload", {})
+        schedule = payload.get("schedule", {})
         needpct = schedule.get("needpct", [])
+        if isinstance(needpct, list):
+            max_m = max(max_m, len(needpct))
+    
+    # Prepare table data
+    table_rows: List[Dict[str, Any]] = []
+    for i, result in enumerate(results[:limit]):
+        payload = result.get("payload", {})
+        schedule = payload.get("schedule", {})
+        sanity = payload.get("sanity", {}) or result.get("sanity", {})
+        diagnostics = payload.get("diagnostics", {}) or result.get("diagnostics", {})
+        needpct = schedule.get("needpct", []) or []
         
-        row = {
+        row: Dict[str, Any] = {
             "Rank": i + 1,
             "Score (J)": f"{result.get('score', 0):.3f}",
-            "Max Need": f"{result.get('max_need', 0):.2f}%",
-            "Var Need": f"{result.get('var_need', 0):.3f}",
-            "Tail": f"{result.get('tail', 0):.3f}",
-            "WCI": f"{diagnostics.get('wci', 0):.3f}",
-            "Sign Flips": diagnostics.get('sign_flips', 0),
-            "NeedPct Sparkline": create_needpct_sparkline(needpct),
-            "Sanity": create_sanity_badges(sanity),
-            "Details": f"expand_{i}"  # Placeholder for expand button
+            "Exit Mean": f"{(float(np.mean(needpct)) if len(needpct) else 0.0):.2f}",
+            "Exit Max": f"{(float(np.max(needpct)) if len(needpct) else 0.0):.2f}",
+            "Badges": create_sanity_badges(sanity),
         }
-        table_data.append(row)
+        # Add exit_req_1..M columns
+        for k in range(max_m):
+            col_name = f"exit_req_{k+1}"
+            row[col_name] = f"{needpct[k]:.2f}" if k < len(needpct) else ""
+        
+        table_rows.append(row)
     
-    # Display table
-    df = pd.DataFrame(table_data)
-    
-    # Use streamlit's native table with selection
-    selected_rows = st.dataframe(
-        df,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "NeedPct Sparkline": st.column_config.TextColumn("NeedPct ▁▂▃▄▅▆▇█"),
-            "Sanity": st.column_config.TextColumn("Sanity Checks"),
-        }
-    )
+    df = pd.DataFrame(table_rows)
+    st.dataframe(df, use_container_width=True, hide_index=True)
     
     # Expandable details sections
     st.subheader("📋 Detailed View")
@@ -286,21 +280,22 @@ def display_results_table(results: List[Dict[str, Any]], limit: int = 50):
 
 def display_result_detail(result: Dict[str, Any]):
     """Display detailed view of a single result."""
-    schedule = result.get("schedule", {})
-    sanity = result.get("sanity", {})
-    diagnostics = result.get("diagnostics", {})
-    penalties = result.get("penalties", {})
+    payload = result.get("payload", {})
+    schedule = payload.get("schedule", {})
+    sanity = payload.get("sanity", {}) or result.get("sanity", {})
+    diagnostics = payload.get("diagnostics", {}) or result.get("diagnostics", {})
+    penalties = payload.get("penalties", {}) or result.get("penalties", {})
     
     # Summary metrics
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("Score (J)", f"{result.get('score', 0):.3f}")
     with col2:
-        st.metric("Max Need", f"{result.get('max_need', 0):.2f}%")
+        st.metric("Exit Mean", f"{(float(np.mean(schedule.get('needpct', [])) if schedule.get('needpct') else 0.0)):.2f}")
     with col3:
-        st.metric("Var Need", f"{result.get('var_need', 0):.3f}")
+        st.metric("Exit Max", f"{(float(np.max(schedule.get('needpct', [])) if schedule.get('needpct') else 0.0)):.2f}")
     with col4:
-        st.metric("Tail", f"{result.get('tail', 0):.3f}")
+        st.metric("Badges", create_sanity_badges(sanity))
     
     # Bullets format
     st.subheader("🎯 Order Bullets")
@@ -340,43 +335,19 @@ def display_result_detail(result: Dict[str, Any]):
         st.metric("Entropy", f"{diagnostics.get('entropy', 0):.3f}")
         st.caption("Volume diversity")
     
-    # Exit speed score
-    needpct = schedule.get("needpct", [])
-    if needpct:
-        avg_need = np.mean(needpct)
-        exit_speed = 1.0 / (1.0 + avg_need / 100.0)  # Normalize to [0,1]
-        st.metric("Exit Speed Score", f"{exit_speed:.3f}")
-        st.caption("1 / (1 + mean(needpct/100)) - Higher is faster exit")
-    
-    # Sanity checks
-    st.subheader("⚠️ Sanity Checks")
-    sanity_badges = create_sanity_badges(sanity)
-    st.write(sanity_badges)
-    
-    # Penalties breakdown
-    if penalties:
-        st.subheader("⚖️ Penalties Breakdown")
-        penalty_df = pd.DataFrame([
-            {"Penalty": k.replace("P_", "").title(), "Value": f"{v:.3f}"}
-            for k, v in penalties.items()
-        ])
-        st.dataframe(penalty_df, hide_index=True)
-    
     # Download options
     st.subheader("💾 Download")
     col1, col2 = st.columns(2)
     
     with col1:
-        # CSV download for schedule
+        # CSV download for schedule + needpct
         schedule_df = pd.DataFrame({
             "Order": range(1, len(schedule.get("volume_pct", [])) + 1),
             "Indent_Pct": schedule.get("indent_pct", []),
             "Volume_Pct": schedule.get("volume_pct", []),
             "Martingale_Pct": schedule.get("martingale_pct", []),
             "NeedPct": schedule.get("needpct", []),
-            "Order_Price": schedule.get("order_prices", [])[1:] if len(schedule.get("order_prices", [])) > 1 else []
         })
-        
         csv_data = schedule_df.to_csv(index=False)
         st.download_button(
             "Download Schedule CSV",
@@ -386,12 +357,12 @@ def display_result_detail(result: Dict[str, Any]):
         )
     
     with col2:
-        # JSON download for complete result
-        json_data = json.dumps(result, indent=2, ensure_ascii=False)
+        # JSON download for payload
+        json_data = json.dumps(payload, indent=2, ensure_ascii=False)
         st.download_button(
-            "Download Full JSON",
+            "Download Payload JSON",
             json_data,
-            f"dca_result_rank_{result.get('rank', 'unknown')}.json",
+            f"dca_payload_rank_{result.get('rank', 'unknown')}.json",
             "application/json"
         )
 
