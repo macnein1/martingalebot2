@@ -11,17 +11,18 @@ import numpy as np
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 import os
 from pathlib import Path
 
-from martingale_lab.utils.structured_logging import (
-    get_structured_logger, EventNames, Timer, ensure_json_serializable
-)
-from ui.utils.constants import Status, DB_PATH
+from martingale_lab.utils.logging import db_logger as logger
 
-# Initialize structured logger for database operations
-logger = get_structured_logger("mlab.db")
+# Status constants
+class Status:
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
 
 
 def _jsonify(o: Any):
@@ -67,7 +68,10 @@ class ExperimentsStore:
         Path(os.path.dirname(self.db_path) or ".").mkdir(parents=True, exist_ok=True)
         
         # Log database initialization
-        logger.info(EventNames.DB_INIT, f"Initializing database at {db_path}", db_path=db_path)
+        logger.info(
+            f"Initializing database at {db_path}",
+            extra={"event": "mlab.db.init", "db_path": db_path}
+        )
         
         self._init_db()
         self.migrate_if_needed()
@@ -260,11 +264,8 @@ class ExperimentsStore:
             
             # Log experiment creation
             logger.info(
-                EventNames.DB_UPSERT_EXP,
                 f"Created experiment {exp_id} for {adapter}",
-                exp_id=int(exp_id),
-                adapter=adapter,
-                run_id=run_id
+                extra={"event": "mlab.db.upsert_exp", "exp_id": int(exp_id), "adapter": adapter, "run_id": run_id}
             )
             
             return int(exp_id)
@@ -370,28 +371,19 @@ class ExperimentsStore:
                 count = cur.fetchone()[0]
                 
                 logger.info(
-                    EventNames.DB_UPSERT_RES,
                     f"Inserted {inserted} results for experiment {experiment_id}",
-                    experiment_id=experiment_id,
-                    rows=inserted,
-                    total_rows=count
+                    extra={"event": "mlab.db.upsert_res", "experiment_id": experiment_id, "rows": inserted, "total_rows": count}
                 )
                 
                 logger.info(
-                    EventNames.DB_VERIFY,
                     f"Verification successful: {count} total rows",
-                    ok=True,
-                    expected=inserted,
-                    actual=count
+                    extra={"event": "mlab.db.verify", "ok": True, "expected": inserted, "actual": count}
                 )
                 
         except Exception as e:
             logger.error(
-                EventNames.DB_ERROR,
                 f"Database error in upsert_results: {str(e)}",
-                error=str(e),
-                operation="upsert_results",
-                experiment_id=experiment_id
+                extra={"event": "mlab.db.error", "error": str(e), "operation": "upsert_results", "experiment_id": experiment_id}
             )
             raise
             
@@ -538,29 +530,22 @@ class ExperimentsStore:
                         
                     except Exception as e:
                         logger.warning(
-                            EventNames.DB_VERIFY,
                             f"Failed to parse result row {row[0]}: {str(e)}",
-                            exp_id=experiment_id,
-                            result_id=row[0],
-                            error=str(e)
+                            extra={"event": "mlab.db.verify", "exp_id": experiment_id, "result_id": row[0], "error": str(e)}
                         )
                         continue
                 
                 logger.info(
-                    EventNames.DB_VERIFY,
                     f"Retrieved {len(results)} results for experiment {experiment_id}",
-                    exp_id=experiment_id,
-                    result_count=len(results)
+                    extra={"event": "mlab.db.verify", "exp_id": experiment_id, "result_count": len(results)}
                 )
                 
                 return results
                 
         except Exception as e:
             logger.error(
-                EventNames.DB_ERROR,
                 f"Failed to get results for experiment {experiment_id}: {str(e)}",
-                exp_id=experiment_id,
-                error=str(e)
+                extra={"event": "mlab.db.error", "exp_id": experiment_id, "error": str(e)}
             )
             return []
 
@@ -655,24 +640,21 @@ class ExperimentsStore:
                         
                     except Exception as e:
                         logger.warning(
-                            EventNames.DB_VERIFY,
                             f"Failed to parse experiment row {row[0]}: {str(e)}",
-                            error=str(e)
+                            extra={"event": "mlab.db.verify", "error": str(e)}
                         )
                         continue
                 
                 logger.info(
-                    EventNames.DB_VERIFY,
                     f"Retrieved {len(experiments)} experiments",
-                    experiment_count=len(experiments)
+                    extra={"event": "mlab.db.verify", "experiment_count": len(experiments)}
                 )
                 
                 return experiments
                 
         except Exception as e:
             logger.error(
-                EventNames.DB_ERROR,
                 f"Failed to get experiments: {str(e)}",
-                error=str(e)
+                extra={"event": "mlab.db.error", "error": str(e)}
             )
             return []

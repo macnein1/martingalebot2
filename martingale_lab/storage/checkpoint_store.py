@@ -4,10 +4,9 @@ Provides database schema and operations for persistent state management.
 """
 import sqlite3
 import json
-import time
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from datetime import datetime
 
 from ..utils.runctx import RunCtx
