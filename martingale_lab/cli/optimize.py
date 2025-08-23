@@ -8,6 +8,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Dict, Any, Optional
+import os
 
 from martingale_lab.orchestrator.dca_orchestrator import (
     DCAOrchestrator, DCAConfig, OrchestratorConfig
@@ -256,6 +257,16 @@ def main() -> int:
     try:
         # Parse arguments
         args = parse_args()
+        
+        # Log absolute database path very early
+        try:
+            db_abs = os.path.abspath(args.db)
+            cli_logger.info(
+                f"Opening SQLite at: {db_abs}",
+                extra={"event": "CLI.DB_OPEN", "db_abs": db_abs}
+            )
+        except Exception:
+            pass
         
         # Configure centralized logging system FIRST
         configure_logging(

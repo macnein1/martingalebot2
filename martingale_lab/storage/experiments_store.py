@@ -7,7 +7,10 @@ Schema:
 from __future__ import annotations
 
 import json
-import numpy as np
+try:
+    import numpy as np  # type: ignore
+except Exception:  # pragma: no cover - allow running without numpy for basic ops
+    np = None  # type: ignore
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
@@ -16,6 +19,7 @@ import os
 from pathlib import Path
 import hashlib
 from typing import Iterable, Sequence, Tuple
+from statistics import variance as _py_variance  # fallback for var if needed
 
 from martingale_lab.utils.logging import db_logger as logger
 
@@ -29,10 +33,10 @@ class Status:
 
 def _jsonify(o: Any):
     # numpy array -> list
-    if isinstance(o, np.ndarray):
+    if np is not None and isinstance(o, np.ndarray):
         return o.tolist()
     # numpy scalars -> python scalars
-    if isinstance(o, np.generic):
+    if np is not None and isinstance(o, np.generic):
         return o.item()
     # recursive containers
     if isinstance(o, (list, tuple)):
@@ -69,14 +73,58 @@ class ExperimentsStore:
         # Ensure directory exists
         Path(os.path.dirname(self.db_path) or ".").mkdir(parents=True, exist_ok=True)
         
-        # Log database initialization
-        logger.info(
-            f"Initializing database at {db_path}",
-            extra={"event": "mlab.db.init", "db_path": db_path}
-        )
+        # Log database initialization with absolute path
+        try:
+            db_abs = os.path.abspath(self.db_path)
+            logger.info(
+                f"Initializing database at {db_abs}",
+                extra={"event": "mlab.db.init", "db_path": self.db_path, "db_abs": db_abs}
+            )
+        except Exception:
+            logger.info(
+                f"Initializing database at {db_path}",
+                extra={"event": "mlab.db.init", "db_path": db_path}
+            )
         
         self._init_db()
         self.migrate_if_needed()
+
+    def _connect(self, *, log_pragmas: bool = False) -> sqlite3.Connection:
+        # Support SQLite URIs for shared in-memory tests
+        use_uri = isinstance(self.db_path, str) and (
+            self.db_path.startswith("file:") or self.db_path == ":memory:"
+        )
+        conn = sqlite3.connect(self.db_path, uri=use_uri)
+        cur = conn.cursor()
+        # Set PRAGMAs for performance and durability expectations
+        try:
+            cur.execute("PRAGMA journal_mode=WAL;")
+        except Exception:
+            pass
+        try:
+            cur.execute("PRAGMA synchronous=NORMAL;")
+        except Exception:
+            pass
+        if log_pragmas:
+            try:
+                cur.execute("PRAGMA journal_mode;")
+                jm = cur.fetchone()[0]
+            except Exception:
+                jm = None
+            try:
+                cur.execute("PRAGMA synchronous;")
+                syn = cur.fetchone()[0]
+            except Exception:
+                syn = None
+            try:
+                db_abs = os.path.abspath(self.db_path)
+            except Exception:
+                db_abs = self.db_path
+            logger.info(
+                f"SQLite open: {db_abs} (journal_mode={jm}, synchronous={syn})",
+                extra={"event": "mlab.db.open", "db_abs": db_abs, "journal_mode": jm, "synchronous": syn}
+            )
+        return conn
 
     def _get_user_version(self, cur) -> int:
         cur.execute("PRAGMA user_version;")
@@ -90,7 +138,7 @@ class ExperimentsStore:
         cur.execute(f"PRAGMA user_version={int(v)};")
 
     def _init_db(self) -> None:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect(log_pragmas=True) as conn:
             cur = conn.cursor()
             cur.execute(
                 """
@@ -143,11 +191,15 @@ class ExperimentsStore:
 
     def migrate_if_needed(self) -> None:
         """Run PRAGMA user_version-based idempotent migrations."""
-        with sqlite3.connect(self.db_path) as con:
+        with self._connect() as con:
             cur = con.cursor()
             # Enable WAL for better concurrency
             try:
                 cur.execute("PRAGMA journal_mode=WAL;")
+            except Exception:
+                pass
+            try:
+                cur.execute("PRAGMA synchronous=NORMAL;")
             except Exception:
                 pass
 
@@ -194,12 +246,60 @@ class ExperimentsStore:
                 )
                 self._set_user_version(cur, 2)
 
+            # v2 -> v3 : ensure results.created_at has DEFAULT and NOT NULL safely
+            v = self._get_user_version(cur)
+            if v < 3:
+                try:
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS results_new(
+                          id INTEGER PRIMARY KEY,
+                          experiment_id INTEGER NOT NULL REFERENCES experiments(id),
+                          stable_id TEXT NOT NULL,
+                          score REAL NOT NULL,
+                          payload_json TEXT NOT NULL,
+                          sanity_json TEXT NOT NULL,
+                          diagnostics_json TEXT NOT NULL,
+                          penalties_json TEXT NOT NULL,
+                          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                          UNIQUE(experiment_id, stable_id)
+                        );
+                        """
+                    )
+                    cur.execute(
+                        """
+                        INSERT INTO results_new(id,experiment_id,stable_id,score,payload_json,sanity_json,diagnostics_json,penalties_json,created_at)
+                        SELECT id,experiment_id,COALESCE(stable_id,''),score,payload_json,sanity_json,diagnostics_json,penalties_json,
+                               COALESCE(created_at, datetime('now'))
+                        FROM results;
+                        """
+                    )
+                    cur.execute("DROP TABLE results;")
+                    cur.execute(
+                        """
+                        ALTER TABLE results_new RENAME TO results;
+                        """
+                    )
+                    cur.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_results_exp ON results(experiment_id, score);
+                        """
+                    )
+                except Exception as e:
+                    # Best effort; if results doesn't exist yet, continue
+                    logger.warning(
+                        f"Migration v3 skipped or partially applied: {e}",
+                        extra={"event": "mlab.db.migrate", "version": 3, "error": str(e)}
+                    )
+                finally:
+                    self._set_user_version(cur, 3)
+
             con.commit()
 
     def create_experiment(self, adapter: str, cfg: Dict[str, Any], run_id: str) -> int:
         created_at = datetime.now().isoformat()
         
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cur = conn.cursor()
             cur.execute(
                 """
@@ -232,7 +332,7 @@ class ExperimentsStore:
             return int(exp_id)
 
     def update_experiment_summary(self, experiment_id: int, best_score: float, total_evals: int, elapsed_s: float) -> None:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cur = conn.cursor()
             
             # Check which columns exist
@@ -276,7 +376,7 @@ class ExperimentsStore:
     def set_experiment_error(self, experiment_id: int, error_payload: Dict[str, Any]) -> None:
         """Persist error details to experiments.error_json."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 cur = conn.cursor()
                 cur.execute(
                     "UPDATE experiments SET error_json = ?, updated_at = ?, status = ? WHERE id = ?",
@@ -307,10 +407,12 @@ class ExperimentsStore:
         items: Iterable[Dict[str, Any]],
     ) -> int:
         rows: Sequence[Tuple] = []
+        created_ts = datetime.now().isoformat()
         for it in items:
             # Prefer provided stable_id, else derive from payload or full item
             stable_id = it.get("stable_id") or self._stable_id_from_payload(it.get("payload", it))
             payload_obj = it.get("payload", it)
+            created_at = it.get("created_at", created_ts)
             rows.append((
                 experiment_id,
                 stable_id,
@@ -319,38 +421,68 @@ class ExperimentsStore:
                 json.dumps(_jsonify(it.get("sanity", {})), separators=(",", ":")),
                 json.dumps(_jsonify(it.get("diagnostics", {})), separators=(",", ":")),
                 json.dumps(_jsonify(it.get("penalties", {})), separators=(",", ":")),
+                created_at,
             ))
 
         if not rows:
             return 0
 
-        with sqlite3.connect(self.db_path) as con:
-            cur = con.cursor()
-            cur.executemany(
-                """
+        sql = (
+            """
                 INSERT INTO results(
                     experiment_id, stable_id, score,
-                    payload_json, sanity_json, diagnostics_json, penalties_json
+                    payload_json, sanity_json, diagnostics_json, penalties_json, created_at
                 )
-                VALUES(?,?,?,?,?,?,?)
+                VALUES(?,?,?,?,?,?,?,COALESCE(?, datetime('now')))
                 ON CONFLICT(experiment_id, stable_id) DO UPDATE SET
                    score=excluded.score,
                    payload_json=excluded.payload_json,
                    sanity_json=excluded.sanity_json,
                    diagnostics_json=excluded.diagnostics_json,
                    penalties_json=excluded.penalties_json;
-                """,
-                rows,
+            """
+        )
+
+        try:
+            with self._connect() as con:
+                cur = con.cursor()
+                cur.executemany(sql, rows)
+                con.commit()
+                affected = cur.rowcount
+                if affected == 0:
+                    logger.warning(
+                        f"No rows affected by upsert for experiment {experiment_id}",
+                        extra={"event": "mlab.db.upsert_warn", "exp_id": experiment_id, "row_count": len(rows)}
+                    )
+                return affected
+        except Exception as e:
+            # Log exception with trimmed params
+            try:
+                sample = rows[0] if rows else None
+                sample_str = str(sample)
+                if sample_str and len(sample_str) > 200:
+                    sample_str = sample_str[:200] + "..."
+            except Exception:
+                sample_str = None
+            logger.exception(
+                f"Upsert failed for experiment {experiment_id}: {e}",
+                extra={
+                    "event": "mlab.db.upsert_error",
+                    "exp_id": experiment_id,
+                    "error": str(e),
+                    "sql": "INSERT ... ON CONFLICT",
+                    "sample_params": sample_str,
+                    "rows": len(rows),
+                }
             )
-            con.commit()
-            return cur.rowcount
+            raise
 
     def get_top_results(self, 
                        experiment_id: Optional[int] = None,
                        limit: int = 100,
                        filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """Get top results with optional filtering."""
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cur = conn.cursor()
             
             query = """
@@ -414,7 +546,7 @@ class ExperimentsStore:
             List of result dictionaries with normalized fields
         """
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 cur = conn.cursor()
                 
                 # Get results with all required fields
@@ -449,7 +581,16 @@ class ExperimentsStore:
                         
                         # Calculate derived metrics
                         max_need = max(needpct) if needpct else 0.0
-                        var_need = np.var(needpct) if len(needpct) > 1 else 0.0
+                        if len(needpct) > 1:
+                            if np is not None:
+                                var_need = float(np.var(needpct))  # type: ignore[attr-defined]
+                            else:
+                                try:
+                                    var_need = float(_py_variance(needpct))
+                                except Exception:
+                                    var_need = 0.0
+                        else:
+                            var_need = 0.0
                         tail = volume_pct[-1] if volume_pct else 0.0
                         
                         # Extract overlap and orders from schedule
@@ -507,7 +648,7 @@ class ExperimentsStore:
 
     def get_experiment_summary(self, experiment_id: int) -> Optional[Dict[str, Any]]:
         """Get experiment summary with statistics."""
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cur = conn.cursor()
             
             # Get experiment details
@@ -553,7 +694,7 @@ class ExperimentsStore:
             }
 
     def soft_delete_experiment(self, experiment_id: int) -> None:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cur = conn.cursor()
             cur.execute("UPDATE experiments SET deleted = 1 WHERE id = ?", (experiment_id,))
             conn.commit()
@@ -561,7 +702,7 @@ class ExperimentsStore:
     def get_experiments(self) -> List[Dict[str, Any]]:
         """Get all experiments with enhanced fields."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 cur = conn.cursor()
                 
                 # Get experiments with all required fields, handling both total_evals and eval_count
