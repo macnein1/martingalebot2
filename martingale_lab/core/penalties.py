@@ -333,6 +333,68 @@ def cvar_calculation(need_pct: np.ndarray, q: float = 0.8) -> float:
         return sorted_need[-1]
 
 
+@njit(cache=True, fastmath=True)
+def penalty_first_fixed(volumes: np.ndarray, indents: np.ndarray, target_volume: float, target_indent: float) -> float:
+    if volumes.size == 0:
+        return 0.0
+    v0 = volumes[0]
+    i0 = indents[0] if indents.size > 0 else 0.0
+    return abs(v0 - target_volume) + abs(i0 - target_indent)
+
+
+@njit(cache=True, fastmath=True)
+def penalty_g_band(volumes: np.ndarray, g_min: float, g_max: float) -> float:
+    n = volumes.size
+    if n <= 2:
+        return 0.0
+    pen = 0.0
+    for i in range(2, n):
+        denom = volumes[i-1] if volumes[i-1] > 1e-12 else 1e-12
+        g = volumes[i] / denom
+        if g < g_min:
+            pen += (g_min - g)
+        elif g > g_max:
+            pen += (g - g_max)
+    return pen
+
+
+@njit(cache=True, fastmath=True)
+def penalty_frontload(volumes: np.ndarray, k_front: int, front_cap: float) -> float:
+    kf = k_front if k_front < volumes.size else volumes.size
+    s = 0.0
+    for i in range(kf):
+        s += volumes[i]
+    excess = s - front_cap
+    if excess > 0.0:
+        return excess * excess
+    return 0.0
+
+
+@njit(cache=True, fastmath=True)
+def penalty_total_variation_vol(volumes: np.ndarray) -> float:
+    n = volumes.size
+    if n <= 1:
+        return 0.0
+    tv = 0.0
+    for i in range(1, n):
+        diff = volumes[i] - volumes[i-1]
+        tv += abs(diff)
+    return tv
+
+
+def compute_shape_penalties(volumes: np.ndarray, indents: np.ndarray,
+                            first_volume_target: float, first_indent_target: float,
+                            g_min: float, g_max: float,
+                            k_front: int, front_cap: float) -> Dict[str, float]:
+    """Compute shape-specific penalties after repair."""
+    return {
+        "penalty_first_fixed": penalty_first_fixed(volumes, indents, first_volume_target, first_indent_target),
+        "penalty_g_band": penalty_g_band(volumes, g_min, g_max),
+        "penalty_frontload": penalty_frontload(volumes, k_front, front_cap),
+        "penalty_tv_vol": penalty_total_variation_vol(volumes),
+    }
+
+
 def compute_all_penalties(volumes: np.ndarray, martingales: np.ndarray, 
                          indents: np.ndarray, need_pct: np.ndarray,
                          config: Dict[str, Any]) -> Dict[str, float]:

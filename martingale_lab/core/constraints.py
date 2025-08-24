@@ -489,3 +489,193 @@ def validate_candidate_hard(indents: np.ndarray, volumes: np.ndarray,
             return False, f"Martingale {i} value {martingales[i]:.3f} outside [1, 100] bounds"
     
     return True, "Valid"
+
+
+def enforce_schedule_shape_fixed(
+    indent_pct: list,
+    volume_pct: list,
+    base_price: float,
+    first_volume_target: float = 0.01,
+    first_indent_target: float = 0.0,
+    k_front: int = 3,
+    front_cap: float = 5.0,
+    g_min: float = 0.95,
+    g_max: float = 1.20,
+) -> Tuple[list, list, list, list, list, list, Dict[str, Any]]:
+    """
+    Enforce fixed-first-order and shaped martingale band on a schedule, then renormalize.
+
+    Args:
+        indent_pct: cumulative indent percentages per order (length M)
+        volume_pct: volume percentages per order (length M, sums ~100)
+        base_price: base price to compute order_prices and needpct
+        first_volume_target: fixed first order volume percentage
+        first_indent_target: fixed first order indent percentage (usually 0.0)
+        k_front: number of initial orders considered "front"
+        front_cap: maximum total volume percentage allowed in the first k_front orders
+        g_min: minimum allowed growth ratio for i>=2 (vol[i]/vol[i-1])
+        g_max: maximum allowed growth ratio for i>=2
+
+    Returns:
+        (repaired_indent_pct, repaired_volume_pct, martingale_pct, needpct,
+         order_prices, price_step_pct, diagnostics)
+    """
+    M = int(len(volume_pct))
+    if M == 0:
+        return [], [], [], [], [], [], {
+            "clipped_frac": 0.0,
+            "front_excess_before": 0.0,
+            "front_excess_after": 0.0,
+            "tv_before": 0.0,
+            "tv_after": 0.0,
+            "l1_change": 0.0,
+            "band_clips": 0,
+        }
+
+    ind = np.asarray(indent_pct, dtype=np.float64).copy()
+    vol_in = np.asarray(volume_pct, dtype=np.float64).copy()
+
+    # Diagnostics baselines
+    def _total_variation(v: np.ndarray) -> float:
+        return float(np.sum(np.abs(np.diff(v)))) if v.size > 1 else 0.0
+
+    tv_before = _total_variation(vol_in)
+    front_sum_before = float(np.sum(vol_in[: min(k_front, M)]))
+
+    # Ensure first indent and first volume fixed
+    if M >= 1:
+        ind[0] = first_indent_target
+    vol = np.zeros(M, dtype=np.float64)
+    vol[0] = first_volume_target
+
+    # Compute input ratios g_i from provided volumes to guide repair
+    g_input = np.ones(M, dtype=np.float64)
+    for i in range(1, M):
+        if vol_in[i-1] > 1e-12:
+            g_input[i] = vol_in[i] / max(vol_in[i-1], 1e-12)
+        else:
+            g_input[i] = 1.0
+
+    # Apply hard constraints on ratios and rebuild volumes while keeping v0 fixed
+    band_clips = 0
+    for i in range(1, M):
+        if i == 1:
+            g = min(g_input[i], 1.0)  # second order must be <= 1.0 (<=100%)
+            if g < 0.0:
+                g = 0.0
+            if not np.isclose(g, g_input[i]):
+                band_clips += 1
+        else:
+            g = g_input[i]
+            if g < g_min:
+                g = g_min
+                band_clips += 1
+            elif g > g_max:
+                g = g_max
+                band_clips += 1
+        vol[i] = vol[i-1] * g
+
+    # Renormalize keeping vol[0] and vol[1] fixed exactly
+    if M > 1:
+        rest2_sum = float(np.sum(vol[2:]))
+        target_rest2 = max(0.0, 100.0 - vol[0] - vol[1])
+        if rest2_sum > 1e-12:
+            scale_rest2 = target_rest2 / rest2_sum
+            vol[2:] *= scale_rest2
+        else:
+            # Distribute remaining mass uniformly across 2..M-1
+            if M > 2:
+                vol[2:] = target_rest2 / (M - 2)
+            else:
+                # M == 2: assign remainder to v1 (cannot satisfy g2<=1 and sum=100 simultaneously)
+                vol[1] = target_rest2
+
+    # Enforce front cap while keeping vol[0] and vol[1] fixed when possible; scale indices 2..k_front-1
+    kf = min(k_front, M)
+    if kf >= 1:
+        target_front_sum = min(front_cap, 100.0)
+        if kf == 1:
+            # only v0 in front; nothing to scale. If over cap, cannot reduce v0; tail will handle sum.
+            pass
+        else:
+            front_sum = float(np.sum(vol[:kf]))
+            if front_sum > target_front_sum + 1e-12:
+                current_front_rest2 = float(np.sum(vol[2:kf])) if kf > 2 else 0.0
+                target_front_rest2 = max(0.0, target_front_sum - vol[0] - vol[1])
+                if current_front_rest2 > 1e-12:
+                    s_front2 = target_front_rest2 / current_front_rest2
+                    vol[2:kf] *= s_front2
+                # Now scale tail (kf..M-1) to keep total 100
+                tail_sum = float(np.sum(vol[kf:]))
+                needed_tail = max(0.0, 100.0 - (vol[0] + vol[1] + float(np.sum(vol[2:kf]))))
+                if tail_sum > 1e-12:
+                    s_tail = needed_tail / tail_sum
+                    vol[kf:] *= s_tail
+                else:
+                    # Push residual to last front component (prefer kf-1, but keep v0/v1 fixed)
+                    if kf > 2:
+                        vol[kf-1] = max(0.0, 100.0 - (vol[0] + vol[1] + float(np.sum(vol[2:kf-1]))))
+
+    # Final small normalization to correct rounding drift
+    total = float(np.sum(vol))
+    if total > 1e-9:
+        vol *= 100.0 / total
+
+    # Repair indents to be non-decreasing and anchored at first_indent_target
+    for i in range(1, len(ind)):
+        if ind[i] < ind[i-1]:
+            ind[i] = ind[i-1]
+
+    # Recompute martingale percentages from repaired volumes (no clamping)
+    mart = np.zeros(M, dtype=np.float64)
+    for i in range(1, M):
+        denom = max(vol[i-1], 1e-12)
+        mart[i] = (vol[i] / denom - 1.0) * 100.0
+
+    # Build indent cumulative (prepend 0)
+    indent_cum = np.concatenate([[0.0], ind.astype(np.float64)])
+
+    # Recompute order prices from base price and indents
+    order_prices = np.empty(M + 1, dtype=np.float64)
+    order_prices[0] = base_price
+    for i in range(1, M + 1):
+        order_prices[i] = base_price * (1.0 - indent_cum[i] / 100.0)
+
+    # Price steps
+    price_step_pct = np.diff(indent_cum)
+
+    # Recompute needpct
+    needpct = np.empty(M, dtype=np.float64)
+    vol_acc = 0.0
+    val_acc = 0.0
+    for i in range(M):
+        vol_acc += vol[i]
+        val_acc += vol[i] * order_prices[i + 1]
+        avg_price = val_acc / vol_acc if vol_acc > 1e-12 else base_price
+        needpct[i] = ((base_price - avg_price) / base_price) * 100.0
+
+    # Diagnostics
+    tv_after = _total_variation(vol)
+    front_sum_after = float(np.sum(vol[:kf]))
+    l1_change = float(np.sum(np.abs(vol - vol_in)))
+    clipped_frac = float(band_clips) / float(max(1, M - 1))
+
+    diagnostics = {
+        "clipped_frac": clipped_frac,
+        "band_clips": int(band_clips),
+        "front_excess_before": float(max(0.0, front_sum_before - front_cap)),
+        "front_excess_after": float(max(0.0, front_sum_after - front_cap)),
+        "tv_before": float(tv_before),
+        "tv_after": float(tv_after),
+        "l1_change": float(l1_change),
+    }
+
+    return (
+        ind.tolist(),
+        vol.tolist(),
+        mart.tolist(),
+        needpct.tolist(),
+        order_prices.tolist(),
+        price_step_pct.tolist(),
+        diagnostics,
+    )
