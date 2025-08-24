@@ -382,6 +382,17 @@ def penalty_total_variation_vol(volumes: np.ndarray) -> float:
     return tv
 
 
+@njit(cache=True, fastmath=True)
+def penalty_second_leq(volumes: np.ndarray) -> float:
+    n = volumes.size
+    if n <= 1:
+        return 0.0
+    v0 = volumes[0]
+    v1 = volumes[1]
+    excess = v1 - v0
+    return excess if excess > 0.0 else 0.0
+
+
 def compute_shape_penalties(volumes: np.ndarray, indents: np.ndarray,
                             first_volume_target: float, first_indent_target: float,
                             g_min: float, g_max: float,
@@ -389,6 +400,7 @@ def compute_shape_penalties(volumes: np.ndarray, indents: np.ndarray,
     """Compute shape-specific penalties after repair."""
     return {
         "penalty_first_fixed": penalty_first_fixed(volumes, indents, first_volume_target, first_indent_target),
+        "penalty_second_leq": penalty_second_leq(volumes),
         "penalty_g_band": penalty_g_band(volumes, g_min, g_max),
         "penalty_frontload": penalty_frontload(volumes, k_front, front_cap),
         "penalty_tv_vol": penalty_total_variation_vol(volumes),

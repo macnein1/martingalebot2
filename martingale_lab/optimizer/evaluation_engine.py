@@ -144,13 +144,14 @@ def evaluation_function(
     first_indent_target: float = 0.0,
     k_front: int = 3,
     front_cap: float = 5.0,
-    g_min: float = 0.95,
+    g_min: float = 1.01,
     g_max: float = 1.20,
     # New penalty weights
     w_fixed: float = 3.0,
     w_band: float = 2.0,
     w_front: float = 3.0,
     w_tv: float = 1.0,
+    w_sec: float = 3.0,
     **kwargs
 ) -> Dict[str, Any]:
     """
@@ -222,6 +223,8 @@ def evaluation_function(
         volume_pct_initial = vol_sample.copy()
         
         # Repair schedule shape and recompute derived arrays
+        g_min_post = 1.01
+        g_max_post = 1.30
         (indent_pct,
          volume_pct,
          martingale_pct,
@@ -238,6 +241,9 @@ def evaluation_function(
             front_cap,
             g_min,
             g_max,
+            g_min_post,
+            g_max_post,
+            True,
         )
         
         # Calculate core metrics from repaired arrays
@@ -337,6 +343,7 @@ def evaluation_function(
         # Weighted sum of shape penalties
         shape_penalty_sum = (
             w_fixed * shape_pens["penalty_first_fixed"] +
+            w_sec * shape_pens.get("penalty_second_leq", 0.0) +
             w_band * shape_pens["penalty_g_band"] +
             w_front * shape_pens["penalty_frontload"] +
             w_tv * shape_pens["penalty_tv_vol"]
@@ -347,7 +354,9 @@ def evaluation_function(
             f"REPAIR: clipped_frac={repair_diag.get('clipped_frac', 0):.4f} "
             f"front_excess_before={repair_diag.get('front_excess_before', 0):.4f} "
             f"front_excess_after={repair_diag.get('front_excess_after', 0):.4f} "
-            f"tv_before={repair_diag.get('tv_before', 0):.4f} tv_after={repair_diag.get('tv_after', 0):.4f}",
+            f"tv_before={repair_diag.get('tv_before', 0):.4f} tv_after={repair_diag.get('tv_after', 0):.4f} "
+            f"first3_sum={repair_diag.get('first3_sum', 0):.4f} g2={repair_diag.get('g2', 0):.4f} "
+            f"clip_hi_post={repair_diag.get('clip_hi_post', 0)} clip_lo_post={repair_diag.get('clip_lo_post', 0)}",
             extra={
                 "event": "REPAIR",
                 "clipped_frac": repair_diag.get("clipped_frac", 0.0),
@@ -355,15 +364,21 @@ def evaluation_function(
                 "front_excess_after": repair_diag.get("front_excess_after", 0.0),
                 "tv_before": repair_diag.get("tv_before", 0.0),
                 "tv_after": repair_diag.get("tv_after", 0.0),
+                "first3_sum": repair_diag.get("first3_sum", 0.0),
+                "g2": repair_diag.get("g2", 0.0),
+                "clip_hi_post": repair_diag.get("clip_hi_post", 0),
+                "clip_lo_post": repair_diag.get("clip_lo_post", 0),
             },
         )
         logger.info(
             f"PENALTIES: fixed={shape_pens['penalty_first_fixed']:.4f} "
+            f"second_leq={shape_pens.get('penalty_second_leq', 0.0):.4f} "
             f"gband={shape_pens['penalty_g_band']:.4f} front={shape_pens['penalty_frontload']:.4f} "
             f"tv={shape_pens['penalty_tv_vol']:.4f} sum={shape_penalty_sum:.4f}",
             extra={
                 "event": "PENALTIES",
                 "fixed": shape_pens["penalty_first_fixed"],
+                "second_leq": shape_pens.get("penalty_second_leq", 0.0),
                 "gband": shape_pens["penalty_g_band"],
                 "front": shape_pens["penalty_frontload"],
                 "tv": shape_pens["penalty_tv_vol"],

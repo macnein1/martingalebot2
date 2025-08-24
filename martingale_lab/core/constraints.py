@@ -7,6 +7,7 @@ from __future__ import annotations
 import numpy as np
 from numba import njit
 from typing import Dict, Any, Tuple
+from martingale_lab.core.repair import hard_clip_local_growth, isotonic_non_decreasing
 import math
 
 
@@ -499,8 +500,11 @@ def enforce_schedule_shape_fixed(
     first_indent_target: float = 0.0,
     k_front: int = 3,
     front_cap: float = 5.0,
-    g_min: float = 0.95,
+    g_min: float = 1.01,
     g_max: float = 1.20,
+    g_min_post: float = 1.01,
+    g_max_post: float = 1.30,
+    isotonic_tail: bool = True,
 ) -> Tuple[list, list, list, list, list, list, Dict[str, Any]]:
     """
     Enforce fixed-first-order and shaped martingale band on a schedule, then renormalize.
@@ -621,6 +625,38 @@ def enforce_schedule_shape_fixed(
     if total > 1e-9:
         vol *= 100.0 / total
 
+    # Post-normalize hard local band clip to eliminate jumps after normalization
+    #  - Keep v0 fixed, enforce v1 <= v0, clip i>=2 to [g_min_post, g_max_post]
+    vol_clipped, clip_stats = hard_clip_local_growth(vol, g_min_post, g_max_post)
+    # Renormalize with single scale for i>=2 while keeping v0 and v1 relation
+    if M > 1:
+        # Fix v0, v1 := min(v1, v0)
+        vol_clipped[0] = first_volume_target
+        vol_clipped[1] = min(vol_clipped[1], vol_clipped[0])
+        tail_sum = float(np.sum(vol_clipped[2:])) if M > 2 else 0.0
+        target_tail = max(0.0, 100.0 - vol_clipped[0] - vol_clipped[1])
+        if tail_sum > 1e-12:
+            s_tail = target_tail / tail_sum
+            vol_clipped[2:] *= s_tail
+        elif M > 2:
+            vol_clipped[2:] = target_tail / (M - 2)
+        else:
+            vol_clipped[1] = target_tail
+    else:
+        vol_clipped[0] = 100.0
+
+    # Optional isotonic smoothing on tail (i>=2) to guarantee monotonicity
+    if isotonic_tail and M > 2:
+        tail_iso = isotonic_non_decreasing(vol_clipped[2:])
+        # Scale tail back to preserve sum 100 with fixed v0,v1
+        target_tail = max(0.0, 100.0 - vol_clipped[0] - vol_clipped[1])
+        cur_tail = float(np.sum(tail_iso))
+        if cur_tail > 1e-12:
+            tail_iso *= target_tail / cur_tail
+        vol_clipped[2:] = tail_iso
+
+    vol = vol_clipped
+
     # Repair indents to be non-decreasing and anchored at first_indent_target
     for i in range(1, len(ind)):
         if ind[i] < ind[i-1]:
@@ -668,6 +704,10 @@ def enforce_schedule_shape_fixed(
         "tv_before": float(tv_before),
         "tv_after": float(tv_after),
         "l1_change": float(l1_change),
+        "clip_hi_post": int(clip_stats.get("hi", 0)),
+        "clip_lo_post": int(clip_stats.get("lo", 0)),
+        "first3_sum": float(np.sum(vol[: min(3, M)])),
+        "g2": float((vol[2] / max(vol[1], 1e-12)) if M > 2 else 0.0),
     }
 
     return (
