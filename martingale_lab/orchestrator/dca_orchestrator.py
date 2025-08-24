@@ -10,10 +10,13 @@ from dataclasses import dataclass
 from typing import Dict, List, Any, Optional, Tuple, Callable
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+from datetime import datetime
+import random
 
 from martingale_lab.optimizer.evaluation_engine import evaluation_function
 from martingale_lab.storage.experiments_store import ExperimentsStore
 from martingale_lab.storage.checkpoint_store import CheckpointStore
+from martingale_lab.utils.stable_id import make_stable_id
 from martingale_lab.utils.logging import (
     get_orchestrator_logger, BatchAggregator, log_with_context
 )
@@ -25,7 +28,7 @@ def _process_eval_worker(params: Dict[str, Any]) -> Dict[str, Any]:
     """Process-safe evaluation worker (top-level for pickling)."""
     try:
         result = evaluation_function(**params)
-        import hashlib, json
+        # Attach parameter subset for downstream logging/DB payload
         param_subset = {
             "base_price": params["base_price"],
             "overlap_pct": params["overlap_pct"],
@@ -36,12 +39,11 @@ def _process_eval_worker(params: Dict[str, Any]) -> Dict[str, Any]:
             "lambda_penalty": params["lambda_penalty"],
             "wave_pattern": params["wave_pattern"],
             "tail_cap": params["tail_cap"],
+            "min_indent_step": params.get("min_indent_step"),
+            "softmax_temp": params.get("softmax_temp"),
+            "seed": params.get("seed"),
         }
-        stable_id = hashlib.sha1(
-            json.dumps(param_subset, sort_keys=True).encode()
-        ).hexdigest()[:16]
         result["params"] = param_subset
-        result["stable_id"] = stable_id
         return result
     except Exception as e:
         return {
@@ -293,10 +295,7 @@ class DCAOrchestrator:
             else:
                 self.stats["evals_ok"] += 1
             
-            # Add parameter info and stable_id
-            import hashlib
-            import json
-            
+            # Attach parameter subset for downstream logging/DB payload
             param_subset = {
                 "base_price": params["base_price"],
                 "overlap_pct": params["overlap_pct"],
@@ -306,15 +305,12 @@ class DCAOrchestrator:
                 "gamma": params["gamma"],
                 "lambda_penalty": params["lambda_penalty"],
                 "wave_pattern": params["wave_pattern"],
-                "tail_cap": params["tail_cap"]
+                "tail_cap": params["tail_cap"],
+                "min_indent_step": params.get("min_indent_step"),
+                "softmax_temp": params.get("softmax_temp"),
+                "seed": params.get("seed"),
             }
-            
-            stable_id = hashlib.sha1(
-                json.dumps(param_subset, sort_keys=True).encode()
-            ).hexdigest()[:16]
-            
             result["params"] = param_subset
-            result["stable_id"] = stable_id
             
             return result
             
@@ -688,6 +684,18 @@ class DCAOrchestrator:
                 pre_prune_count = len(batch_results)
                 pruned_results = self.apply_pruning(batch_results, batch_idx)
                 post_prune_count = len(pruned_results)
+                # Pruning diagnostics for visibility
+                self.logger.info(
+                    f"PRUNE.COUNTS pre={pre_prune_count} post={post_prune_count}",
+                    extra={
+                        "event": "PRUNE.COUNTS",
+                        "run_id": self.run_id,
+                        "exp_id": self.current_experiment_id,
+                        "batch_idx": batch_idx,
+                        "pre_prune": pre_prune_count,
+                        "post_prune": post_prune_count,
+                    }
+                )
                 
                 # Update best candidates
                 self.update_best_candidates(pruned_results)
@@ -695,6 +703,85 @@ class DCAOrchestrator:
                 # Update kept_total counter
                 kept_in_this_batch = len(pruned_results)
                 self.kept_total += kept_in_this_batch
+
+                # Persist pruned results to database with deterministic stable_id
+                db_items: List[Dict[str, Any]] = []
+                for cand_idx, res in enumerate(pruned_results):
+                    params_info = res.get("params", {})
+                    payload = {
+                        "schedule": res.get("schedule", {}),
+                        "overlap": params_info.get("overlap_pct"),
+                        "orders": params_info.get("num_orders"),
+                        "alpha": params_info.get("alpha"),
+                        "beta": params_info.get("beta"),
+                        "gamma": params_info.get("gamma"),
+                        "lambda_penalty": params_info.get("lambda_penalty"),
+                        "wave_pattern": params_info.get("wave_pattern"),
+                        "tail_cap": params_info.get("tail_cap"),
+                        "min_indent_step": params_info.get("min_indent_step"),
+                        "softmax_temp": params_info.get("softmax_temp"),
+                        "seed": params_info.get("seed"),
+                        "candidate_uid": f"{self.run_id}:{batch_idx}:{cand_idx}",
+                    }
+                    sid = make_stable_id(payload, run_id=self.run_id, batch_idx=batch_idx, cand_idx=cand_idx)
+                    db_items.append({
+                        "stable_id": sid,
+                        "score": float(res.get("score", float("inf"))),
+                        "payload": payload,
+                        "sanity": res.get("sanity", {}),
+                        "diagnostics": res.get("diagnostics", {}),
+                        "penalties": res.get("penalties", {}),
+                        "created_at": datetime.now().isoformat(),
+                    })
+
+                rows_written = 0
+                if db_items:
+                    try:
+                        rows_written = self.store.upsert_results(self.current_experiment_id, db_items)
+                    except Exception as e:
+                        self.logger.error(
+                            f"DB upsert failed for batch {batch_idx}: {e}",
+                            extra={
+                                "event": "DB.UPSERT_ERROR",
+                                "run_id": self.run_id,
+                                "exp_id": self.current_experiment_id,
+                                "batch_idx": batch_idx,
+                                "error": str(e),
+                                "items": len(db_items),
+                            }
+                        )
+                        rows_written = 0
+
+                # Sampled debug for first 2 items
+                for sample_item in db_items[: min(2, len(db_items))]:
+                    if random.random() < 0.001:
+                        self.logger.debug(
+                            f"DB row sample sid={sample_item['stable_id']} score={sample_item['score']:.6f} overlap={sample_item['payload'].get('overlap')} orders={sample_item['payload'].get('orders')}",
+                            extra={
+                                "event": "DB.ROW_SAMPLE",
+                                "run_id": self.run_id,
+                                "exp_id": self.current_experiment_id,
+                                "batch_idx": batch_idx,
+                                "stable_id": sample_item["stable_id"],
+                                "score": sample_item["score"],
+                                "overlap": sample_item["payload"].get("overlap"),
+                                "orders": sample_item["payload"].get("orders"),
+                            }
+                        )
+
+                # Log batch DB write summary
+                self.logger.info(
+                    f"DB wrote rows={rows_written} kept_batch={kept_in_this_batch} kept_total={self.kept_total}",
+                    extra={
+                        "event": "DB.BATCH_WRITE",
+                        "run_id": self.run_id,
+                        "exp_id": self.current_experiment_id,
+                        "batch_idx": batch_idx,
+                        "db_rows_written": rows_written,
+                        "kept_batch": kept_in_this_batch,
+                        "kept_total": self.kept_total,
+                    }
+                )
                 
                 # Update statistics
                 batch_time = time.time() - batch_start
