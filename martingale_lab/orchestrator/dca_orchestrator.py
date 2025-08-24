@@ -684,6 +684,18 @@ class DCAOrchestrator:
                 pre_prune_count = len(batch_results)
                 pruned_results = self.apply_pruning(batch_results, batch_idx)
                 post_prune_count = len(pruned_results)
+                # Pruning diagnostics for visibility
+                self.logger.info(
+                    f"PRUNE.COUNTS pre={pre_prune_count} post={post_prune_count}",
+                    extra={
+                        "event": "PRUNE.COUNTS",
+                        "run_id": self.run_id,
+                        "exp_id": self.current_experiment_id,
+                        "batch_idx": batch_idx,
+                        "pre_prune": pre_prune_count,
+                        "post_prune": post_prune_count,
+                    }
+                )
                 
                 # Update best candidates
                 self.update_best_candidates(pruned_results)

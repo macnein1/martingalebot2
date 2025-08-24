@@ -446,9 +446,15 @@ class ExperimentsStore:
         try:
             with self._connect() as con:
                 cur = con.cursor()
+                # Use total_changes delta for reliable affected count across executemany
+                before_total = con.total_changes
                 cur.executemany(sql, rows)
                 con.commit()
-                affected = cur.rowcount
+                affected = con.total_changes - before_total
+                logger.info(
+                    f"UPSERT rows={affected} exp_id={experiment_id}",
+                    extra={"event": "mlab.db.upsert", "exp_id": experiment_id, "rows": int(affected)}
+                )
                 if affected == 0:
                     logger.warning(
                         f"No rows affected by upsert for experiment {experiment_id}",
