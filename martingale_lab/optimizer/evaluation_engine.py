@@ -12,6 +12,8 @@ from typing import Dict, Any, List, Optional, Tuple
 import math
 
 from martingale_lab.utils.logging import get_eval_logger, should_log_eval
+from martingale_lab.core.constraints import enforce_schedule_shape_fixed
+from martingale_lab.core.penalties import compute_shape_penalties
 
 # Use the new centralized logging system
 logger = get_eval_logger()
@@ -137,6 +139,18 @@ def evaluation_function(
     tail_cap: float = 0.40,
     min_indent_step: float = 0.05,
     softmax_temp: float = 1.0,
+    # New shape-enforcement parameters
+    first_volume_target: float = 0.01,
+    first_indent_target: float = 0.0,
+    k_front: int = 3,
+    front_cap: float = 5.0,
+    g_min: float = 0.95,
+    g_max: float = 1.20,
+    # New penalty weights
+    w_fixed: float = 3.0,
+    w_band: float = 2.0,
+    w_front: float = 3.0,
+    w_tv: float = 1.0,
     **kwargs
 ) -> Dict[str, Any]:
     """
@@ -167,6 +181,7 @@ def evaluation_function(
         # Generate random parameters
         rng = np.random.default_rng(seed)
         raw_indents = rng.normal(0.0, 1.0, size=num_orders)
+        # raw_volumes kept for backward-compat logging but we will use monotone sampler
         raw_volumes = rng.normal(0.0, 1.0, size=num_orders)
         
         # 1. Build indent_pct with monotonic increasing steps
@@ -180,134 +195,184 @@ def evaluation_function(
         
         # Cumulative indents: [p0=0, p1, p2, ..., pM]
         indent_cumulative = np.concatenate([[0.0], np.cumsum(steps)]) * 100.0
-        indent_pct = indent_cumulative[1:].tolist()  # [p1, p2, ..., pM] for output
+        indent_pct_initial = indent_cumulative[1:].tolist()
         
-        # 2. Build volume_pct using softmax (sums to 100)
-        volume_raw = _softmax(raw_volumes, softmax_temp)
-        volume_pct = volume_raw * 100.0
+        # 2. Monotone-biased volume sampling with fixed first order
+        #    v0 fixed, v1 <= v0, for i>=2 sample g_i ~ N(1.05, 0.05) then clip to [g_min, g_max]
+        vol_sample = np.zeros(num_orders, dtype=np.float64)
+        vol_sample[0] = first_volume_target
+        # sample g1 around 0.95, cap at 1.0 and non-negative
+        g1 = float(min(1.0, max(0.0, rng.normal(0.95, 0.03)))) if num_orders >= 2 else 0.0
+        if num_orders >= 2:
+            vol_sample[1] = vol_sample[0] * g1
+        for i in range(2, num_orders):
+            gi = float(rng.normal(1.05, 0.05))
+            gi = min(g_max, max(g_min, gi))
+            vol_sample[i] = vol_sample[i-1] * gi
+        # Normalize keeping v0 fixed
+        if num_orders > 1:
+            rest_sum = float(np.sum(vol_sample[1:]))
+            if rest_sum > 1e-12:
+                scale_rest = (100.0 - vol_sample[0]) / rest_sum
+                vol_sample[1:] *= scale_rest
+            else:
+                vol_sample[1:] = (100.0 - vol_sample[0]) / (num_orders - 1)
+        else:
+            vol_sample[0] = 100.0
+        volume_pct_initial = vol_sample.copy()
         
-        # Apply tail cap constraint
-        if volume_pct[-1] > tail_cap * 100.0:
-            excess = volume_pct[-1] - tail_cap * 100.0
-            volume_pct[-1] = tail_cap * 100.0
-            if num_orders > 1:
-                other_sum = np.sum(volume_pct[:-1])
-                if other_sum > 1e-9:
-                    volume_pct[:-1] += volume_pct[:-1] * (excess / other_sum)
+        # Repair schedule shape and recompute derived arrays
+        (indent_pct,
+         volume_pct,
+         martingale_pct,
+         needpct,
+         order_prices,
+         price_step_pct,
+         repair_diag) = enforce_schedule_shape_fixed(
+            indent_pct_initial,
+            volume_pct_initial.tolist(),
+            base_price,
+            first_volume_target,
+            first_indent_target,
+            k_front,
+            front_cap,
+            g_min,
+            g_max,
+        )
         
-        # 3. Build martingale_pct (m1=0, m2...mM calculated)
-        martingale_pct = np.zeros(num_orders)
-        for i in range(1, num_orders):
-            if volume_pct[i-1] > 1e-12:
-                ratio = volume_pct[i] / volume_pct[i-1]
-                martingale_pct[i] = max(1.0, min(100.0, (ratio - 1.0) * 100.0))
+        # Calculate core metrics from repaired arrays
+        max_need = float(np.max(needpct)) if len(needpct) > 0 else 0.0
+        var_need = float(np.var(needpct)) if len(needpct) > 0 else 0.0
         
-        # 4. Calculate order prices
-        order_prices = np.empty(num_orders + 1)
-        order_prices[0] = base_price  # Base price
-        for i in range(1, num_orders + 1):
-            order_prices[i] = base_price * (1.0 - indent_cumulative[i] / 100.0)
-        
-        # 5. Calculate price step percentages
-        price_step_pct = np.diff(indent_cumulative).tolist()
-        
-        # 6. Calculate NeedPct sequence using exact formula from README
-        needpct = np.empty(num_orders)
-        vol_acc = 0.0
-        val_acc = 0.0
-        
-        for i in range(num_orders):
-            vol_acc += volume_pct[i]
-            val_acc += volume_pct[i] * order_prices[i + 1]
-            avg_price = val_acc / vol_acc if vol_acc > 1e-12 else base_price
-            needpct[i] = ((base_price - avg_price) / base_price) * 100.0
-        
-        # Calculate core metrics
-        max_need = float(np.max(needpct))
-        var_need = float(np.var(needpct))
-        
-        # Tail calculation (last 20% of orders)
+        # Tail calculation (last 20% of orders) from repaired volumes
         tail_start = max(0, int(0.8 * num_orders))
-        tail = float(np.sum(volume_pct[tail_start:]) / 100.0)
+        tail = float(np.sum(np.asarray(volume_pct)[tail_start:]) / 100.0)
         
-        # Build schedule dict with all required fields
+        # Build schedule dict with all required fields (repaired)
         schedule = {
             "indent_pct": _ensure_json_serializable(indent_pct),
-            "volume_pct": _ensure_json_serializable(volume_pct.tolist()),
-            "martingale_pct": _ensure_json_serializable(martingale_pct.tolist()),
-            "needpct": _ensure_json_serializable(needpct.tolist()),
-            "order_prices": _ensure_json_serializable(order_prices.tolist()),
-            "price_step_pct": _ensure_json_serializable(price_step_pct)
+            "volume_pct": _ensure_json_serializable(volume_pct),
+            "martingale_pct": _ensure_json_serializable(martingale_pct),
+            "needpct": _ensure_json_serializable(needpct),
+            "order_prices": _ensure_json_serializable(order_prices),
+            "price_step_pct": _ensure_json_serializable(price_step_pct),
         }
         
-        # Calculate sanity checks
-        calculated_max_need = float(np.max(needpct))
+        # Calculate sanity checks on repaired arrays
+        calculated_max_need = float(np.max(needpct)) if len(needpct) > 0 else 0.0
+        collapse_indents = False
+        if len(indent_pct) > 1:
+            diff_ind = np.diff(np.asarray([0.0] + indent_pct))
+            collapse_indents = bool(np.any(diff_ind < min_indent_step))
         sanity = {
             "max_need_mismatch": bool(abs(max_need - calculated_max_need) > 1e-6),
-            "collapse_indents": bool(np.any(np.diff(indent_cumulative[1:]) < min_indent_step)),
-            "tail_overflow": bool(volume_pct[-1] > tail_cap * 100.0)
+            "collapse_indents": collapse_indents,
+            "tail_overflow": bool((len(volume_pct) > 0) and (volume_pct[-1] > tail_cap * 100.0)),
         }
         
-        # Calculate diagnostics
+        # Diagnostics (repaired)
+        volume_pct_np = np.asarray(volume_pct, dtype=np.float64)
         diagnostics = {
-            "wci": float(_weight_center_index(volume_pct)),
-            "sign_flips": int(_count_sign_flips(needpct)),
-            "gini": float(_gini_coefficient(volume_pct / 100.0)),
-            "entropy": float(_entropy_normalized(volume_pct))
+            "wci": float(_weight_center_index(volume_pct_np)),
+            "sign_flips": int(_count_sign_flips(np.asarray(needpct, dtype=np.float64))),
+            "gini": float(_gini_coefficient(volume_pct_np / 100.0)),
+            "entropy": float(_entropy_normalized(volume_pct_np)),
+            # Repair diagnostics for batch aggregation
+            "repair_clipped_frac": float(repair_diag.get("clipped_frac", 0.0)),
+            "repair_front_excess_before": float(repair_diag.get("front_excess_before", 0.0)),
+            "repair_front_excess_after": float(repair_diag.get("front_excess_after", 0.0)),
+            "repair_tv_before": float(repair_diag.get("tv_before", 0.0)),
+            "repair_tv_after": float(repair_diag.get("tv_after", 0.0)),
         }
         
-        # Calculate all penalties (always present, even if zero)
-        penalties = {}
-        
-        # P_gini: Volume concentration penalty
-        penalties["P_gini"] = float(_gini_coefficient(volume_pct / 100.0))
-        
-        # P_entropy: Low diversity penalty
-        penalties["P_entropy"] = float(max(0.0, 1.0 - _entropy_normalized(volume_pct)))
-        
-        # P_monotone: Non-monotonic indent penalty
-        monotone_violations = np.sum(np.maximum(0, -np.diff(indent_cumulative[1:])))
+        # Penalties
+        penalties: Dict[str, float] = {}
+        penalties["P_gini"] = float(_gini_coefficient(volume_pct_np / 100.0))
+        penalties["P_entropy"] = float(max(0.0, 1.0 - _entropy_normalized(volume_pct_np)))
+        # Indent monotonicity penalty (using repaired indent cumulative)
+        indent_cumulative_repaired = np.asarray([0.0] + indent_pct, dtype=np.float64)
+        monotone_violations = float(np.sum(np.maximum(0, -np.diff(indent_cumulative_repaired[1:])))) if len(indent_pct) > 1 else 0.0
         penalties["P_monotone"] = float(monotone_violations)
-        
-        # P_smooth: Price step smoothness penalty
+        # Price step smoothness
         if len(price_step_pct) > 1:
-            step_var = np.var(price_step_pct)
-            penalties["P_smooth"] = float(step_var / 100.0)  # Normalize
+            penalties["P_smooth"] = float(np.var(np.asarray(price_step_pct)) / 100.0)
         else:
             penalties["P_smooth"] = 0.0
-        
-        # P_tailcap: Tail cap violation penalty
-        if volume_pct[-1] > tail_cap * 100.0:
+        # Tailcap penalty
+        if len(volume_pct) > 0 and volume_pct[-1] > tail_cap * 100.0:
             penalties["P_tailcap"] = float((volume_pct[-1] - tail_cap * 100.0) / (tail_cap * 100.0))
         else:
             penalties["P_tailcap"] = 0.0
-        
-        # P_need_mismatch: Sanity check penalty
         penalties["P_need_mismatch"] = float(1.0 if sanity["max_need_mismatch"] else 0.0)
         
-        # P_wave: Wave pattern penalty/reward
+        # Wave pattern penalty/reward (on repaired martingale_pct)
         wave_score = 0.0
         if wave_pattern and len(martingale_pct) > 2:
             for i in range(2, len(martingale_pct)):
                 prev_mart = martingale_pct[i-1]
                 curr_mart = martingale_pct[i]
-                
-                # Reward alternating patterns
                 if prev_mart >= wave_strong_threshold and curr_mart <= wave_weak_threshold:
                     wave_score += 0.1
                 elif prev_mart <= wave_weak_threshold and curr_mart >= wave_strong_threshold:
                     wave_score += 0.1
-                
-                # Penalty for consecutive patterns
                 if prev_mart >= wave_strong_threshold and curr_mart >= wave_strong_threshold:
                     wave_score -= 0.2
                 elif prev_mart <= wave_weak_threshold and curr_mart <= wave_weak_threshold:
                     wave_score -= 0.2
+        penalties["P_wave"] = float(max(0.0, -wave_score))
         
-        penalties["P_wave"] = float(max(0.0, -wave_score))  # Convert negative reward to penalty
+        # New shape penalties after repair
+        shape_pens = compute_shape_penalties(
+            np.asarray(volume_pct, dtype=np.float64),
+            np.asarray(indent_pct, dtype=np.float64),
+            first_volume_target,
+            first_indent_target,
+            g_min,
+            g_max,
+            k_front,
+            front_cap,
+        )
+        penalties.update(shape_pens)
         
-        # Calculate final score using exact README formula: J = α·max_need + β·var_need + γ·tail + λ·Σ(penalties)
-        penalty_sum = sum(penalties.values())
+        # Weighted sum of shape penalties
+        shape_penalty_sum = (
+            w_fixed * shape_pens["penalty_first_fixed"] +
+            w_band * shape_pens["penalty_g_band"] +
+            w_front * shape_pens["penalty_frontload"] +
+            w_tv * shape_pens["penalty_tv_vol"]
+        )
+        
+        # Log repair diagnostics and penalties (INFO)
+        logger.info(
+            f"REPAIR: clipped_frac={repair_diag.get('clipped_frac', 0):.4f} "
+            f"front_excess_before={repair_diag.get('front_excess_before', 0):.4f} "
+            f"front_excess_after={repair_diag.get('front_excess_after', 0):.4f} "
+            f"tv_before={repair_diag.get('tv_before', 0):.4f} tv_after={repair_diag.get('tv_after', 0):.4f}",
+            extra={
+                "event": "REPAIR",
+                "clipped_frac": repair_diag.get("clipped_frac", 0.0),
+                "front_excess_before": repair_diag.get("front_excess_before", 0.0),
+                "front_excess_after": repair_diag.get("front_excess_after", 0.0),
+                "tv_before": repair_diag.get("tv_before", 0.0),
+                "tv_after": repair_diag.get("tv_after", 0.0),
+            },
+        )
+        logger.info(
+            f"PENALTIES: fixed={shape_pens['penalty_first_fixed']:.4f} "
+            f"gband={shape_pens['penalty_g_band']:.4f} front={shape_pens['penalty_frontload']:.4f} "
+            f"tv={shape_pens['penalty_tv_vol']:.4f} sum={shape_penalty_sum:.4f}",
+            extra={
+                "event": "PENALTIES",
+                "fixed": shape_pens["penalty_first_fixed"],
+                "gband": shape_pens["penalty_g_band"],
+                "front": shape_pens["penalty_frontload"],
+                "tv": shape_pens["penalty_tv_vol"],
+                "sum": shape_penalty_sum,
+            },
+        )
+        
+        # Final score
+        penalty_sum = sum(penalties.values()) + shape_penalty_sum
         score = alpha * max_need + beta * var_need + gamma * tail + lambda_penalty * penalty_sum
         
         # Log successful evaluation only if sampling allows it
@@ -325,8 +390,8 @@ def evaluation_function(
                     "penalty_sum": penalty_sum,
                     "sanity_violations": sum(1 for v in sanity.values() if v),
                     "overlap": overlap_pct,
-                    "orders": num_orders
-                }
+                    "orders": num_orders,
+                },
             )
         
         # Return complete dict exactly as specified in README
@@ -339,7 +404,7 @@ def evaluation_function(
             "schedule": schedule,
             "sanity": sanity,
             "diagnostics": diagnostics,
-            "penalties": penalties
+            "penalties": penalties,
         }
         
     except Exception as e:
