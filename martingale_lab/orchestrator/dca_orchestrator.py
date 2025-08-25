@@ -42,6 +42,30 @@ def _process_eval_worker(params: Dict[str, Any]) -> Dict[str, Any]:
             "min_indent_step": params.get("min_indent_step"),
             "softmax_temp": params.get("softmax_temp"),
             "seed": params.get("seed"),
+            # Generation controls
+            "wave_mode": params.get("wave_mode"),
+            "anchors": params.get("anchors"),
+            "blocks": params.get("blocks"),
+            "wave_amp_min": params.get("wave_amp_min"),
+            "wave_amp_max": params.get("wave_amp_max"),
+            # Hard constraints and bands
+            "first_volume_target": params.get("first_volume_target"),
+            "first_indent_target": params.get("first_indent_target"),
+            "k_front": params.get("k_front"),
+            "front_cap": params.get("front_cap"),
+            "g_min": params.get("g_min"),
+            "g_max": params.get("g_max"),
+            "g_min_post": params.get("g_min_post"),
+            "g_max_post": params.get("g_max_post"),
+            "isotonic_tail": params.get("isotonic_tail"),
+            # Penalty weights/preset
+            "penalty_preset": params.get("penalty_preset"),
+            "w_fixed": params.get("w_fixed"),
+            "w_sec": params.get("w_sec"),
+            "w_band": params.get("w_band"),
+            "w_front": params.get("w_front"),
+            "w_tv": params.get("w_tv"),
+            "w_wave": params.get("w_wave"),
         }
         result["params"] = param_subset
         return result
@@ -162,6 +186,33 @@ class DCAConfig:
     tail_cap: float = 0.40
     min_indent_step: float = 0.05
     softmax_temp: float = 1.0
+
+    # Generation controls
+    wave_mode: str = "anchors"  # [anchors, blocks]
+    anchors: int = 6
+    blocks: int = 3
+    wave_amp_min: float = 0.05
+    wave_amp_max: float = 0.30
+
+    # Hard constraint parameters
+    first_volume: float = 0.01
+    first_indent: float = 0.0
+    g_pre_min: float = 1.01
+    g_pre_max: float = 1.20
+    g_post_min: float = 1.01
+    g_post_max: float = 1.30
+    front_cap: float = 5.0
+    k_front: int = 3
+    isotonic_tail: bool = False
+
+    # Penalty weight preset and overrides
+    penalty_preset: Optional[str] = None
+    w_fixed: float = 3.0
+    w_second: float = 3.0
+    w_gband: float = 2.0
+    w_front: float = 3.0
+    w_tv: float = 1.0
+    w_wave: float = 1.0
     
     # Early stopping
     early_stop_threshold: float = 1e-6  # Stop if improvement < threshold
@@ -276,7 +327,31 @@ class DCAOrchestrator:
                 "wave_weak_threshold": self.config.wave_weak_threshold,
                 "tail_cap": self.config.tail_cap,
                 "min_indent_step": self.config.min_indent_step,
-                "softmax_temp": self.config.softmax_temp
+                "softmax_temp": self.config.softmax_temp,
+                # Generation controls
+                "wave_mode": self.config.wave_mode,
+                "anchors": self.config.anchors,
+                "blocks": self.config.blocks,
+                "wave_amp_min": self.config.wave_amp_min,
+                "wave_amp_max": self.config.wave_amp_max,
+                # Hard constraints and bands
+                "first_volume_target": self.config.first_volume,
+                "first_indent_target": self.config.first_indent,
+                "k_front": self.config.k_front,
+                "front_cap": self.config.front_cap,
+                "g_min": self.config.g_pre_min,
+                "g_max": self.config.g_pre_max,
+                "g_min_post": self.config.g_post_min,
+                "g_max_post": self.config.g_post_max,
+                "isotonic_tail": self.config.isotonic_tail,
+                # Penalty weights/preset
+                "penalty_preset": self.config.penalty_preset,
+                "w_fixed": self.config.w_fixed,
+                "w_sec": self.config.w_second,
+                "w_band": self.config.w_gband,
+                "w_front": self.config.w_front,
+                "w_tv": self.config.w_tv,
+                "w_wave": self.config.w_wave,
             }
             parameters.append(params)
         
@@ -309,6 +384,30 @@ class DCAOrchestrator:
                 "min_indent_step": params.get("min_indent_step"),
                 "softmax_temp": params.get("softmax_temp"),
                 "seed": params.get("seed"),
+                # Generation controls
+                "wave_mode": params.get("wave_mode"),
+                "anchors": params.get("anchors"),
+                "blocks": params.get("blocks"),
+                "wave_amp_min": params.get("wave_amp_min"),
+                "wave_amp_max": params.get("wave_amp_max"),
+                # Hard constraints and bands
+                "first_volume_target": params.get("first_volume_target"),
+                "first_indent_target": params.get("first_indent_target"),
+                "k_front": params.get("k_front"),
+                "front_cap": params.get("front_cap"),
+                "g_min": params.get("g_min"),
+                "g_max": params.get("g_max"),
+                "g_min_post": params.get("g_min_post"),
+                "g_max_post": params.get("g_max_post"),
+                "isotonic_tail": params.get("isotonic_tail"),
+                # Penalty weights/preset
+                "penalty_preset": params.get("penalty_preset"),
+                "w_fixed": params.get("w_fixed"),
+                "w_sec": params.get("w_sec"),
+                "w_band": params.get("w_band"),
+                "w_front": params.get("w_front"),
+                "w_tv": params.get("w_tv"),
+                "w_wave": params.get("w_wave"),
             }
             result["params"] = param_subset
             
@@ -723,15 +822,17 @@ class DCAOrchestrator:
                         "seed": params_info.get("seed"),
                         "candidate_uid": f"{self.run_id}:{batch_idx}:{cand_idx}",
                         "param_repr": {
-                            "mode": res.get("diagnostics", {}).get("wave_mode", "anchors"),
+                            "mode": params_info.get("wave_mode", res.get("diagnostics", {}).get("wave_mode", "anchors")),
                             "orders": params_info.get("num_orders"),
-                            "anchors": res.get("diagnostics", {}).get("anchors", None),
-                            "blocks": res.get("diagnostics", {}).get("blocks", None),
-                            "g_pre_band": [1.01, 1.20],
-                            "g_post_band": [1.01, 1.30],
-                            "front_cap": 5.0,
-                            "k_front": 3,
-                            "isotonic_tail": res.get("diagnostics", {}).get("isotonic_applied", False)
+                            "anchors": params_info.get("anchors", res.get("diagnostics", {}).get("anchors", None)),
+                            "blocks": params_info.get("blocks", res.get("diagnostics", {}).get("blocks", None)),
+                            "anchor_points": res.get("diagnostics", {}).get("anchor_points"),
+                            "anchor_logv": res.get("diagnostics", {}).get("anchor_logv"),
+                            "g_pre_band": [params_info.get("g_min", 1.01), params_info.get("g_max", 1.20)],
+                            "g_post_band": [params_info.get("g_min_post", 1.01), params_info.get("g_max_post", 1.30)],
+                            "front_cap": params_info.get("front_cap", 5.0),
+                            "k_front": params_info.get("k_front", 3),
+                            "isotonic_tail": bool(params_info.get("isotonic_tail", False))
                         }
                     }
                     sid = make_stable_id(payload, run_id=self.run_id, batch_idx=batch_idx, cand_idx=cand_idx)

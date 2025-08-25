@@ -19,6 +19,35 @@ from martingale_lab.core.penalties import compute_shape_penalties
 logger = get_eval_logger()
 
 
+# Penalty weight presets
+PRESET_WEIGHTS = {
+    "explore": {
+        "w_fixed": 2.0,
+        "w_second": 2.0,
+        "w_gband": 1.5,
+        "w_front": 2.0,
+        "w_tv": 0.5,
+        "w_wave": 0.5
+    },
+    "robust": {
+        "w_fixed": 3.0,
+        "w_second": 3.0,
+        "w_gband": 2.5,
+        "w_front": 3.0,
+        "w_tv": 1.5,
+        "w_wave": 1.0
+    },
+    "tight": {
+        "w_fixed": 4.0,
+        "w_second": 4.0,
+        "w_gband": 3.0,
+        "w_front": 4.0,
+        "w_tv": 2.0,
+        "w_wave": 1.5
+    }
+}
+
+
 def batch_evaluate(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Vectorized batch evaluation skeleton. Currently falls back to per-item eval."""
     if not candidates:
@@ -125,7 +154,7 @@ def _count_sign_flips(needpct: np.ndarray) -> int:
 
 
 def _interp_from_anchors(num_orders: int, anchors: int, rng: np.random.Generator,
-                         v0: float, g1_max: float) -> np.ndarray:
+                         v0: float, g1_max: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     # t in [0,1] at order indices
     t = np.linspace(0.0, 1.0, num_orders)
     # choose anchor positions uniformly in t-space excluding first 2 indices
@@ -157,11 +186,11 @@ def _interp_from_anchors(num_orders: int, anchors: int, rng: np.random.Generator
             w = (i - i0) / max(1, (i1 - i0))
             vi = (1 - w) * vals[left] + w * vals[right]
         v[i] = max(1e-6, vi)
-    return v
+    return v, anchor_idx.astype(np.int64), logv
 
 
 def _wave_blocks(num_orders: int, blocks: int, rng: np.random.Generator,
-                 v0: float) -> np.ndarray:
+                 v0: float, amp_min: float, amp_max: float) -> np.ndarray:
     v = np.zeros(num_orders, dtype=np.float64)
     v[0] = v0
     if num_orders >= 2:
@@ -176,7 +205,7 @@ def _wave_blocks(num_orders: int, blocks: int, rng: np.random.Generator,
     while i < num_orders:
         this_len = min(blk_len, num_orders - i)
         g_base = max(1.01, min(1.20, rng.normal(1.06, 0.03)))
-        amp = max(0.0, min(0.30, rng.uniform(0.05, 0.25)))
+        amp = max(0.0, min(1.0, rng.uniform(amp_min, amp_max)))
         phase = rng.uniform(0.0, np.pi)
         for k in range(this_len):
             t = k / max(1, this_len - 1)
@@ -224,6 +253,14 @@ def evaluation_function(
     wave_mode: str = "anchors",  # [anchors, blocks]
     anchors: int = 6,
     blocks: int = 3,
+    wave_amp_min: float = 0.05,
+    wave_amp_max: float = 0.30,
+    # Post-band controls and isotonic smoothing
+    g_min_post: float = 1.01,
+    g_max_post: float = 1.30,
+    isotonic_tail: bool = False,
+    # Penalty weight preset
+    penalty_preset: Optional[str] = None,
     **kwargs
 ) -> Dict[str, Any]:
     """
@@ -269,10 +306,18 @@ def evaluation_function(
 
         # 2. Volume generation (anchors/blocks) with v0 fixed and v1<=v0
         vol_sample = np.zeros(num_orders, dtype=np.float64)
+        anchor_points_norm = None
+        anchor_logv = None
         if wave_mode == "blocks":
-            vol_sample = _wave_blocks(num_orders, blocks, rng, first_volume_target)
+            vol_sample = _wave_blocks(num_orders, blocks, rng, first_volume_target, wave_amp_min, wave_amp_max)
         else:
-            vol_sample = _interp_from_anchors(num_orders, max(4, min(anchors, 8)), rng, first_volume_target, 1.0)
+            vol_sample, anchor_idx, logv = _interp_from_anchors(num_orders, max(4, min(anchors, 8)), rng, first_volume_target, 1.0)
+            # Normalize anchor indices to t-space [0,1]
+            if num_orders > 1:
+                anchor_points_norm = anchor_idx.astype(np.float64) / float(num_orders - 1)
+            else:
+                anchor_points_norm = anchor_idx.astype(np.float64)
+            anchor_logv = logv
 
         # Ensure minimal pre-band (clip ratios for i>=2) and build monotone-biased raw chain
         for i in range(2, num_orders):
@@ -293,9 +338,19 @@ def evaluation_function(
             vol_sample[0] = 100.0
         volume_pct_initial = vol_sample.copy()
 
-        # Repair and evaluate as before...
-        g_min_post = 1.01
-        g_max_post = 1.30
+        # Optional preset overrides for penalty weights
+        if penalty_preset:
+            pp = (penalty_preset or "").lower()
+            if pp == "explore":
+                w_fixed_local = 2.0; w_sec_local = 2.0; w_band_local = 1.5; w_front_local = 2.0; w_tv_local = 0.5; w_wave_local = 0.5
+            elif pp == "robust":
+                w_fixed_local = 3.0; w_sec_local = 3.0; w_band_local = 2.5; w_front_local = 3.0; w_tv_local = 1.5; w_wave_local = 1.0
+            elif pp == "tight":
+                w_fixed_local = 4.0; w_sec_local = 4.0; w_band_local = 3.0; w_front_local = 4.0; w_tv_local = 2.0; w_wave_local = 1.5
+            else:
+                w_fixed_local = w_fixed; w_sec_local = w_sec; w_band_local = w_band; w_front_local = w_front; w_tv_local = w_tv; w_wave_local = w_wave
+        else:
+            w_fixed_local = w_fixed; w_sec_local = w_sec; w_band_local = w_band; w_front_local = w_front; w_tv_local = w_tv; w_wave_local = w_wave
         (indent_pct,
          volume_pct,
          martingale_pct,
@@ -314,7 +369,7 @@ def evaluation_function(
             g_max,
             g_min_post,
             g_max_post,
-            wave_mode != "anchors" and False,
+            isotonic_tail,
         )
         
         # Calculate core metrics from repaired arrays
@@ -364,8 +419,12 @@ def evaluation_function(
             "wave_mode": wave_mode,
             "anchors": int(anchors) if wave_mode == "anchors" else None,
             "blocks": int(blocks) if wave_mode == "blocks" else None,
-            "isotonic_applied": bool(wave_mode != "anchors" and False),
+            "isotonic_applied": bool(isotonic_tail),
         }
+        if anchor_points_norm is not None:
+            diagnostics["anchor_points"] = anchor_points_norm.tolist()
+        if anchor_logv is not None:
+            diagnostics["anchor_logv"] = _ensure_json_serializable(anchor_logv)
         
         # Penalties
         penalties: Dict[str, float] = {}
@@ -418,12 +477,12 @@ def evaluation_function(
         
         # Weighted sum of shape penalties
         shape_penalty_sum = (
-            w_fixed * shape_pens["penalty_first_fixed"] +
-            w_sec * shape_pens.get("penalty_second_leq", 0.0) +
-            w_band * shape_pens["penalty_g_band"] +
-            w_front * shape_pens["penalty_frontload"] +
-            w_tv * shape_pens["penalty_tv_vol"] +
-            w_wave * shape_pens.get("penalty_wave", 0.0)
+            w_fixed_local * shape_pens["penalty_first_fixed"] +
+            w_sec_local * shape_pens.get("penalty_second_leq", 0.0) +
+            w_band_local * shape_pens["penalty_g_band"] +
+            w_front_local * shape_pens["penalty_frontload"] +
+            w_tv_local * shape_pens["penalty_tv_vol"] +
+            w_wave_local * shape_pens.get("penalty_wave", 0.0)
         )
         
         # Log repair diagnostics and penalties (INFO)
@@ -451,7 +510,7 @@ def evaluation_function(
             f"PENALTIES: fixed={shape_pens['penalty_first_fixed']:.4f} "
             f"second_leq={shape_pens.get('penalty_second_leq', 0.0):.4f} "
             f"gband={shape_pens['penalty_g_band']:.4f} front={shape_pens['penalty_frontload']:.4f} "
-            f"tv={shape_pens['penalty_tv_vol']:.4f} sum={shape_penalty_sum:.4f}",
+            f"tv={shape_pens['penalty_tv_vol']:.4f} wave={shape_pens.get('penalty_wave', 0.0):.4f} sum={shape_penalty_sum:.4f}",
             extra={
                 "event": "PENALTIES",
                 "fixed": shape_pens["penalty_first_fixed"],
@@ -459,6 +518,7 @@ def evaluation_function(
                 "gband": shape_pens["penalty_g_band"],
                 "front": shape_pens["penalty_frontload"],
                 "tv": shape_pens["penalty_tv_vol"],
+                "wave": shape_pens.get("penalty_wave", 0.0),
                 "sum": shape_penalty_sum,
             },
         )

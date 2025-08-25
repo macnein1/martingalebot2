@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import Dict, Any, Optional
 import os
+from dataclasses import replace
 
 from martingale_lab.orchestrator.dca_orchestrator import (
     DCAOrchestrator, DCAConfig, OrchestratorConfig
@@ -64,6 +65,20 @@ def parse_args() -> argparse.Namespace:
                        help="Minimum indent step")
     parser.add_argument("--softmax-temp", type=float, default=1.0,
                        help="Softmax temperature")
+    parser.add_argument("--first-volume", type=float, default=0.01,
+                       help="First order volume pct (fixed).")
+    parser.add_argument("--first-indent", type=float, default=0.0,
+                       help="First order indent pct (fixed).")
+    parser.add_argument("--g-pre-band", type=str, default="1.01,1.20",
+                       help="Pre-normalization local growth band as 'lo,hi'.")
+    parser.add_argument("--g-post-band", type=str, default="1.01,1.30",
+                       help="Post-normalization local growth band as 'lo,hi'.")
+    parser.add_argument("--front-cap", type=float, default=5.0,
+                       help="Max sum of first K_front volumes in percent.")
+    parser.add_argument("--k-front", type=int, default=3,
+                       help="K_front (how many first orders are capped).")
+    parser.add_argument("--isotonic-tail", choices=["on", "off"], default="off",
+                       help="Apply isotonic smoothing on tail (i>=2).")
     
     # Optimization parameters
     parser.add_argument("--batches", type=int, default=100,
@@ -96,6 +111,26 @@ def parse_args() -> argparse.Namespace:
     # Wave pattern
     parser.add_argument("--wave-pattern", action="store_true",
                        help="Enable wave pattern optimization")
+    parser.add_argument("--wave-mode", choices=["anchors", "blocks"], default="anchors",
+                       help="Volume shape generator: anchors (default) or blocks (wave blocks).")
+    parser.add_argument("--anchors", type=int, default=6,
+                       help="Number of anchor points for anchors mode (4..8 typical).")
+    parser.add_argument("--blocks", type=int, default=3,
+                       help="Number of wave blocks for blocks mode.")
+    parser.add_argument("--wave-amp-min", type=float, default=0.05,
+                       help="Min wave amplitude for blocks mode.")
+    parser.add_argument("--wave-amp-max", type=float, default=0.30,
+                       help="Max wave amplitude for blocks mode.")
+
+    # Penalty presets/weights
+    parser.add_argument("--penalty-preset", choices=["explore", "robust", "tight"], default=None,
+                       help="Penalty weight preset; overrides individual weights if set.")
+    parser.add_argument("--w-fixed", type=float, default=3.0, help="Weight for first-order fixed penalty")
+    parser.add_argument("--w-second", type=float, default=3.0, help="Weight for second<=first penalty")
+    parser.add_argument("--w-gband", type=float, default=2.0, help="Weight for g band penalty")
+    parser.add_argument("--w-front", type=float, default=3.0, help="Weight for front-load penalty")
+    parser.add_argument("--w-tv", type=float, default=1.0, help="Weight for total variation penalty")
+    parser.add_argument("--w-wave", type=float, default=1.0, help="Weight for wave penalty")
     
     # Logging configuration
     parser.add_argument("--log-level", default="INFO", 
@@ -139,6 +174,32 @@ def setup_database(db_path: str) -> ExperimentsStore:
 def create_orchestrator_config(args: argparse.Namespace) -> tuple[DCAConfig, OrchestratorConfig]:
     """Create orchestrator configurations from CLI arguments."""
     
+    def _parse_band(s: str):
+        try:
+            lo_str, hi_str = s.split(",")
+            lo, hi = float(lo_str), float(hi_str)
+            if not (0.0 < lo < hi):
+                raise ValueError
+            return lo, hi
+        except Exception:
+            raise SystemExit(f"--band parse error: expected 'lo,hi' got '{s}'")
+
+    # Parse band strings
+    g_pre_lo, g_pre_hi = _parse_band(args.g_pre_band)
+    g_post_lo, g_post_hi = _parse_band(args.g_post_band)
+    iso_tail = (args.isotonic_tail == "on")
+
+    # Penalty preset (evaluation_engine tarafındaki isimlerle uyumlu)
+    penalty_weights = dict(
+        w_fixed=args.w_fixed, w_second=args.w_second, w_gband=args.w_gband,
+        w_front=args.w_front, w_tv=args.w_tv, w_wave=args.w_wave
+    )
+    if args.penalty_preset:
+        from martingale_lab.optimizer.evaluation_engine import PRESET_WEIGHTS
+        if args.penalty_preset not in PRESET_WEIGHTS:
+            raise SystemExit(f"unknown preset: {args.penalty_preset}")
+        penalty_weights = PRESET_WEIGHTS[args.penalty_preset]
+
     dca_config = DCAConfig(
         # Search space
         overlap_min=args.overlap_min,
@@ -159,11 +220,34 @@ def create_orchestrator_config(args: argparse.Namespace) -> tuple[DCAConfig, Orc
         
         # Wave pattern
         wave_pattern=args.wave_pattern,
+        wave_mode=args.wave_mode,
+        anchors=args.anchors,
+        blocks=args.blocks,
+        wave_amp_min=args.wave_amp_min,
+        wave_amp_max=args.wave_amp_max,
         
         # Constraints
         tail_cap=args.tail_cap,
         min_indent_step=args.min_indent_step,
         softmax_temp=args.softmax_temp,
+        first_volume=args.first_volume,
+        first_indent=args.first_indent,
+        g_pre_min=g_pre_lo,
+        g_pre_max=g_pre_hi,
+        g_post_min=g_post_lo,
+        g_post_max=g_post_hi,
+        front_cap=args.front_cap,
+        k_front=args.k_front,
+        isotonic_tail=iso_tail,
+        
+        # Penalty weights
+        penalty_preset=args.penalty_preset,
+        w_fixed=penalty_weights["w_fixed"],
+        w_second=penalty_weights["w_second"],
+        w_gband=penalty_weights["w_gband"],
+        w_front=penalty_weights["w_front"],
+        w_tv=penalty_weights["w_tv"],
+        w_wave=penalty_weights["w_wave"],
         
         # Parallelization
         n_workers=args.workers,
@@ -218,7 +302,28 @@ def log_config_summary(dca_config: DCAConfig, orch_config: OrchestratorConfig, r
                 "batch_size": dca_config.n_candidates_per_batch,
                 "max_batches": dca_config.max_batches,
                 "workers": dca_config.n_workers,
-                "wave_pattern": dca_config.wave_pattern
+                "wave_pattern": dca_config.wave_pattern,
+                "wave_mode": dca_config.wave_mode,
+                "anchors": dca_config.anchors,
+                "blocks": dca_config.blocks
+            },
+            "constraints": {
+                "first_volume": dca_config.first_volume,
+                "first_indent": dca_config.first_indent,
+                "g_pre_band": f"{dca_config.g_pre_min},{dca_config.g_pre_max}",
+                "g_post_band": f"{dca_config.g_post_min},{dca_config.g_post_max}",
+                "front_cap": dca_config.front_cap,
+                "k_front": dca_config.k_front,
+                "isotonic_tail": dca_config.isotonic_tail
+            },
+            "penalties": {
+                "preset": dca_config.penalty_preset,
+                "w_fixed": dca_config.w_fixed,
+                "w_second": dca_config.w_second,
+                "w_gband": dca_config.w_gband,
+                "w_front": dca_config.w_front,
+                "w_tv": dca_config.w_tv,
+                "w_wave": dca_config.w_wave
             },
             "pruning": {
                 "enabled": orch_config.prune_enabled,
