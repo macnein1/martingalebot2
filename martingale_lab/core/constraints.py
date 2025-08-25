@@ -7,7 +7,7 @@ from __future__ import annotations
 import numpy as np
 from numba import njit
 from typing import Dict, Any, Tuple
-from martingale_lab.core.repair import hard_clip_local_growth, isotonic_non_decreasing
+from martingale_lab.core.repair import hard_clip_local_growth, isotonic_non_decreasing, tail_only_rescale_keep_first_two, compute_m_from_v, rechain_v_from_m, longest_plateau_run
 import math
 
 
@@ -34,6 +34,12 @@ def _rescale_block(vol, start_idx, target_sum):
     for i in range(start_idx, len(vol)):
         vol[i] *= f
     return vol
+
+
+def _decay_ceiling(i, N, m_head, m_tail, tau_scale):
+    """Decaying ceiling function for m_max(i)"""
+    tau = max(1.0, N * tau_scale)
+    return m_tail + (m_head - m_tail) * np.exp(-(i-2)/tau)
 
 
 @njit(cache=True, fastmath=True)
@@ -531,12 +537,15 @@ def enforce_schedule_shape_fixed(
     g_max_post: float = 1.30,
     isotonic_tail: bool = True,
     # New parameters
-    m2_min: float = 0.10,
-    m2_max: float = 1.00,
-    m_min: float = 0.05,
-    m_max: float = 1.00,
-    firstK_min: float = 1.0,
-    eps_inc: float = 1e-5,
+    second_upper_c2: float = 2.0,     # v1 ≤ c2*v0 band
+    m2_min: float = 0.10, m2_max: float = 0.80,   # i=2 band
+    m_min: float = 0.05,              # i≥2 alt band
+    m_head: float = 0.40, m_tail: float = 0.20,   # decaying tavan
+    tau_scale: float = 1/3,           # tau = N*tau_scale
+    slope_cap: float = 0.25,          # |Δm| ≤ cap (i≥3)
+    q1_cap: float = 22.0,             # ilk çeyrek toplam üst sınır (%)
+    tail_floor: float = 32.0,         # son çeyrek taban (%)
+    eps_inc: float = 1e-6,
 ) -> Tuple[list, list, list, list, list, list, Dict[str, Any]]:
     """
     Enforce fixed-first-order and shaped martingale band on a schedule, then renormalize.
@@ -578,129 +587,174 @@ def enforce_schedule_shape_fixed(
     tv_before = _total_variation(vol_in)
     front_sum_before = float(np.sum(vol_in[: min(k_front, M)]))
 
-    # Ensure first indent and first volume fixed
-    if M >= 1:
-        ind[0] = first_indent_target
+    # Initialize diagnostics counters
+    v1_band_applied = 0
+    m2_clip_applied = 0
+    decaying_clips_count = 0
+    slope_clips_count = 0
+    plateau_max_run = 0
+    turn_count = 0
+
+    # 1. Başlat: v0=0.01, indent0=0.00 (zaten set). İlk normalize: tail_only_rescale_keep_first_two.
     vol = np.zeros(M, dtype=np.float64)
     vol[0] = first_volume_target
-
-    # Compute input ratios g_i from provided volumes to guide repair
-    g_input = np.ones(M, dtype=np.float64)
-    for i in range(1, M):
-        if vol_in[i-1] > 1e-12:
-            g_input[i] = vol_in[i] / max(vol_in[i-1], 1e-12)
-        else:
-            g_input[i] = 1.0
-
-    # NEW ALGORITHM: Apply new hard constraints with iteration
-    band_clips = 0
-    clips_hi = 0
-    clips_lo = 0
-    iter_fix_loops = 0
-    
-    # 1) v0 sabit: v0 := first_volume (0.01)
-    vol[0] = first_volume_target
-    
-    # 2) v1 bandı: v1_raw := max( v0*(1+m2_min), min(v1_raw, v0*(1+m2_max) ) )
     if M > 1:
-        v1_raw = vol_in[1] if len(vol_in) > 1 else first_volume_target
-        v1_min = vol[0] * (1 + m2_min)
-        v1_max = vol[0] * (1 + m2_max)
-        vol[1] = max(v1_min, min(v1_raw, v1_max))
-        if vol[1] != v1_raw:
-            band_clips += 1
+        vol[1] = vol_in[1] if len(vol_in) > 1 else first_volume_target
+    if M > 2:
+        vol[2:] = vol_in[2:] if len(vol_in) > 2 else np.zeros(M-2)
     
-    # 3) Tüm tail (i≥2) için martingale bantı (post)
-    for i in range(2, M):
-        if vol[i-1] > 1e-12:
-            g_i = vol_in[i] / vol[i-1] if i < len(vol_in) else 1.0
-            # g_i ← clip(g_i, 1+m_min, 1+m_max)
-            g_i = max(1 + m_min, min(g_i, 1 + m_max))
-            vol[i] = vol[i-1] * g_i
-            if g_i != (vol_in[i] / vol[i-1] if i < len(vol_in) else 1.0):
-                band_clips += 1
-        else:
-            vol[i] = vol[i-1] * (1 + m_min)
-    
-    # 4) Katı artış: v_i ← max(v_i, v_{i-1} + eps_inc)
+    # Initial tail-only rescale
+    tail_only_rescale_keep_first_two(vol)
+
+    # 2. m = compute_m_from_v(v).
+    m = compute_m_from_v(vol)
+
+    # 3. HC1 (v1 band): v1 ∈ [1.10*v0, second_upper_c2*v0]. Kliple; sonra tail-only rescale.
+    if M > 1:
+        v1_min = 1.10 * vol[0]
+        v1_max = second_upper_c2 * vol[0]
+        if vol[1] < v1_min:
+            vol[1] = v1_min
+            v1_band_applied = 1
+        elif vol[1] > v1_max:
+            vol[1] = v1_max
+            v1_band_applied = 1
+        tail_only_rescale_keep_first_two(vol)
+
+    # 4. HC3 (m bantları):
+    # i=2: klip [m2_min, m2_max]
+    # i≥3: klip [m_min, m_max(i)], m_max(i)=_decay_ceiling(...)
+    # Rechain v = rechain_v_from_m(v0,v1,m) → tail-only rescale.
+    if M > 2:
+        # Clip m[2]
+        m[2] = max(m2_min, min(m[2], m2_max))
+        if m[2] != (vol[2] / max(vol[1], 1e-12) - 1.0):
+            m2_clip_applied = 1
+        
+        # Clip m[i] for i≥3 with decaying ceiling
+        for i in range(3, M):
+            m_max_i = _decay_ceiling(i, M, m_head, m_tail, tau_scale)
+            m[i] = max(m_min, min(m[i], m_max_i))
+            if m[i] != (vol[i] / max(vol[i-1], 1e-12) - 1.0):
+                decaying_clips_count += 1
+        
+        # Rechain and rescale
+        vol = rechain_v_from_m(vol[0], vol[1], m)
+        tail_only_rescale_keep_first_two(vol)
+
+    # 5. HC4 (eğim sınırı): i≥3 için bandı [m[i-1]-slope_cap, m[i-1]+slope_cap] ile kesiştirip kliple. → Rechain → tail-only.
+    if M > 3:
+        for i in range(3, M):
+            m_prev = m[i-1]
+            m_min_slope = m_prev - slope_cap
+            m_max_slope = m_prev + slope_cap
+            m[i] = max(m_min_slope, min(m[i], m_max_slope))
+            if m[i] != (vol[i] / max(vol[i-1], 1e-12) - 1.0):
+                slope_clips_count += 1
+        
+        # Rechain and rescale
+        vol = rechain_v_from_m(vol[0], vol[1], m)
+        tail_only_rescale_keep_first_two(vol)
+
+    # 6. HC2 (katı artış): ∀i≥1: v[i] ≥ v[i-1]+eps_inc. Gerekli yerleri yükselt.
     for i in range(1, M):
         min_vol = vol[i-1] + eps_inc
         if vol[i] < min_vol:
             vol[i] = min_vol
-            clips_lo += 1
-    
-    # 5) Ön kısım alt sınırı: sum3 := v0+v1+v2. Eğer sum3 < firstK_min:
-    if M >= 3:
-        sum3 = vol[0] + vol[1] + vol[2]
-        if sum3 < firstK_min:
-            delta = firstK_min - sum3
-            # Bunu yalnızca i∈{2..K-1} üzerinde oransal ekle
-            k_orders = min(3, M)
-            if k_orders > 2:
-                vol[2] += delta  # Add to v2 only
-                clips_hi += 1
-    
-    # 6) Front-cap ve sum=100 normalize: v0/v1 sabit, tail tek ölçek
-    # Front cap enforcement
-    kf = min(k_front, M)
-    if kf >= 1:
-        target_front_sum = min(front_cap, 100.0)
-        if kf == 1:
-            pass  # only v0 in front; nothing to scale
-        else:
-            front_sum = float(np.sum(vol[:kf]))
-            if front_sum > target_front_sum + 1e-12:
-                current_front_rest2 = float(np.sum(vol[2:kf])) if kf > 2 else 0.0
-                target_front_rest2 = max(0.0, target_front_sum - vol[0] - vol[1])
-                if current_front_rest2 > 1e-12:
-                    s_front2 = target_front_rest2 / current_front_rest2
-                    vol[2:kf] *= s_front2
-                # Now scale tail (kf..M-1) to keep total 100
-                tail_sum = float(np.sum(vol[kf:]))
-                needed_tail = max(0.0, 100.0 - (vol[0] + vol[1] + float(np.sum(vol[2:kf]))))
-                if tail_sum > 1e-12:
-                    s_tail = needed_tail / tail_sum
-                    vol[kf:] *= s_tail
-                else:
-                    if kf > 2:
-                        vol[kf-1] = max(0.0, 100.0 - (vol[0] + vol[1] + float(np.sum(vol[2:kf-1]))))
-    
-    # Final normalization to sum=100
-    total = float(np.sum(vol))
-    if total > 1e-9:
-        vol *= 100.0 / total
-    
-    # 7) İTERASYON: 2→6 adımlarını 2–3 kez döndür
-    for iteration in range(2):  # 2 iterations
-        iter_fix_loops += 1
-        
-        # Re-apply martingale bands after normalization
-        for i in range(2, M):
-            if vol[i-1] > 1e-12:
-                g_i = vol[i] / vol[i-1]
-                g_i = max(1 + m_min, min(g_i, 1 + m_max))
-                vol[i] = vol[i-1] * g_i
-        
-        # Re-apply strict increase
-        for i in range(1, M):
-            min_vol = vol[i-1] + eps_inc
-            if vol[i] < min_vol:
-                vol[i] = min_vol
-        
-        # Re-normalize
-        total = float(np.sum(vol))
-        if total > 1e-9:
-            vol *= 100.0 / total
 
+    # 7. Tail-only rescale (v0,v1 sabit).
+    tail_only_rescale_keep_first_two(vol)
+
+    # 8. HC5 (kütle kontrolü): N'e göre Q1=ceil(N/4), Q4=ceil(N/4).
+    # Front cap: S_F>q1_cap ise yalnız [2..Q1-1] blokunu f_F2 ile küçült; çıkan Δ'yı Tail'e oransal ekle.
+    # Tail floor: S_T<tail_floor ise Tail'i f_T ile büyüt; dengeyi Mid'den (yoksa Front2) düş.
+    # Ardından HC2 + tail-only.
+    Q1 = max(1, int(np.ceil(M / 4.0)))
+    Q4 = max(1, int(np.ceil(M / 4.0)))
+    
+    # Front cap
+    front_sum = np.sum(vol[:Q1])
+    if front_sum > q1_cap:
+        front2_sum = np.sum(vol[2:Q1]) if Q1 > 2 else 0.0
+        if front2_sum > 1e-12:
+            target_front2 = max(0.0, q1_cap - vol[0] - vol[1])
+            f_front2 = target_front2 / front2_sum
+            vol[2:Q1] *= f_front2
+            # Redistribute excess to tail
+            excess = front_sum - q1_cap
+            tail_sum = np.sum(vol[Q1:])
+            if tail_sum > 1e-12:
+                vol[Q1:] *= (tail_sum + excess) / tail_sum
+    
+    # Tail floor
+    tail_sum = np.sum(vol[-Q4:])
+    if tail_sum < tail_floor:
+        deficit = tail_floor - tail_sum
+        # Take from middle section
+        mid_start = Q1
+        mid_end = M - Q4
+        if mid_end > mid_start:
+            mid_sum = np.sum(vol[mid_start:mid_end])
+            if mid_sum > deficit:
+                vol[mid_start:mid_end] *= (mid_sum - deficit) / mid_sum
+                vol[-Q4:] *= (tail_sum + deficit) / tail_sum
+    
+    # Re-apply HC2 and tail-only
+    for i in range(1, M):
+        min_vol = vol[i-1] + eps_inc
+        if vol[i] < min_vol:
+            vol[i] = min_vol
+    tail_only_rescale_keep_first_two(vol)
+
+    # 9. HC6 (plato kırıcı): i≥2'de |m−1|<0.02 koşulunda run uzunluğu L>3 ise, run içinde +/− δ alternasyonla ayarla; δ, bant/slope izinlerine göre min alınır. → Rechain → tail-only.
+    m = compute_m_from_v(vol)
+    plateau_max_run = longest_plateau_run(m, center=1.0, tol=0.02, start_idx=2)
+    
+    if plateau_max_run > 3:
+        # Find plateau runs and break them
+        current_run = 0
+        run_start = 2
+        for i in range(2, M):
+            if abs(m[i] - 1.0) < 0.02:
+                if current_run == 0:
+                    run_start = i
+                current_run += 1
+            else:
+                if current_run > 3:
+                    # Break this plateau run
+                    delta = min(0.05, slope_cap, m_head - 1.0)  # Conservative delta
+                    for j in range(run_start, i):
+                        if (j - run_start) % 2 == 0:
+                            m[j] = 1.0 + delta
+                        else:
+                            m[j] = 1.0 - delta
+                current_run = 0
+        
+        # Handle last run
+        if current_run > 3:
+            delta = min(0.05, slope_cap, m_head - 1.0)
+            for j in range(run_start, M):
+                if (j - run_start) % 2 == 0:
+                    m[j] = 1.0 + delta
+                else:
+                    m[j] = 1.0 - delta
+        
+        # Rechain and rescale
+        vol = rechain_v_from_m(vol[0], vol[1], m)
+        tail_only_rescale_keep_first_two(vol)
+
+    # 10. Türevler: martingale_pct, needpct, order_prices, price_step_pct hesaplarını mevcut formüllerle aynen üret.
     # Ensure v0 is fixed after all operations
     vol[0] = first_volume_target
 
     # Repair indents to be non-decreasing and anchored at first_indent_target
+    if M >= 1:
+        ind[0] = first_indent_target
     for i in range(1, len(ind)):
         if ind[i] < ind[i-1]:
             ind[i] = ind[i-1]
 
-    # Recompute martingale percentages from repaired volumes (no clamping)
+    # Recompute martingale percentages from repaired volumes
     mart = np.zeros(M, dtype=np.float64)
     for i in range(1, M):
         denom = max(vol[i-1], 1e-12)
@@ -716,7 +770,6 @@ def enforce_schedule_shape_fixed(
         if i < len(indent_cum):
             order_prices[i] = base_price * (1.0 - indent_cum[i] / 100.0)
         else:
-            # Fallback if indent_cum is shorter than expected
             order_prices[i] = base_price * (1.0 - indent_cum[-1] / 100.0)
 
     # Price steps
@@ -732,46 +785,51 @@ def enforce_schedule_shape_fixed(
         avg_price = val_acc / vol_acc if vol_acc > 1e-12 else base_price
         needpct[i] = ((base_price - avg_price) / base_price) * 100.0
 
-    # Diagnostics
+    # Final diagnostics
     tv_after = _total_variation(vol)
-    front_sum_after = float(np.sum(vol[:kf]))
+    front_sum_after = float(np.sum(vol[: min(k_front, M)]))
     l1_change = float(np.sum(np.abs(vol - vol_in)))
-    clipped_frac = float(band_clips) / float(max(1, M - 1))
     
-    # Calculate m2 (v1/v0 - 1)
-    m2 = 0.0
-    if M > 1 and vol[0] > 1e-12:
-        m2 = (vol[1] / vol[0]) - 1.0
+    # Calculate final metrics
+    m_final = compute_m_from_v(vol)
+    std_m = float(np.std(m_final[2:])) if M > 2 else 0.0
     
-    # Calculate std_m for martingale diversity
-    std_m = 0.0
-    if M > 2:
-        m_values = []
-        for i in range(2, M):
-            if vol[i-1] > 1e-12:
-                g_i = vol[i] / vol[i-1]
-                m_values.append(g_i - 1.0)
-        if m_values:
-            mean_m = sum(m_values) / len(m_values)
-            var_m = sum((m - mean_m) ** 2 for m in m_values) / len(m_values)
-            std_m = var_m ** 0.5
+    # Count turns (sign changes in m around 1.0)
+    turn_count = 0
+    if M > 3:
+        for i in range(3, M):
+            if (m_final[i-1] - 1.0) * (m_final[i] - 1.0) < 0:
+                turn_count += 1
+    
+    # Q1 and Q4 shares
+    q1_share = float(np.sum(vol[:Q1])) if M > 0 else 0.0
+    q4_share = float(np.sum(vol[-Q4:])) if M > 0 else 0.0
 
     diagnostics = {
-        "clipped_frac": clipped_frac,
-        "band_clips": int(band_clips),
+        "clipped_frac": 0.0,  # Legacy field
+        "band_clips": 0,      # Legacy field
         "front_excess_before": float(max(0.0, front_sum_before - front_cap)),
         "front_excess_after": float(max(0.0, front_sum_after - front_cap)),
         "tv_before": float(tv_before),
         "tv_after": float(tv_after),
         "l1_change": float(l1_change),
-        "clip_hi_post": clips_hi,
-        "clip_lo_post": clips_lo,
+        "clip_hi_post": 0,    # Legacy field
+        "clip_lo_post": 0,    # Legacy field
         "first3_sum": float(np.sum(vol[: min(3, M)])),
         "g2": float((vol[2] / max(vol[1], 1e-12)) if M > 2 else 0.0),
-        "m2": m2,
+        "m2": float(m_final[2]) if M > 2 else 0.0,
         "std_m": std_m,
-        "sign_changes": 0,  # Will be calculated in penalties
-        "iter_fix_loops": iter_fix_loops,
+        "sign_changes": turn_count,
+        "iter_fix_loops": 0,  # Legacy field
+        # New diagnostics
+        "v1_band_applied": v1_band_applied,
+        "m2_clip_applied": m2_clip_applied,
+        "decaying_clips_count": decaying_clips_count,
+        "slope_clips_count": slope_clips_count,
+        "q1_share": q1_share,
+        "q4_share": q4_share,
+        "plateau_max_run": plateau_max_run,
+        "turn_count": turn_count,
     }
 
     return (
