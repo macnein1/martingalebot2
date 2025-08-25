@@ -13,7 +13,7 @@ import math
 
 from martingale_lab.utils.logging import get_eval_logger, should_log_eval
 from martingale_lab.core.constraints import enforce_schedule_shape_fixed
-from martingale_lab.core.penalties import compute_shape_penalties
+from martingale_lab.core.penalties import compute_shape_penalties, compute_m_from_v
 
 # Use the new centralized logging system
 logger = get_eval_logger()
@@ -383,13 +383,14 @@ def evaluation_function(
             g_min_post,
             g_max_post,
             isotonic_tail,
-            # New parameters
-            m2_min,
-            m2_max,
-            m_min,
-            m_max,
-            firstK_min,
-            strict_inc_eps,
+            # New parameters with defaults
+            second_upper_c2=2.0,
+            m2_min=m2_min, m2_max=m2_max,
+            m_min=m_min, m_max=m_max,
+            m_head=0.40, m_tail=0.20,
+            tau_scale=1/3, slope_cap=0.25,
+            q1_cap=22.0, tail_floor=32.0,
+            eps_inc=strict_inc_eps,
         )
         
         # Calculate core metrics from repaired arrays
@@ -490,7 +491,10 @@ def evaluation_function(
                     wave_score -= 0.2
         penalties["P_wave"] = float(max(0.0, -wave_score))
         
-        # New shape penalties after repair
+        # Calculate m from volumes for new penalties
+        m = compute_m_from_v(volume_pct_np)
+        
+        # New shape penalties after repair with SP1-SP7
         shape_pens = compute_shape_penalties(
             np.asarray(volume_pct, dtype=np.float64),
             np.asarray(indent_pct, dtype=np.float64),
@@ -504,10 +508,19 @@ def evaluation_function(
             target_std,
             use_entropy,
             entropy_target,
+            # New parameters for SP1-SP7
+            second_upper_c2=2.0,
+            m2_min=m2_min, m2_max=m2_max,
+            m_min=m_min, m_max=m_max,
+            m_head=0.40, m_tail=0.20,
+            tau_scale=1/3, slope_cap=0.25,
+            q1_cap=22.0, tail_floor=32.0,
+            delta_soft=0.20, delta_cap=0.25,
+            penalty_preset="robust",
         )
         penalties.update(shape_pens)
         
-        # Weighted sum of shape penalties
+        # Weighted sum of shape penalties (including new SP1-SP7)
         shape_penalty_sum = (
             w_fixed_local * shape_pens["penalty_first_fixed"] +
             w_sec_local * shape_pens.get("penalty_second_leq", 0.0) +
@@ -516,7 +529,15 @@ def evaluation_function(
             w_tv_local * shape_pens["penalty_tv_vol"] +
             w_wave_local * shape_pens.get("penalty_wave", 0.0) +
             w_varm * shape_pens.get("penalty_uniform", 0.0) +
-            w_blocks * shape_pens.get("penalty_flat_blocks", 0.0)
+            w_blocks * shape_pens.get("penalty_flat_blocks", 0.0) +
+            # New SP1-SP7 penalties (already weighted in compute_shape_penalties)
+            shape_pens.get("penalty_second_band", 0.0) +
+            shape_pens.get("penalty_plateau", 0.0) +
+            shape_pens.get("penalty_varm", 0.0) +
+            shape_pens.get("penalty_wave_shape", 0.0) +
+            shape_pens.get("penalty_front_share", 0.0) +
+            shape_pens.get("penalty_tailweak", 0.0) +
+            shape_pens.get("penalty_slope", 0.0)
         )
         
         # Add entropy penalty if enabled
@@ -527,8 +548,9 @@ def evaluation_function(
         logger.info(
             f"REPAIR v0={first_volume_target:.3f} v1={volume_pct[1] if len(volume_pct) > 1 else 0:.3f} "
             f"m2={repair_diag.get('m2', 0):+.1%} first3={repair_diag.get('first3_sum', 0):.2%} "
-            f"clips_hi={repair_diag.get('clip_hi_post', 0)} clips_lo={repair_diag.get('clip_lo_post', 0)} "
-            f"iters={repair_diag.get('iter_fix_loops', 0)}",
+            f"clips(decay/slope)={repair_diag.get('decaying_clips_count', 0)}/{repair_diag.get('slope_clips_count', 0)} "
+            f"q1={repair_diag.get('q1_share', 0):.1%} q4={repair_diag.get('q4_share', 0):.1%} "
+            f"plateau_max_run={repair_diag.get('plateau_max_run', 0)} std_m={repair_diag.get('std_m', 0):.3f} turns={repair_diag.get('turn_count', 0)}",
             extra={
                 "event": "REPAIR",
                 "clipped_frac": repair_diag.get("clipped_frac", 0.0),
@@ -543,11 +565,21 @@ def evaluation_function(
                 "m2": repair_diag.get("m2", 0.0),
                 "std_m": repair_diag.get("std_m", 0.0),
                 "iter_fix_loops": repair_diag.get("iter_fix_loops", 0),
+                # New diagnostics
+                "v1_band_applied": repair_diag.get("v1_band_applied", 0),
+                "m2_clip_applied": repair_diag.get("m2_clip_applied", 0),
+                "decaying_clips_count": repair_diag.get("decaying_clips_count", 0),
+                "slope_clips_count": repair_diag.get("slope_clips_count", 0),
+                "q1_share": repair_diag.get("q1_share", 0.0),
+                "q4_share": repair_diag.get("q4_share", 0.0),
+                "plateau_max_run": repair_diag.get("plateau_max_run", 0),
+                "turn_count": repair_diag.get("turn_count", 0),
             },
         )
         logger.info(
             f"PEN m_uniform={shape_pens.get('penalty_uniform', 0.0):.2f} "
             f"m_blocks={shape_pens.get('penalty_flat_blocks', 0.0):.2f} "
+            f"sp1-7={shape_pens.get('penalty_second_band', 0.0):.2f}/{shape_pens.get('penalty_plateau', 0.0):.2f}/{shape_pens.get('penalty_varm', 0.0):.2f} "
             f"total={shape_penalty_sum:.4f}",
             extra={
                 "event": "PENALTIES",
@@ -560,6 +592,14 @@ def evaluation_function(
                 "uniform": shape_pens.get("penalty_uniform", 0.0),
                 "flat_blocks": shape_pens.get("penalty_flat_blocks", 0.0),
                 "low_entropy": shape_pens.get("penalty_low_entropy", 0.0),
+                # New SP1-SP7 penalties
+                "second_band": shape_pens.get("penalty_second_band", 0.0),
+                "plateau": shape_pens.get("penalty_plateau", 0.0),
+                "varm": shape_pens.get("penalty_varm", 0.0),
+                "wave_shape": shape_pens.get("penalty_wave_shape", 0.0),
+                "front_share": shape_pens.get("penalty_front_share", 0.0),
+                "tailweak": shape_pens.get("penalty_tailweak", 0.0),
+                "slope": shape_pens.get("penalty_slope", 0.0),
                 "sum": shape_penalty_sum,
             },
         )

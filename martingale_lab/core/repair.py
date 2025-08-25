@@ -83,3 +83,80 @@ def isotonic_non_decreasing(y: np.ndarray) -> np.ndarray:
         out[idx: idx + cnt] = lvl
         idx += cnt
     return out
+
+
+def tail_only_rescale_keep_first_two(v: np.ndarray) -> float:
+    """
+    v[0], v[1] sabit kalsın; v[2:] tek bir faktörle ölçeklensin ki sum(v)=100 olsun.
+    f = (100 - (v0+v1)) / sum(v[2:])
+    v[2:] *= f
+    return f
+    # S_tail=0 durumunda: v[2:]'yi küçük artan bir geometrik rampa ile doldur,
+    # sonra aynı formülle ölçekle. Bölüm sıfır guard'ları ekle.
+    """
+    if v.size < 2:
+        return 1.0
+    
+    v0, v1 = v[0], v[1]
+    tail_sum = np.sum(v[2:])
+    
+    if tail_sum <= 1e-12:
+        # S_tail=0 durumunda: küçük artan geometrik rampa ile doldur
+        n_tail = v.size - 2
+        if n_tail > 0:
+            # v[2] = v1 * 1.01, v[3] = v[2] * 1.01, ...
+            v[2] = v1 * 1.01
+            for i in range(3, v.size):
+                v[i] = v[i-1] * 1.01
+            tail_sum = np.sum(v[2:])
+    
+    if tail_sum <= 1e-12:
+        return 1.0
+    
+    target_tail = 100.0 - v0 - v1
+    if target_tail <= 0:
+        # Eğer v0+v1 >= 100, tail'i çok küçük yap
+        f = 1e-6 / tail_sum
+        v[2:] *= f
+        return f
+    
+    f = target_tail / tail_sum
+    v[2:] *= f
+    return f
+
+
+def compute_m_from_v(v: np.ndarray) -> np.ndarray:
+    """ m[0]=0; m[i] = v[i]/max(v[i-1],1e-12) - 1 """
+    m = np.zeros_like(v)
+    for i in range(1, v.size):
+        m[i] = v[i] / max(v[i-1], 1e-12) - 1.0
+    return m
+
+
+def rechain_v_from_m(v0: float, v1: float, m: np.ndarray) -> np.ndarray:
+    """ v[0]=v0; v[1]=v1; i>=2: v[i] = v[i-1]*(1+m[i]) """
+    v = np.zeros_like(m)
+    v[0] = v0
+    if m.size > 1:
+        v[1] = v1
+        for i in range(2, m.size):
+            v[i] = v[i-1] * (1.0 + m[i])
+    return v
+
+
+def longest_plateau_run(m: np.ndarray, center=1.0, tol=0.02, start_idx=2):
+    """ |m-center|<tol koşullu run'ları ve max uzunluğu döndür (HC6 için) """
+    if m.size <= start_idx:
+        return 0
+    
+    max_run = 0
+    current_run = 0
+    
+    for i in range(start_idx, m.size):
+        if abs(m[i] - center) < tol:
+            current_run += 1
+            max_run = max(max_run, current_run)
+        else:
+            current_run = 0
+    
+    return max_run

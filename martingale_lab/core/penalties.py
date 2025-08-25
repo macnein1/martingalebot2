@@ -9,6 +9,7 @@ import numpy as np
 from numba import njit
 from typing import Dict, Any
 import math
+from martingale_lab.core.repair import compute_m_from_v, longest_plateau_run
 
 
 @njit(cache=True, fastmath=True)
@@ -529,6 +530,90 @@ def penalty_flat_blocks(volumes: np.ndarray, k_front: int = 3) -> float:
     return max(0.0, 2.0 - sign_changes)
 
 
+# New penalty functions (SP1-SP7)
+def penalty_second_band(v0: float, v1: float) -> float:
+    """SP1: v1'in [1.10v0, 2.0v0] dışına karesi."""
+    v1_min = 1.10 * v0
+    v1_max = 2.0 * v0
+    if v1 < v1_min:
+        return (v1_min - v1) ** 2
+    elif v1 > v1_max:
+        return (v1 - v1_max) ** 2
+    return 0.0
+
+
+def penalty_plateau(m_tail: np.ndarray, tol: float = 0.02, max_len: int = 3) -> float:
+    """SP2: plato run'larının (|m−1|<tol) fazla uzun kısmının toplamı."""
+    max_run = longest_plateau_run(m_tail, center=1.0, tol=tol, start_idx=0)
+    return max(0.0, max_run - max_len)
+
+
+def penalty_varm(m_tail: np.ndarray, target_std: float = 0.20) -> float:
+    """SP3: max(0, target_std - std(m_tail))."""
+    if m_tail.size <= 1:
+        return target_std
+    std_m = float(np.std(m_tail))
+    return max(0.0, target_std - std_m)
+
+
+def penalty_wave_shape(m_tail: np.ndarray, m_min: float, m_head: float, m_tail_cap: float, 
+                      tau: float, phase: float = 0.0) -> float:
+    """SP4: decaying tavana gömülü 1.5 dalgalı hedefe L2 uzaklık (N'e ölçekli)."""
+    if m_tail.size <= 1:
+        return 0.0
+    
+    # Create target wave pattern
+    target = np.zeros_like(m_tail)
+    for i in range(m_tail.size):
+        # Decaying ceiling
+        ceiling = m_tail_cap + (m_head - m_tail_cap) * np.exp(-i/tau)
+        # Wave pattern: 1.5 cycles with phase
+        wave = 0.5 * np.sin(2 * np.pi * 1.5 * i / m_tail.size + phase)
+        target[i] = ceiling * (1.0 + wave)
+    
+    # L2 distance
+    diff = m_tail - target
+    return float(np.sum(diff * diff)) / m_tail.size
+
+
+def penalty_front_share(volumes: np.ndarray, q1_cap: float = 22.0) -> float:
+    """SP5: ilk çeyrek toplam cap aşımları."""
+    if volumes.size == 0:
+        return 0.0
+    
+    Q1 = max(1, int(np.ceil(volumes.size / 4.0)))
+    front_sum = float(np.sum(volumes[:Q1]))
+    return max(0.0, front_sum - q1_cap)
+
+
+def penalty_tailweak(volumes: np.ndarray, tail_floor: float = 32.0) -> float:
+    """SP6: son çeyrek taban altı eksikliği."""
+    if volumes.size == 0:
+        return 0.0
+    
+    Q4 = max(1, int(np.ceil(volumes.size / 4.0)))
+    tail_sum = float(np.sum(volumes[-Q4:]))
+    return max(0.0, tail_floor - tail_sum)
+
+
+def penalty_slope(m_tail: np.ndarray, delta_soft: float = 0.20, delta_cap: float = 0.25) -> float:
+    """SP7: |Δm| delta_soft'ı aşınca karesel maliyet."""
+    if m_tail.size <= 1:
+        return 0.0
+    
+    penalty = 0.0
+    for i in range(1, m_tail.size):
+        delta = abs(m_tail[i] - m_tail[i-1])
+        if delta > delta_soft:
+            # Quadratic penalty
+            penalty += (delta - delta_soft) ** 2
+        if delta > delta_cap:
+            # Additional penalty for exceeding hard cap
+            penalty += (delta - delta_cap) ** 2
+    
+    return penalty
+
+
 def compute_shape_penalties(volumes: np.ndarray, indents: np.ndarray,
                             first_volume_target: float, first_indent_target: float,
                             g_min: float, g_max: float,
@@ -536,7 +621,16 @@ def compute_shape_penalties(volumes: np.ndarray, indents: np.ndarray,
                             martingales: np.ndarray = None,
                             target_std: float = 0.10,
                             use_entropy: bool = False,
-                            entropy_target: float = 1.0) -> Dict[str, float]:
+                            entropy_target: float = 1.0,
+                            # New parameters for SP1-SP7
+                            second_upper_c2: float = 2.0,
+                            m2_min: float = 0.10, m2_max: float = 0.80,
+                            m_min: float = 0.05, m_head: float = 0.40, m_tail: float = 0.20,
+                            tau_scale: float = 1/3, slope_cap: float = 0.25,
+                            q1_cap: float = 22.0, tail_floor: float = 32.0,
+                            delta_soft: float = 0.20, delta_cap: float = 0.25,
+                            # Weight presets
+                            penalty_preset: str = "robust") -> Dict[str, float]:
     """Compute shape-specific penalties after repair."""
     penalties = {
         "penalty_first_fixed": penalty_first_fixed(volumes, indents, first_volume_target, first_indent_target),
@@ -554,6 +648,55 @@ def compute_shape_penalties(volumes: np.ndarray, indents: np.ndarray,
         
         if use_entropy:
             penalties["penalty_low_entropy"] = penalty_low_entropy(martingales, entropy_target)
+    
+    # Add new SP1-SP7 penalties
+    if volumes.size >= 2:
+        v0, v1 = volumes[0], volumes[1]
+        penalties["penalty_second_band"] = penalty_second_band(v0, v1)
+    
+    if martingales is not None and martingales.size > 2:
+        m_tail = martingales[2:]  # Skip first two elements
+        penalties["penalty_plateau"] = penalty_plateau(m_tail)
+        penalties["penalty_varm"] = penalty_varm(m_tail, target_std=0.20)
+        
+        # Wave shape penalty with parameters
+        tau = max(1.0, volumes.size * tau_scale)
+        penalties["penalty_wave_shape"] = penalty_wave_shape(m_tail, m_min, m_head, m_tail, tau)
+    
+    penalties["penalty_front_share"] = penalty_front_share(volumes, q1_cap)
+    penalties["penalty_tailweak"] = penalty_tailweak(volumes, tail_floor)
+    
+    if martingales is not None and martingales.size > 2:
+        m_tail = martingales[2:]
+        penalties["penalty_slope"] = penalty_slope(m_tail, delta_soft, delta_cap)
+    
+    # Weight presets
+    if penalty_preset == "robust":
+        weights = {
+            "w_second": 3.0, "w_plateau": 2.0, "w_varm": 3.0, 
+            "w_wave_shape": 2.0, "w_front": 2.0, "w_tail": 2.0, "w_slope": 1.0
+        }
+    elif penalty_preset == "tight":
+        weights = {
+            "w_second": 4.0, "w_plateau": 3.0, "w_varm": 4.0,
+            "w_wave_shape": 3.0, "w_front": 3.0, "w_tail": 3.0, "w_slope": 2.0
+        }
+    elif penalty_preset == "explore":
+        weights = {
+            "w_second": 2.0, "w_plateau": 1.5, "w_varm": 2.0,
+            "w_wave_shape": 1.5, "w_front": 1.5, "w_tail": 1.5, "w_slope": 0.5
+        }
+    else:
+        weights = {
+            "w_second": 3.0, "w_plateau": 2.0, "w_varm": 3.0,
+            "w_wave_shape": 2.0, "w_front": 2.0, "w_tail": 2.0, "w_slope": 1.0
+        }
+    
+    # Apply weights to new penalties
+    for key, weight in weights.items():
+        penalty_key = key.replace("w_", "penalty_")
+        if penalty_key in penalties:
+            penalties[penalty_key] *= weight
     
     return penalties
 
