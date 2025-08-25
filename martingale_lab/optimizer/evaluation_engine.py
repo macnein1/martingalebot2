@@ -124,6 +124,73 @@ def _count_sign_flips(needpct: np.ndarray) -> int:
     return int(sign_changes)
 
 
+def _interp_from_anchors(num_orders: int, anchors: int, rng: np.random.Generator,
+                         v0: float, g1_max: float) -> np.ndarray:
+    # t in [0,1] at order indices
+    t = np.linspace(0.0, 1.0, num_orders)
+    # choose anchor positions uniformly in t-space excluding first 2 indices
+    anchor_idx = np.linspace(2, num_orders - 1, anchors, dtype=int)
+    # sample log-volumes for anchors with mild smoothness
+    logv = rng.normal(0.0, 0.5, size=anchors)
+    # piecewise-linear in log-space
+    v = np.zeros(num_orders, dtype=np.float64)
+    v[0] = v0
+    # sample v1 <= v0
+    v[1] = min(v0, v0 * max(0.0, min(1.0, rng.normal(0.95, 0.03)))) if num_orders >= 2 else v0
+    # set anchor values (positive)
+    vals = np.exp(logv)
+    # normalize anchors roughly around median scale of v1
+    vals *= (v[1] + 1e-6) / (np.median(vals) + 1e-6)
+    # linear interpolate anchors for i>=2
+    for i in range(2, num_orders):
+        # find surrounding anchors
+        right = np.searchsorted(anchor_idx, i)
+        left = max(0, right - 1)
+        if right >= anchors:
+            left = anchors - 1
+            right = anchors - 1
+        i0 = anchor_idx[left]
+        i1 = anchor_idx[right]
+        if i1 == i0:
+            vi = vals[left]
+        else:
+            w = (i - i0) / max(1, (i1 - i0))
+            vi = (1 - w) * vals[left] + w * vals[right]
+        v[i] = max(1e-6, vi)
+    return v
+
+
+def _wave_blocks(num_orders: int, blocks: int, rng: np.random.Generator,
+                 v0: float) -> np.ndarray:
+    v = np.zeros(num_orders, dtype=np.float64)
+    v[0] = v0
+    if num_orders >= 2:
+        v[1] = min(v0, v0 * max(0.0, min(1.0, rng.normal(0.95, 0.03))))
+    if num_orders <= 2:
+        return v
+    # block-wise base growth and amplitude
+    length = num_orders - 2
+    blk_len = max(1, length // max(1, blocks))
+    i = 2
+    prev = v[1]
+    while i < num_orders:
+        this_len = min(blk_len, num_orders - i)
+        g_base = max(1.01, min(1.20, rng.normal(1.06, 0.03)))
+        amp = max(0.0, min(0.30, rng.uniform(0.05, 0.25)))
+        phase = rng.uniform(0.0, np.pi)
+        for k in range(this_len):
+            t = k / max(1, this_len - 1)
+            wave = np.sin(2 * np.pi * t + phase)
+            g = g_base * (1.0 + amp * wave)
+            g = max(1.01, min(1.30, g))
+            prev = prev * g
+            v[i] = prev
+            i += 1
+            if i >= num_orders:
+                break
+    return v
+
+
 def evaluation_function(
     base_price: float, 
     overlap_pct: float, 
@@ -152,6 +219,11 @@ def evaluation_function(
     w_front: float = 3.0,
     w_tv: float = 1.0,
     w_sec: float = 3.0,
+    w_wave: float = 1.0,
+    # Generation mode knobs
+    wave_mode: str = "anchors",  # [anchors, blocks]
+    anchors: int = 6,
+    blocks: int = 3,
     **kwargs
 ) -> Dict[str, Any]:
     """
@@ -182,10 +254,9 @@ def evaluation_function(
         # Generate random parameters
         rng = np.random.default_rng(seed)
         raw_indents = rng.normal(0.0, 1.0, size=num_orders)
-        # raw_volumes kept for backward-compat logging but we will use monotone sampler
         raw_volumes = rng.normal(0.0, 1.0, size=num_orders)
-        
-        # 1. Build indent_pct with monotonic increasing steps
+
+        # 1. Build indent_pct with monotonic steps
         steps = _softplus(raw_indents)
         steps = np.maximum(steps, min_indent_step / 100.0)
         steps_sum = np.sum(steps)
@@ -193,24 +264,24 @@ def evaluation_function(
             steps = np.full(num_orders, overlap_pct / (100.0 * num_orders))
         else:
             steps = steps * (overlap_pct / 100.0) / steps_sum
-        
-        # Cumulative indents: [p0=0, p1, p2, ..., pM]
         indent_cumulative = np.concatenate([[0.0], np.cumsum(steps)]) * 100.0
         indent_pct_initial = indent_cumulative[1:].tolist()
-        
-        # 2. Monotone-biased volume sampling with fixed first order
-        #    v0 fixed, v1 <= v0, for i>=2 sample g_i ~ N(1.05, 0.05) then clip to [g_min, g_max]
+
+        # 2. Volume generation (anchors/blocks) with v0 fixed and v1<=v0
         vol_sample = np.zeros(num_orders, dtype=np.float64)
-        vol_sample[0] = first_volume_target
-        # sample g1 around 0.95, cap at 1.0 and non-negative
-        g1 = float(min(1.0, max(0.0, rng.normal(0.95, 0.03)))) if num_orders >= 2 else 0.0
-        if num_orders >= 2:
-            vol_sample[1] = vol_sample[0] * g1
+        if wave_mode == "blocks":
+            vol_sample = _wave_blocks(num_orders, blocks, rng, first_volume_target)
+        else:
+            vol_sample = _interp_from_anchors(num_orders, max(4, min(anchors, 8)), rng, first_volume_target, 1.0)
+
+        # Ensure minimal pre-band (clip ratios for i>=2) and build monotone-biased raw chain
         for i in range(2, num_orders):
-            gi = float(rng.normal(1.05, 0.05))
+            denom = max(vol_sample[i-1], 1e-12)
+            gi = vol_sample[i] / denom
             gi = min(g_max, max(g_min, gi))
             vol_sample[i] = vol_sample[i-1] * gi
-        # Normalize keeping v0 fixed
+
+        # Normalize keeping v0 fixed, tail scaled with single factor
         if num_orders > 1:
             rest_sum = float(np.sum(vol_sample[1:]))
             if rest_sum > 1e-12:
@@ -221,8 +292,8 @@ def evaluation_function(
         else:
             vol_sample[0] = 100.0
         volume_pct_initial = vol_sample.copy()
-        
-        # Repair schedule shape and recompute derived arrays
+
+        # Repair and evaluate as before...
         g_min_post = 1.01
         g_max_post = 1.30
         (indent_pct,
@@ -243,7 +314,7 @@ def evaluation_function(
             g_max,
             g_min_post,
             g_max_post,
-            True,
+            wave_mode != "anchors" and False,
         )
         
         # Calculate core metrics from repaired arrays
@@ -289,6 +360,11 @@ def evaluation_function(
             "repair_front_excess_after": float(repair_diag.get("front_excess_after", 0.0)),
             "repair_tv_before": float(repair_diag.get("tv_before", 0.0)),
             "repair_tv_after": float(repair_diag.get("tv_after", 0.0)),
+            # Generation/repair flags
+            "wave_mode": wave_mode,
+            "anchors": int(anchors) if wave_mode == "anchors" else None,
+            "blocks": int(blocks) if wave_mode == "blocks" else None,
+            "isotonic_applied": bool(wave_mode != "anchors" and False),
         }
         
         # Penalties
@@ -346,7 +422,8 @@ def evaluation_function(
             w_sec * shape_pens.get("penalty_second_leq", 0.0) +
             w_band * shape_pens["penalty_g_band"] +
             w_front * shape_pens["penalty_frontload"] +
-            w_tv * shape_pens["penalty_tv_vol"]
+            w_tv * shape_pens["penalty_tv_vol"] +
+            w_wave * shape_pens.get("penalty_wave", 0.0)
         )
         
         # Log repair diagnostics and penalties (INFO)

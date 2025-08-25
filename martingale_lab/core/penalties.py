@@ -393,6 +393,31 @@ def penalty_second_leq(volumes: np.ndarray) -> float:
     return excess if excess > 0.0 else 0.0
 
 
+@njit(cache=True, fastmath=True)
+def penalty_wave(volumes: np.ndarray, lambda_v2: float = 0.1) -> float:
+    n = volumes.size
+    if n <= 3:
+        return 0.0
+    # Growth ratios for i>=2
+    # g[i] corresponds to vol[i]/vol[i-1] for i in [2..n-1]
+    prev = volumes[1] if volumes[1] > 1e-12 else 1e-12
+    # Prepare first growth at i=2
+    g_prev = volumes[2] / (volumes[1] if volumes[1] > 1e-12 else 1e-12)
+    sum_abs_delta_g = 0.0
+    for i in range(3, n):
+        denom = volumes[i-1] if volumes[i-1] > 1e-12 else 1e-12
+        g_curr = volumes[i] / denom
+        diff_g = g_curr - g_prev
+        sum_abs_delta_g += abs(diff_g)
+        g_prev = g_curr
+    # Second differences on volumes (i>=2)
+    sum_abs_second_diff = 0.0
+    for i in range(2, n):
+        second = volumes[i] - 2.0 * volumes[i-1] + volumes[i-2]
+        sum_abs_second_diff += abs(second)
+    return sum_abs_delta_g + lambda_v2 * sum_abs_second_diff
+
+
 def compute_shape_penalties(volumes: np.ndarray, indents: np.ndarray,
                             first_volume_target: float, first_indent_target: float,
                             g_min: float, g_max: float,
@@ -404,6 +429,7 @@ def compute_shape_penalties(volumes: np.ndarray, indents: np.ndarray,
         "penalty_g_band": penalty_g_band(volumes, g_min, g_max),
         "penalty_frontload": penalty_frontload(volumes, k_front, front_cap),
         "penalty_tv_vol": penalty_total_variation_vol(volumes),
+        "penalty_wave": penalty_wave(volumes, 0.1),
     }
 
 

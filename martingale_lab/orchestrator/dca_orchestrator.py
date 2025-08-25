@@ -722,6 +722,17 @@ class DCAOrchestrator:
                         "softmax_temp": params_info.get("softmax_temp"),
                         "seed": params_info.get("seed"),
                         "candidate_uid": f"{self.run_id}:{batch_idx}:{cand_idx}",
+                        "param_repr": {
+                            "mode": res.get("diagnostics", {}).get("wave_mode", "anchors"),
+                            "orders": params_info.get("num_orders"),
+                            "anchors": res.get("diagnostics", {}).get("anchors", None),
+                            "blocks": res.get("diagnostics", {}).get("blocks", None),
+                            "g_pre_band": [1.01, 1.20],
+                            "g_post_band": [1.01, 1.30],
+                            "front_cap": 5.0,
+                            "k_front": 3,
+                            "isotonic_tail": res.get("diagnostics", {}).get("isotonic_applied", False)
+                        }
                     }
                     sid = make_stable_id(payload, run_id=self.run_id, batch_idx=batch_idx, cand_idx=cand_idx)
                     db_items.append({
