@@ -261,6 +261,19 @@ def evaluation_function(
     isotonic_tail: bool = False,
     # Penalty weight preset
     penalty_preset: Optional[str] = None,
+    # New hard constraints
+    m2_min: float = 0.10,
+    m2_max: float = 1.00,
+    m_min: float = 0.05,
+    m_max: float = 1.00,
+    firstK_min: float = 1.0,
+    strict_inc_eps: float = 1e-5,
+    # New soft penalties
+    target_std: float = 0.10,
+    w_varm: float = 2.0,
+    w_blocks: float = 1.0,
+    use_entropy: bool = False,
+    entropy_target: float = 1.0,
     **kwargs
 ) -> Dict[str, Any]:
     """
@@ -370,6 +383,13 @@ def evaluation_function(
             g_min_post,
             g_max_post,
             isotonic_tail,
+            # New parameters
+            m2_min,
+            m2_max,
+            m_min,
+            m_max,
+            firstK_min,
+            strict_inc_eps,
         )
         
         # Calculate core metrics from repaired arrays
@@ -415,6 +435,14 @@ def evaluation_function(
             "repair_front_excess_after": float(repair_diag.get("front_excess_after", 0.0)),
             "repair_tv_before": float(repair_diag.get("tv_before", 0.0)),
             "repair_tv_after": float(repair_diag.get("tv_after", 0.0)),
+            # New diagnostics
+            "first3_sum": float(repair_diag.get("first3_sum", 0.0)),
+            "m2": float(repair_diag.get("m2", 0.0)),
+            "std_m": float(repair_diag.get("std_m", 0.0)),
+            "sign_changes": float(repair_diag.get("sign_changes", 0.0)),
+            "clips_hi_count": int(repair_diag.get("clip_hi_post", 0)),
+            "clips_lo_count": int(repair_diag.get("clip_lo_post", 0)),
+            "iter_fix_loops": int(repair_diag.get("iter_fix_loops", 0)),
             # Generation/repair flags
             "wave_mode": wave_mode,
             "anchors": int(anchors) if wave_mode == "anchors" else None,
@@ -472,6 +500,10 @@ def evaluation_function(
             g_max,
             k_front,
             front_cap,
+            np.asarray(martingale_pct, dtype=np.float64),
+            target_std,
+            use_entropy,
+            entropy_target,
         )
         penalties.update(shape_pens)
         
@@ -482,17 +514,21 @@ def evaluation_function(
             w_band_local * shape_pens["penalty_g_band"] +
             w_front_local * shape_pens["penalty_frontload"] +
             w_tv_local * shape_pens["penalty_tv_vol"] +
-            w_wave_local * shape_pens.get("penalty_wave", 0.0)
+            w_wave_local * shape_pens.get("penalty_wave", 0.0) +
+            w_varm * shape_pens.get("penalty_uniform", 0.0) +
+            w_blocks * shape_pens.get("penalty_flat_blocks", 0.0)
         )
+        
+        # Add entropy penalty if enabled
+        if use_entropy and "penalty_low_entropy" in shape_pens:
+            shape_penalty_sum += w_varm * shape_pens["penalty_low_entropy"]
         
         # Log repair diagnostics and penalties (INFO)
         logger.info(
-            f"REPAIR: clipped_frac={repair_diag.get('clipped_frac', 0):.4f} "
-            f"front_excess_before={repair_diag.get('front_excess_before', 0):.4f} "
-            f"front_excess_after={repair_diag.get('front_excess_after', 0):.4f} "
-            f"tv_before={repair_diag.get('tv_before', 0):.4f} tv_after={repair_diag.get('tv_after', 0):.4f} "
-            f"first3_sum={repair_diag.get('first3_sum', 0):.4f} g2={repair_diag.get('g2', 0):.4f} "
-            f"clip_hi_post={repair_diag.get('clip_hi_post', 0)} clip_lo_post={repair_diag.get('clip_lo_post', 0)}",
+            f"REPAIR v0={first_volume_target:.3f} v1={volume_pct[1] if len(volume_pct) > 1 else 0:.3f} "
+            f"m2={repair_diag.get('m2', 0):+.1%} first3={repair_diag.get('first3_sum', 0):.2%} "
+            f"clips_hi={repair_diag.get('clip_hi_post', 0)} clips_lo={repair_diag.get('clip_lo_post', 0)} "
+            f"iters={repair_diag.get('iter_fix_loops', 0)}",
             extra={
                 "event": "REPAIR",
                 "clipped_frac": repair_diag.get("clipped_frac", 0.0),
@@ -504,13 +540,15 @@ def evaluation_function(
                 "g2": repair_diag.get("g2", 0.0),
                 "clip_hi_post": repair_diag.get("clip_hi_post", 0),
                 "clip_lo_post": repair_diag.get("clip_lo_post", 0),
+                "m2": repair_diag.get("m2", 0.0),
+                "std_m": repair_diag.get("std_m", 0.0),
+                "iter_fix_loops": repair_diag.get("iter_fix_loops", 0),
             },
         )
         logger.info(
-            f"PENALTIES: fixed={shape_pens['penalty_first_fixed']:.4f} "
-            f"second_leq={shape_pens.get('penalty_second_leq', 0.0):.4f} "
-            f"gband={shape_pens['penalty_g_band']:.4f} front={shape_pens['penalty_frontload']:.4f} "
-            f"tv={shape_pens['penalty_tv_vol']:.4f} wave={shape_pens.get('penalty_wave', 0.0):.4f} sum={shape_penalty_sum:.4f}",
+            f"PEN m_uniform={shape_pens.get('penalty_uniform', 0.0):.2f} "
+            f"m_blocks={shape_pens.get('penalty_flat_blocks', 0.0):.2f} "
+            f"total={shape_penalty_sum:.4f}",
             extra={
                 "event": "PENALTIES",
                 "fixed": shape_pens["penalty_first_fixed"],
@@ -519,6 +557,9 @@ def evaluation_function(
                 "front": shape_pens["penalty_frontload"],
                 "tv": shape_pens["penalty_tv_vol"],
                 "wave": shape_pens.get("penalty_wave", 0.0),
+                "uniform": shape_pens.get("penalty_uniform", 0.0),
+                "flat_blocks": shape_pens.get("penalty_flat_blocks", 0.0),
+                "low_entropy": shape_pens.get("penalty_low_entropy", 0.0),
                 "sum": shape_penalty_sum,
             },
         )

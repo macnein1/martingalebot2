@@ -530,6 +530,13 @@ def enforce_schedule_shape_fixed(
     g_min_post: float = 1.01,
     g_max_post: float = 1.30,
     isotonic_tail: bool = True,
+    # New parameters
+    m2_min: float = 0.10,
+    m2_max: float = 1.00,
+    m_min: float = 0.05,
+    m_max: float = 1.00,
+    firstK_min: float = 1.0,
+    eps_inc: float = 1e-5,
 ) -> Tuple[list, list, list, list, list, list, Dict[str, Any]]:
     """
     Enforce fixed-first-order and shaped martingale band on a schedule, then renormalize.
@@ -585,47 +592,61 @@ def enforce_schedule_shape_fixed(
         else:
             g_input[i] = 1.0
 
-    # Apply hard constraints on ratios and rebuild volumes while keeping v0 fixed
+    # NEW ALGORITHM: Apply new hard constraints with iteration
     band_clips = 0
-    for i in range(1, M):
-        if i == 1:
-            g = min(g_input[i], 1.0)  # second order must be <= 1.0 (<=100%)
-            if g < 0.0:
-                g = 0.0
-            if not np.isclose(g, g_input[i]):
-                band_clips += 1
-        else:
-            g = g_input[i]
-            if g < g_min:
-                g = g_min
-                band_clips += 1
-            elif g > g_max:
-                g = g_max
-                band_clips += 1
-        vol[i] = vol[i-1] * g
-
-    # Renormalize keeping vol[0] and vol[1] fixed exactly
+    clips_hi = 0
+    clips_lo = 0
+    iter_fix_loops = 0
+    
+    # 1) v0 sabit: v0 := first_volume (0.01)
+    vol[0] = first_volume_target
+    
+    # 2) v1 bandı: v1_raw := max( v0*(1+m2_min), min(v1_raw, v0*(1+m2_max) ) )
     if M > 1:
-        rest2_sum = float(np.sum(vol[2:]))
-        target_rest2 = max(0.0, 100.0 - vol[0] - vol[1])
-        if rest2_sum > 1e-12:
-            scale_rest2 = target_rest2 / rest2_sum
-            vol[2:] *= scale_rest2
+        v1_raw = vol_in[1] if len(vol_in) > 1 else first_volume_target
+        v1_min = vol[0] * (1 + m2_min)
+        v1_max = vol[0] * (1 + m2_max)
+        vol[1] = max(v1_min, min(v1_raw, v1_max))
+        if vol[1] != v1_raw:
+            band_clips += 1
+    
+    # 3) Tüm tail (i≥2) için martingale bantı (post)
+    for i in range(2, M):
+        if vol[i-1] > 1e-12:
+            g_i = vol_in[i] / vol[i-1] if i < len(vol_in) else 1.0
+            # g_i ← clip(g_i, 1+m_min, 1+m_max)
+            g_i = max(1 + m_min, min(g_i, 1 + m_max))
+            vol[i] = vol[i-1] * g_i
+            if g_i != (vol_in[i] / vol[i-1] if i < len(vol_in) else 1.0):
+                band_clips += 1
         else:
-            # Distribute remaining mass uniformly across 2..M-1
-            if M > 2:
-                vol[2:] = target_rest2 / (M - 2)
-            else:
-                # M == 2: assign remainder to v1 (cannot satisfy g2<=1 and sum=100 simultaneously)
-                vol[1] = target_rest2
-
-    # Enforce front cap while keeping vol[0] and vol[1] fixed when possible; scale indices 2..k_front-1
+            vol[i] = vol[i-1] * (1 + m_min)
+    
+    # 4) Katı artış: v_i ← max(v_i, v_{i-1} + eps_inc)
+    for i in range(1, M):
+        min_vol = vol[i-1] + eps_inc
+        if vol[i] < min_vol:
+            vol[i] = min_vol
+            clips_lo += 1
+    
+    # 5) Ön kısım alt sınırı: sum3 := v0+v1+v2. Eğer sum3 < firstK_min:
+    if M >= 3:
+        sum3 = vol[0] + vol[1] + vol[2]
+        if sum3 < firstK_min:
+            delta = firstK_min - sum3
+            # Bunu yalnızca i∈{2..K-1} üzerinde oransal ekle
+            k_orders = min(3, M)
+            if k_orders > 2:
+                vol[2] += delta  # Add to v2 only
+                clips_hi += 1
+    
+    # 6) Front-cap ve sum=100 normalize: v0/v1 sabit, tail tek ölçek
+    # Front cap enforcement
     kf = min(k_front, M)
     if kf >= 1:
         target_front_sum = min(front_cap, 100.0)
         if kf == 1:
-            # only v0 in front; nothing to scale. If over cap, cannot reduce v0; tail will handle sum.
-            pass
+            pass  # only v0 in front; nothing to scale
         else:
             front_sum = float(np.sum(vol[:kf]))
             if front_sum > target_front_sum + 1e-12:
@@ -641,53 +662,38 @@ def enforce_schedule_shape_fixed(
                     s_tail = needed_tail / tail_sum
                     vol[kf:] *= s_tail
                 else:
-                    # Push residual to last front component (prefer kf-1, but keep v0/v1 fixed)
                     if kf > 2:
                         vol[kf-1] = max(0.0, 100.0 - (vol[0] + vol[1] + float(np.sum(vol[2:kf-1]))))
-
-    # Final small normalization to correct rounding drift
+    
+    # Final normalization to sum=100
     total = float(np.sum(vol))
     if total > 1e-9:
         vol *= 100.0 / total
+    
+    # 7) İTERASYON: 2→6 adımlarını 2–3 kez döndür
+    for iteration in range(2):  # 2 iterations
+        iter_fix_loops += 1
+        
+        # Re-apply martingale bands after normalization
+        for i in range(2, M):
+            if vol[i-1] > 1e-12:
+                g_i = vol[i] / vol[i-1]
+                g_i = max(1 + m_min, min(g_i, 1 + m_max))
+                vol[i] = vol[i-1] * g_i
+        
+        # Re-apply strict increase
+        for i in range(1, M):
+            min_vol = vol[i-1] + eps_inc
+            if vol[i] < min_vol:
+                vol[i] = min_vol
+        
+        # Re-normalize
+        total = float(np.sum(vol))
+        if total > 1e-9:
+            vol *= 100.0 / total
 
-    # 0) v0 sabit, v1 = min(v1, v0) zaten yapılıyor
+    # Ensure v0 is fixed after all operations
     vol[0] = first_volume_target
-    if M > 1:
-        vol[1] = min(vol[1], vol[0])
-
-    # 1) tail hedef toplam (v2..n-1)
-    S_tail = 100.0 - vol[0] - vol[1]
-
-    # 2) önce i>=2 ham tail'i bu toplamla normalize et (tek faktör)
-    if M > 2:
-        vol = _rescale_block(vol, start_idx=2, target_sum=S_tail)
-
-    # 3) g2'yi kesin sınırla: v2 ∈ [v1*gmin_post, v1*gmax_post]
-    if M > 2:
-        lo2 = vol[1] * g_min_post
-        hi2 = vol[1] * g_max_post
-        vol[2] = min(max(vol[2], lo2), hi2)
-
-    # 4) v3..n-1'i S₃ = S_tail - v2 hedefine ölçekle (v2'ye dokunma → g2 korunur)
-    if M > 3:
-        S3 = S_tail - vol[2]
-        if S3 > 0:
-            vol = _rescale_block(vol, start_idx=3, target_sum=S3)
-
-        # 5) ölçeklemeden bozulan yerel bantları i>=3 için tekrar kliple
-        vol = _clip_local_band_forward(vol, start_idx=3, gmin=g_min_post, gmax=g_max_post)
-
-        # 6) bir kez daha yalnızca i>=3 bloğunu S3 hedefine rescale et (genelde tek iter yeter)
-        vol = _rescale_block(vol, start_idx=3, target_sum=S3)
-
-    # (opsiyonel) isotonic tail istiyorsan burada i>=3'e uygula, ardından YİNE start_idx=3 rescale
-    if isotonic_tail and M > 3:
-        tail_iso = isotonic_non_decreasing(vol[3:])
-        vol[3:] = tail_iso
-        # Scale tail back to preserve sum 100 with fixed v0,v1,v2
-        S3 = S_tail - vol[2]
-        if S3 > 0:
-            vol = _rescale_block(vol, start_idx=3, target_sum=S3)
 
     # Repair indents to be non-decreasing and anchored at first_indent_target
     for i in range(1, len(ind)):
@@ -707,7 +713,11 @@ def enforce_schedule_shape_fixed(
     order_prices = np.empty(M + 1, dtype=np.float64)
     order_prices[0] = base_price
     for i in range(1, M + 1):
-        order_prices[i] = base_price * (1.0 - indent_cum[i] / 100.0)
+        if i < len(indent_cum):
+            order_prices[i] = base_price * (1.0 - indent_cum[i] / 100.0)
+        else:
+            # Fallback if indent_cum is shorter than expected
+            order_prices[i] = base_price * (1.0 - indent_cum[-1] / 100.0)
 
     # Price steps
     price_step_pct = np.diff(indent_cum)
@@ -727,6 +737,24 @@ def enforce_schedule_shape_fixed(
     front_sum_after = float(np.sum(vol[:kf]))
     l1_change = float(np.sum(np.abs(vol - vol_in)))
     clipped_frac = float(band_clips) / float(max(1, M - 1))
+    
+    # Calculate m2 (v1/v0 - 1)
+    m2 = 0.0
+    if M > 1 and vol[0] > 1e-12:
+        m2 = (vol[1] / vol[0]) - 1.0
+    
+    # Calculate std_m for martingale diversity
+    std_m = 0.0
+    if M > 2:
+        m_values = []
+        for i in range(2, M):
+            if vol[i-1] > 1e-12:
+                g_i = vol[i] / vol[i-1]
+                m_values.append(g_i - 1.0)
+        if m_values:
+            mean_m = sum(m_values) / len(m_values)
+            var_m = sum((m - mean_m) ** 2 for m in m_values) / len(m_values)
+            std_m = var_m ** 0.5
 
     diagnostics = {
         "clipped_frac": clipped_frac,
@@ -736,10 +764,14 @@ def enforce_schedule_shape_fixed(
         "tv_before": float(tv_before),
         "tv_after": float(tv_after),
         "l1_change": float(l1_change),
-        "clip_hi_post": 0,  # Updated algorithm doesn't use clip_stats
-        "clip_lo_post": 0,  # Updated algorithm doesn't use clip_stats
+        "clip_hi_post": clips_hi,
+        "clip_lo_post": clips_lo,
         "first3_sum": float(np.sum(vol[: min(3, M)])),
         "g2": float((vol[2] / max(vol[1], 1e-12)) if M > 2 else 0.0),
+        "m2": m2,
+        "std_m": std_m,
+        "sign_changes": 0,  # Will be calculated in penalties
+        "iter_fix_loops": iter_fix_loops,
     }
 
     return (

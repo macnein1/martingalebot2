@@ -418,12 +418,127 @@ def penalty_wave(volumes: np.ndarray, lambda_v2: float = 0.1) -> float:
     return sum_abs_delta_g + lambda_v2 * sum_abs_second_diff
 
 
+@njit(cache=True, fastmath=True)
+def penalty_uniform_martingale(martingales: np.ndarray, target_std: float = 0.10) -> float:
+    """
+    Calculate penalty for uniform martingale pattern (low diversity).
+    
+    Args:
+        martingales: Martingale percentages (first element should be 0)
+        target_std: Target standard deviation for diversity
+        
+    Returns:
+        Penalty for low diversity (0 if std >= target_std)
+    """
+    if martingales.size <= 2:
+        return 0.0
+    
+    # Calculate m_i = g_i - 1 (growth ratio minus 1)
+    m_values = np.empty(martingales.size - 1)
+    for i in range(1, martingales.size):
+        m_values[i-1] = martingales[i] / 100.0  # Convert percentage to ratio
+    
+    # Calculate standard deviation
+    mean_m = np.mean(m_values)
+    var_m = 0.0
+    for i in range(m_values.size):
+        diff = m_values[i] - mean_m
+        var_m += diff * diff
+    var_m /= m_values.size
+    std_m = math.sqrt(var_m)
+    
+    # Penalty for low diversity
+    return max(0.0, target_std - std_m)
+
+
+@njit(cache=True, fastmath=True)
+def penalty_low_entropy(martingales: np.ndarray, target_entropy: float = 1.0) -> float:
+    """
+    Calculate penalty for low entropy in martingale pattern.
+    
+    Args:
+        martingales: Martingale percentages (first element should be 0)
+        target_entropy: Target entropy value
+        
+    Returns:
+        Penalty for low entropy (0 if entropy >= target_entropy)
+    """
+    if martingales.size <= 2:
+        return 0.0
+    
+    # Calculate m_i = g_i - 1 (growth ratio minus 1)
+    m_values = np.empty(martingales.size - 1)
+    for i in range(1, martingales.size):
+        m_values[i-1] = martingales[i] / 100.0  # Convert percentage to ratio
+    
+    # Calculate entropy
+    m_sum = np.sum(m_values)
+    if m_sum <= 1e-12:
+        return target_entropy  # Maximum penalty for zero sum
+    
+    entropy = 0.0
+    for i in range(m_values.size):
+        if m_values[i] > 1e-12:
+            p = m_values[i] / m_sum
+            entropy -= p * math.log(p)
+    
+    # Penalty for low entropy
+    return max(0.0, target_entropy - entropy)
+
+
+@njit(cache=True, fastmath=True)
+def penalty_flat_blocks(volumes: np.ndarray, k_front: int = 3) -> float:
+    """
+    Calculate penalty for flat block patterns (blocks mode).
+    
+    Args:
+        volumes: Volume percentages
+        k_front: Number of front orders to consider as blocks
+        
+    Returns:
+        Penalty for flat blocks (0 if good variation)
+    """
+    if volumes.size <= k_front:
+        return 0.0
+    
+    # Calculate average martingales for each block
+    # For simplicity, we'll use volume ratios as proxy for martingales
+    block_means = []
+    
+    # Front block (first k_front orders)
+    front_sum = 0.0
+    for i in range(k_front):
+        front_sum += volumes[i]
+    front_mean = front_sum / k_front
+    block_means.append(front_mean)
+    
+    # Tail block (remaining orders)
+    tail_sum = 0.0
+    for i in range(k_front, volumes.size):
+        tail_sum += volumes[i]
+    tail_mean = tail_sum / (volumes.size - k_front)
+    block_means.append(tail_mean)
+    
+    # Count sign changes in block means
+    sign_changes = 0
+    for i in range(1, len(block_means)):
+        if (block_means[i] - block_means[i-1]) * (block_means[i-1] - (block_means[i-2] if i > 1 else block_means[i-1])) < 0:
+            sign_changes += 1
+    
+    # Penalty: require at least 1 sign change (1 up + 1 down)
+    return max(0.0, 2.0 - sign_changes)
+
+
 def compute_shape_penalties(volumes: np.ndarray, indents: np.ndarray,
                             first_volume_target: float, first_indent_target: float,
                             g_min: float, g_max: float,
-                            k_front: int, front_cap: float) -> Dict[str, float]:
+                            k_front: int, front_cap: float,
+                            martingales: np.ndarray = None,
+                            target_std: float = 0.10,
+                            use_entropy: bool = False,
+                            entropy_target: float = 1.0) -> Dict[str, float]:
     """Compute shape-specific penalties after repair."""
-    return {
+    penalties = {
         "penalty_first_fixed": penalty_first_fixed(volumes, indents, first_volume_target, first_indent_target),
         "penalty_second_leq": penalty_second_leq(volumes),
         "penalty_g_band": penalty_g_band(volumes, g_min, g_max),
@@ -431,6 +546,16 @@ def compute_shape_penalties(volumes: np.ndarray, indents: np.ndarray,
         "penalty_tv_vol": penalty_total_variation_vol(volumes),
         "penalty_wave": penalty_wave(volumes, 0.1),
     }
+    
+    # Add new diversity penalties if martingales provided
+    if martingales is not None:
+        penalties["penalty_uniform"] = penalty_uniform_martingale(martingales, target_std)
+        penalties["penalty_flat_blocks"] = penalty_flat_blocks(volumes, k_front)
+        
+        if use_entropy:
+            penalties["penalty_low_entropy"] = penalty_low_entropy(martingales, entropy_target)
+    
+    return penalties
 
 
 def compute_all_penalties(volumes: np.ndarray, martingales: np.ndarray, 

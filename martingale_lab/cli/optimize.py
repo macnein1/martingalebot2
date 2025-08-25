@@ -80,6 +80,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--isotonic-tail", choices=["on", "off"], default="off",
                        help="Apply isotonic smoothing on tail (i>=2).")
     
+    # New hard constraints
+    parser.add_argument("--m2-min", type=float, default=0.10,
+                       help="Minimum m2 (v1 >= v0*(1+m2_min))")
+    parser.add_argument("--m2-max", type=float, default=1.00,
+                       help="Maximum m2 (v1 <= v0*(1+m2_max))")
+    parser.add_argument("--m-min", type=float, default=0.05,
+                       help="Minimum martingale for i>=2 (g_i >= 1+m_min)")
+    parser.add_argument("--m-max", type=float, default=1.00,
+                       help="Maximum martingale for i>=2 (g_i <= 1+m_max)")
+    parser.add_argument("--firstK-min", type=float, default=1.0,
+                       help="Minimum sum of first K orders")
+    parser.add_argument("--strict-inc-eps", type=float, default=1e-5,
+                       help="Strict increase epsilon (v_i >= v_{i-1} + eps)")
+    
+    # New soft penalties
+    parser.add_argument("--target-std", type=float, default=0.10,
+                       help="Target standard deviation for martingale diversity")
+    parser.add_argument("--w-varm", type=float, default=2.0,
+                       help="Weight for variance/entropy penalties")
+    parser.add_argument("--w-blocks", type=float, default=1.0,
+                       help="Weight for block shape penalties")
+    parser.add_argument("--use-entropy", choices=["on", "off"], default="off",
+                       help="Enable entropy-based diversity penalty")
+    parser.add_argument("--entropy-target", type=float, default=1.0,
+                       help="Target entropy value for diversity penalty")
+    
     # Optimization parameters
     parser.add_argument("--batches", type=int, default=100,
                        help="Maximum number of batches")
@@ -240,6 +266,21 @@ def create_orchestrator_config(args: argparse.Namespace) -> tuple[DCAConfig, Orc
         k_front=args.k_front,
         isotonic_tail=iso_tail,
         
+        # New hard constraints
+        m2_min=args.m2_min,
+        m2_max=args.m2_max,
+        m_min=args.m_min,
+        m_max=args.m_max,
+        firstK_min=args.firstK_min,
+        strict_inc_eps=args.strict_inc_eps,
+        
+        # New soft penalties
+        target_std=args.target_std,
+        w_varm=args.w_varm,
+        w_blocks=args.w_blocks,
+        use_entropy=(args.use_entropy == "on"),
+        entropy_target=args.entropy_target,
+        
         # Penalty weights
         penalty_preset=args.penalty_preset,
         w_fixed=penalty_weights["w_fixed"],
@@ -314,7 +355,13 @@ def log_config_summary(dca_config: DCAConfig, orch_config: OrchestratorConfig, r
                 "g_post_band": f"{dca_config.g_post_min},{dca_config.g_post_max}",
                 "front_cap": dca_config.front_cap,
                 "k_front": dca_config.k_front,
-                "isotonic_tail": dca_config.isotonic_tail
+                "isotonic_tail": dca_config.isotonic_tail,
+                "m2_min": dca_config.m2_min,
+                "m2_max": dca_config.m2_max,
+                "m_min": dca_config.m_min,
+                "m_max": dca_config.m_max,
+                "firstK_min": dca_config.firstK_min,
+                "strict_inc_eps": dca_config.strict_inc_eps
             },
             "penalties": {
                 "preset": dca_config.penalty_preset,
@@ -323,7 +370,12 @@ def log_config_summary(dca_config: DCAConfig, orch_config: OrchestratorConfig, r
                 "w_gband": dca_config.w_gband,
                 "w_front": dca_config.w_front,
                 "w_tv": dca_config.w_tv,
-                "w_wave": dca_config.w_wave
+                "w_wave": dca_config.w_wave,
+                "w_varm": dca_config.w_varm,
+                "w_blocks": dca_config.w_blocks,
+                "target_std": dca_config.target_std,
+                "use_entropy": dca_config.use_entropy,
+                "entropy_target": dca_config.entropy_target
             },
             "pruning": {
                 "enabled": orch_config.prune_enabled,

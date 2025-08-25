@@ -204,6 +204,21 @@ class DCAConfig:
     front_cap: float = 5.0
     k_front: int = 3
     isotonic_tail: bool = False
+    
+    # New hard constraints
+    m2_min: float = 0.10
+    m2_max: float = 1.00
+    m_min: float = 0.05
+    m_max: float = 1.00
+    firstK_min: float = 1.0
+    strict_inc_eps: float = 1e-5
+    
+    # New soft penalties
+    target_std: float = 0.10
+    w_varm: float = 2.0
+    w_blocks: float = 1.0
+    use_entropy: bool = False
+    entropy_target: float = 1.0
 
     # Penalty weight preset and overrides
     penalty_preset: Optional[str] = None
