@@ -11,6 +11,31 @@ from martingale_lab.core.repair import hard_clip_local_growth, isotonic_non_decr
 import math
 
 
+# helpers
+def _clip_local_band_forward(vol, start_idx, gmin, gmax):
+    """i>=start_idx için v[i] ∈ [v[i-1]*gmin, v[i-1]*gmax] ileri tarama."""
+    n = len(vol)
+    for i in range(max(1, start_idx), n):
+        lo = vol[i-1] * gmin
+        hi = vol[i-1] * gmax
+        if vol[i] < lo:
+            vol[i] = lo
+        elif vol[i] > hi:
+            vol[i] = hi
+    return vol
+
+
+def _rescale_block(vol, start_idx, target_sum):
+    """v[start_idx:] toplamını tek faktörle target_sum yap; prefix'i dokunma."""
+    cur = sum(vol[start_idx:])
+    if cur <= 0:
+        return vol
+    f = target_sum / cur
+    for i in range(start_idx, len(vol)):
+        vol[i] *= f
+    return vol
+
+
 @njit(cache=True, fastmath=True)
 def normalize_volumes_softmax(raw_volumes: np.ndarray, temperature: float = 1.0) -> np.ndarray:
     """
@@ -625,37 +650,44 @@ def enforce_schedule_shape_fixed(
     if total > 1e-9:
         vol *= 100.0 / total
 
-    # Post-normalize hard local band clip to eliminate jumps after normalization
-    #  - Keep v0 fixed, enforce v1 <= v0, clip i>=2 to [g_min_post, g_max_post]
-    vol_clipped, clip_stats = hard_clip_local_growth(vol, g_min_post, g_max_post)
-    # Renormalize with single scale for i>=2 while keeping v0 and v1 relation
+    # 0) v0 sabit, v1 = min(v1, v0) zaten yapılıyor
+    vol[0] = first_volume_target
     if M > 1:
-        # Fix v0, v1 := min(v1, v0)
-        vol_clipped[0] = first_volume_target
-        vol_clipped[1] = min(vol_clipped[1], vol_clipped[0])
-        tail_sum = float(np.sum(vol_clipped[2:])) if M > 2 else 0.0
-        target_tail = max(0.0, 100.0 - vol_clipped[0] - vol_clipped[1])
-        if tail_sum > 1e-12:
-            s_tail = target_tail / tail_sum
-            vol_clipped[2:] *= s_tail
-        elif M > 2:
-            vol_clipped[2:] = target_tail / (M - 2)
-        else:
-            vol_clipped[1] = target_tail
-    else:
-        vol_clipped[0] = 100.0
+        vol[1] = min(vol[1], vol[0])
 
-    # Optional isotonic smoothing on tail (i>=2) to guarantee monotonicity
-    if isotonic_tail and M > 2:
-        tail_iso = isotonic_non_decreasing(vol_clipped[2:])
-        # Scale tail back to preserve sum 100 with fixed v0,v1
-        target_tail = max(0.0, 100.0 - vol_clipped[0] - vol_clipped[1])
-        cur_tail = float(np.sum(tail_iso))
-        if cur_tail > 1e-12:
-            tail_iso *= target_tail / cur_tail
-        vol_clipped[2:] = tail_iso
+    # 1) tail hedef toplam (v2..n-1)
+    S_tail = 100.0 - vol[0] - vol[1]
 
-    vol = vol_clipped
+    # 2) önce i>=2 ham tail'i bu toplamla normalize et (tek faktör)
+    if M > 2:
+        vol = _rescale_block(vol, start_idx=2, target_sum=S_tail)
+
+    # 3) g2'yi kesin sınırla: v2 ∈ [v1*gmin_post, v1*gmax_post]
+    if M > 2:
+        lo2 = vol[1] * g_min_post
+        hi2 = vol[1] * g_max_post
+        vol[2] = min(max(vol[2], lo2), hi2)
+
+    # 4) v3..n-1'i S₃ = S_tail - v2 hedefine ölçekle (v2'ye dokunma → g2 korunur)
+    if M > 3:
+        S3 = S_tail - vol[2]
+        if S3 > 0:
+            vol = _rescale_block(vol, start_idx=3, target_sum=S3)
+
+        # 5) ölçeklemeden bozulan yerel bantları i>=3 için tekrar kliple
+        vol = _clip_local_band_forward(vol, start_idx=3, gmin=g_min_post, gmax=g_max_post)
+
+        # 6) bir kez daha yalnızca i>=3 bloğunu S3 hedefine rescale et (genelde tek iter yeter)
+        vol = _rescale_block(vol, start_idx=3, target_sum=S3)
+
+    # (opsiyonel) isotonic tail istiyorsan burada i>=3'e uygula, ardından YİNE start_idx=3 rescale
+    if isotonic_tail and M > 3:
+        tail_iso = isotonic_non_decreasing(vol[3:])
+        vol[3:] = tail_iso
+        # Scale tail back to preserve sum 100 with fixed v0,v1,v2
+        S3 = S_tail - vol[2]
+        if S3 > 0:
+            vol = _rescale_block(vol, start_idx=3, target_sum=S3)
 
     # Repair indents to be non-decreasing and anchored at first_indent_target
     for i in range(1, len(ind)):
@@ -704,8 +736,8 @@ def enforce_schedule_shape_fixed(
         "tv_before": float(tv_before),
         "tv_after": float(tv_after),
         "l1_change": float(l1_change),
-        "clip_hi_post": int(clip_stats.get("hi", 0)),
-        "clip_lo_post": int(clip_stats.get("lo", 0)),
+        "clip_hi_post": 0,  # Updated algorithm doesn't use clip_stats
+        "clip_lo_post": 0,  # Updated algorithm doesn't use clip_stats
         "first3_sum": float(np.sum(vol[: min(3, M)])),
         "g2": float((vol[2] / max(vol[1], 1e-12)) if M > 2 else 0.0),
     }
