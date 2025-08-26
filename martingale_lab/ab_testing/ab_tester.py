@@ -45,9 +45,16 @@ class ABTester:
     - Monte Carlo simulation
     """
     
-    def __init__(self, db_path: str = "ab_tests.db"):
+    def __init__(self, 
+                 db_path: str = "ab_tests.db",
+                 confidence_level: float = 0.95,
+                 min_samples: int = 30):
         self.db_path = db_path
+        self.confidence_level = confidence_level
+        self.min_samples = min_samples
         self._init_database()
+        self.results_a = []
+        self.results_b = []
         self.confidence_levels = {
             'low': 0.90,
             'medium': 0.95,
@@ -583,9 +590,65 @@ class ABTester:
             'recommendation': best_strategy[0],
             'score': best_strategy[1],
             'reasoning': reasoning,
+            'strategy_scores': strategy_scores,
             'market_conditions': {
                 'volatility': market_volatility,
-                'trend': market_trend,
-                'risk_tolerance': risk_tolerance
+                'trend': market_trend
             }
+        }
+    
+    def add_result(self, strategy: str, value: float):
+        """
+        Add a result for simple A/B testing.
+        
+        Args:
+            strategy: 'A' or 'B'
+            value: Result value (e.g., return, score)
+        """
+        if strategy == 'A':
+            self.results_a.append(value)
+        elif strategy == 'B':
+            self.results_b.append(value)
+        else:
+            raise ValueError(f"Strategy must be 'A' or 'B', got {strategy}")
+    
+    def get_results(self) -> Dict[str, Any]:
+        """
+        Get simple A/B test results.
+        
+        Returns:
+            Dictionary with winner, confidence, and statistics
+        """
+        if len(self.results_a) < self.min_samples or len(self.results_b) < self.min_samples:
+            return {
+                'winner': 'INSUFFICIENT_DATA',
+                'confidence': 0.0,
+                'message': f'Need at least {self.min_samples} samples per strategy'
+            }
+        
+        # Perform t-test
+        t_stat, p_value = stats.ttest_ind(self.results_a, self.results_b)
+        
+        # Determine winner
+        mean_a = np.mean(self.results_a)
+        mean_b = np.mean(self.results_b)
+        
+        if p_value < (1 - self.confidence_level):
+            winner = 'A' if mean_a > mean_b else 'B'
+            confidence = 1 - p_value
+        else:
+            winner = 'NO_DIFFERENCE'
+            confidence = p_value
+        
+        return {
+            'winner': winner,
+            'confidence': confidence,
+            'p_value': p_value,
+            't_statistic': t_stat,
+            'mean_a': mean_a,
+            'mean_b': mean_b,
+            'std_a': np.std(self.results_a),
+            'std_b': np.std(self.results_b),
+            'samples_a': len(self.results_a),
+            'samples_b': len(self.results_b)
         }

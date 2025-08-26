@@ -31,7 +31,8 @@ class BayesianOptimizer:
     
     def __init__(
         self,
-        param_bounds: Dict[str, Tuple[float, float]],
+        param_bounds: Dict[str, Tuple[float, float]] = None,
+        bounds: Dict[str, Tuple[float, float]] = None,  # Alias for param_bounds
         n_initial: int = 10,
         acquisition: str = "ei",  # Expected Improvement
         xi: float = 0.01,  # Exploration parameter
@@ -47,6 +48,12 @@ class BayesianOptimizer:
             xi: Exploration vs exploitation trade-off
             random_state: Random seed
         """
+        # Allow both 'bounds' and 'param_bounds' for compatibility
+        if param_bounds is None and bounds is not None:
+            param_bounds = bounds
+        elif param_bounds is None and bounds is None:
+            raise ValueError("Either 'param_bounds' or 'bounds' must be provided")
+        
         self.param_bounds = param_bounds
         self.param_names = list(param_bounds.keys())
         self.n_params = len(self.param_names)

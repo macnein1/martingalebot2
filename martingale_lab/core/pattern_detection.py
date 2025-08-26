@@ -4,7 +4,7 @@ Micro pattern detection for identifying problematic patterns in martingale strat
 
 import numpy as np
 from numba import njit
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any
 
 
 @njit(cache=True)
@@ -163,7 +163,7 @@ def detect_stagnation(m: np.ndarray, window: int = 5, threshold: float = 0.03) -
 def analyze_micro_patterns(
     volumes: np.ndarray,
     martingales: np.ndarray
-) -> Dict[str, any]:
+) -> Dict[str, Any]:
     """
     Comprehensive micro pattern analysis.
     
@@ -180,6 +180,7 @@ def analyze_micro_patterns(
     plateaus = detect_plateaus(martingales)
     analysis['plateau_count'] = len(plateaus)
     analysis['max_plateau_length'] = max([p[1] for p in plateaus], default=0)
+    analysis['plateau_length'] = analysis['max_plateau_length']  # Add for compatibility
     analysis['plateau_zones'] = plateaus
     
     # Detect zigzag

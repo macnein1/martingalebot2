@@ -198,8 +198,10 @@ def compute_exit_ease_metrics(needpct: np.ndarray, volumes: np.ndarray) -> Dict[
         front_tail_ratio = 1.0
     
     return {
-        'ee_harmonic': harmonic,
-        'ee_tail_weighted': tail_weighted,
+        'harmonic_mean': harmonic,  # Standard key name
+        'tail_weighted_avg': tail_weighted,  # Standard key name
+        'ee_harmonic': harmonic,  # Also keep old name for compatibility
+        'ee_tail_weighted': tail_weighted,  # Also keep old name for compatibility
         'ee_q1': q1_ee,
         'ee_q2': q2_ee,
         'ee_q3': q3_ee,

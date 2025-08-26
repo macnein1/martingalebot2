@@ -258,7 +258,8 @@ def calculate_risk_parity_weights(
 def calculate_portfolio_metrics(
     volumes: np.ndarray,
     returns: Optional[np.ndarray] = None,
-    benchmark_returns: Optional[np.ndarray] = None
+    benchmark_returns: Optional[np.ndarray] = None,
+    risk_free_rate: float = 0.02
 ) -> Dict[str, float]:
     """
     Calculate comprehensive portfolio metrics.
