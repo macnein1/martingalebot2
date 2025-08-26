@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional, Tuple
 import math
+import traceback
 
 from martingale_lab.utils.logging import get_eval_logger, should_log_eval
 from martingale_lab.core.constraints import enforce_schedule_shape_fixed
@@ -395,7 +396,7 @@ def evaluation_function(
          price_step_pct,
          repair_diag) = enforce_schedule_shape_fixed(
             indent_pct_initial,
-            volume_pct_initial.tolist(),
+            volume_pct_initial,  # Already a list, no need for .tolist()
             base_price,
             first_volume_target,
             first_indent_target,
@@ -454,6 +455,10 @@ def evaluation_function(
         
         # Calculate repair diagnostics
         volume_pct_np = np.asarray(volume_pct, dtype=np.float64)
+        
+        # Import at the beginning to avoid UnboundLocalError
+        from martingale_lab.core.repair import compute_m_from_v
+        
         m = compute_m_from_v(volume_pct_np)
         
         # Import exit-ease metrics
@@ -580,7 +585,7 @@ def evaluation_function(
         penalties["P_wave"] = float(max(0.0, -wave_score))
         
         # New shape penalties after repair
-        from martingale_lab.core.repair import compute_m_from_v
+        # (compute_m_from_v already imported above)
         
         # Compute shape-related penalties
         shape_pens = compute_shape_penalties(
@@ -728,17 +733,19 @@ def evaluation_function(
     except Exception as e:
         # Log evaluation error only if sampling allows it
         duration_ms = (time.time() - start_time) * 1000
-        if should_log_eval():
-            logger.debug(
-                f"Evaluation failed: {str(e)}",
-                extra={
-                    "event": "EVAL_ERROR",
-                    "error": str(e),
-                    "duration_ms": duration_ms,
-                    "overlap": overlap_pct,
-                    "orders": num_orders
-                }
-            )
+        
+        # Always log exceptions for debugging
+        logger.error(
+            f"Evaluation failed with exception: {str(e)}",
+            extra={
+                "event": "EVAL_ERROR",
+                "error": str(e),
+                "traceback": traceback.format_exc(),
+                "duration_ms": duration_ms,
+                "overlap": overlap_pct,
+                "orders": num_orders
+            }
+        )
         
         # Never throw - return error state as complete dict
         return {

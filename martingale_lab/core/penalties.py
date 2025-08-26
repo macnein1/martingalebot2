@@ -720,33 +720,109 @@ def penalty_tailweak(volumes: np.ndarray, tail_floor: float = 32.0) -> float:
 @njit(cache=True, fastmath=True)
 def penalty_slope(m_tail: np.ndarray, delta_soft: float = 0.20, delta_cap: float = 0.25) -> float:
     """
-    SP7: Quadratic penalty for |Δm| exceeding soft limit.
+    SP7: Penalty for large slope changes in martingale ratios.
+    
+    Quadratic penalty when |m[i] - m[i-1]| > delta_soft.
     
     Args:
-        m_tail: Martingale ratios for tail (m[2:])
-        delta_soft: Soft limit for |Δm| (quadratic penalty starts here)
-        delta_cap: Hard cap for |Δm| (strong penalty)
+        m_tail: Martingale ratios for i >= 2 (already m[i] = v[i]/v[i-1] - 1)
+        delta_soft: Soft threshold for slope changes
+        delta_cap: Hard cap for slope changes
         
     Returns:
-        Quadratic cost for slope violations
+        Penalty for excessive slope changes
     """
-    if m_tail.size <= 1:
+    if m_tail.size < 2:
         return 0.0
     
     penalty = 0.0
     for i in range(1, m_tail.size):
         delta = abs(m_tail[i] - m_tail[i-1])
-        
         if delta > delta_soft:
-            if delta <= delta_cap:
-                # Quadratic penalty between soft and cap
-                excess = delta - delta_soft
-                penalty += excess * excess
-            else:
-                # Strong penalty beyond cap
-                excess_cap = delta - delta_cap
-                excess_soft = delta_cap - delta_soft
-                penalty += excess_soft * excess_soft + 10.0 * excess_cap * excess_cap
+            # Quadratic penalty beyond soft threshold
+            excess = min(delta - delta_soft, delta_cap - delta_soft)
+            penalty += excess * excess
+    
+    return penalty
+
+
+@njit(cache=True, fastmath=True)
+def penalty_front_excess(volumes: np.ndarray, k_front: int, front_cap: float) -> float:
+    """
+    Legacy penalty for excessive front-loading.
+    
+    Args:
+        volumes: Volume percentages
+        k_front: Number of front orders
+        front_cap: Maximum allowed front sum
+        
+    Returns:
+        Penalty if front orders exceed cap
+    """
+    if volumes.size < k_front:
+        return 0.0
+    
+    front_sum = 0.0
+    for i in range(min(k_front, volumes.size)):
+        front_sum += volumes[i]
+    
+    if front_sum > front_cap:
+        return (front_sum - front_cap) / front_cap
+    return 0.0
+
+
+@njit(cache=True, fastmath=True)
+def penalty_total_variation(volumes: np.ndarray) -> float:
+    """
+    Penalty for high total variation in volumes.
+    
+    Args:
+        volumes: Volume percentages
+        
+    Returns:
+        Total variation penalty
+    """
+    if volumes.size < 2:
+        return 0.0
+    
+    tv = 0.0
+    for i in range(1, volumes.size):
+        tv += abs(volumes[i] - volumes[i-1])
+    
+    return tv / volumes.size
+
+
+@njit(cache=True, fastmath=True)
+def penalty_flat_blocks(volumes: np.ndarray, block_size: int = 3) -> float:
+    """
+    Penalty for flat blocks in volume distribution.
+    
+    Args:
+        volumes: Volume percentages
+        block_size: Size of blocks to check
+        
+    Returns:
+        Penalty for flat blocks
+    """
+    if volumes.size < block_size:
+        return 0.0
+    
+    penalty = 0.0
+    for i in range(volumes.size - block_size + 1):
+        block_var = 0.0
+        block_mean = 0.0
+        for j in range(block_size):
+            block_mean += volumes[i + j]
+        block_mean /= block_size
+        
+        for j in range(block_size):
+            diff = volumes[i + j] - block_mean
+            block_var += diff * diff
+        block_var /= block_size
+        
+        # Penalty for low variance (flat block)
+        if block_var < 0.01:  # Threshold for "flat"
+            penalty += 1.0 - block_var * 100.0
     
     return penalty
 
@@ -801,11 +877,13 @@ def compute_shape_penalties(
     """
     penalties = {}
     
-    # Front excess penalty
-    penalties["penalty_front_excess"] = penalty_front_excess(volumes, k_front, front_cap)
-    
-    # Total variation penalty
-    penalties["penalty_tv"] = penalty_total_variation(volumes)
+    # Legacy penalties with expected names
+    penalties["penalty_first_fixed"] = 0.0  # Not used anymore
+    penalties["penalty_second_leq"] = 0.0  # Not used anymore
+    penalties["penalty_g_band"] = 0.0  # Not used anymore
+    penalties["penalty_frontload"] = penalty_front_excess(volumes, k_front, front_cap)
+    penalties["penalty_tv_vol"] = penalty_total_variation(volumes)
+    penalties["penalty_wave"] = 0.0  # Handled separately
     
     # Second order band penalty (SP1)
     if volumes.size >= 2:
