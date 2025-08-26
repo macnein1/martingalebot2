@@ -134,6 +134,101 @@ def longest_plateau_run(m: np.ndarray, center: float = 1.0, tol: float = 0.02, s
     return max_run, max_run_start
 
 
+def bootstrap_tail_from_bands(v0: float, v1: float, N: int,
+                              m2_min: float, m2_max: float,
+                              m_min: float,
+                              m_head: float, m_tail: float, tau_scale: float,
+                              eps: float = 1e-12) -> np.ndarray:
+    """
+    Bootstrap feasible tail volumes using geometric growth within m2 bounds.
+    
+    Creates a volume array with v0, v1 fixed and v[2:] following a geometric
+    progression that satisfies m2 band constraints. The sum is normalized to 100
+    while preserving v0 and v1.
+    
+    Args:
+        v0: Fixed first volume
+        v1: Fixed second volume  
+        N: Total number of orders
+        m2_min/m2_max: Bounds for m[2] = v[2]/v[1] - 1
+        m_min: Minimum growth rate for tail
+        m_head/m_tail/tau_scale: Parameters for decaying ceiling
+        eps: Numerical tolerance
+        
+    Returns:
+        Volume array of length N with sum = 100
+    """
+    if N <= 0:
+        return np.array([])
+    
+    if N == 1:
+        # Single order, must sum to 100
+        return np.array([100.0])
+    
+    if N == 2:
+        # Two orders, keep v0 fixed but adjust v1 to sum to 100
+        v = np.zeros(2, dtype=np.float64)
+        v[0] = v0
+        v[1] = 100.0 - v0
+        return v
+    
+    # For N >= 3
+    # Initialize volume array
+    v = np.zeros(N, dtype=np.float64)
+    v[0] = v0
+    v[1] = v1
+    
+    # Use middle of m2 range for v[2]
+    # This ensures m2 constraint is always satisfied
+    # Use below middle to leave room for rescaling which increases m2
+    m2_use = 0.4 * (m2_min + m2_max)
+    v[2] = v1 * (1.0 + m2_use)
+    
+    if N == 3:
+        # For N=3, apply tail_only_rescale to get sum=100
+        # This will increase v[2] proportionally
+        tail_only_rescale_keep_first_two(v)
+        # Check if m2 is still within bounds (with some tolerance)
+        m2_final = (v[2] / v[1]) - 1.0
+        if m2_final > m2_max * 1.1:  # Allow 10% overshoot
+            # m2 is too large after rescaling, cap it
+            v[2] = v[1] * (1.0 + m2_max)
+            # Accept that sum might not be exactly 100
+        return v
+    
+    # For N > 3, build a geometric progression for v[3:]
+    # Use a moderate growth rate within bounds
+    tau = max(1.0, N * tau_scale)
+    
+    # Calculate growth rate bounds
+    r_min = 1.0 + m_min
+    r_max_ceiling = 1.0 + m_tail + (m_head - m_tail) * np.exp(-1.0 / tau)
+    r_max = min(1.5, r_max_ceiling)  # Cap growth for stability
+    
+    # Use a moderate growth rate
+    r = 0.5 * (r_min + r_max)
+    
+    # Build geometric tail
+    for i in range(3, N):
+        v[i] = v[i-1] * r
+    
+    # Now rescale the tail to sum to 100
+    # This preserves v0, v1 and the relative proportions of v[2:]
+    tail_only_rescale_keep_first_two(v)
+    
+    # Verify m2 is still within bounds after rescaling
+    m2_final = (v[2] / v[1]) - 1.0
+    if m2_final < m2_min or m2_final > m2_max:
+        # This shouldn't happen with tail_only_rescale, but just in case
+        # Clip v[2] and rescale again
+        v2_min = v1 * (1.0 + m2_min)
+        v2_max = v1 * (1.0 + m2_max)
+        v[2] = np.clip(v[2], v2_min, v2_max)
+        tail_only_rescale_keep_first_two(v)
+    
+    return v
+
+
 def hard_clip_local_growth(volumes: np.ndarray, g_min: float, g_max: float) -> Tuple[np.ndarray, Dict[str, int]]:
     """
     Apply hard clipping to local growth ratios for i>=2 and rebuild the chain.

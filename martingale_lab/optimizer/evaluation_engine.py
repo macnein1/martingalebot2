@@ -238,8 +238,9 @@ def evaluation_function(
     # New shape-enforcement parameters
     first_volume_target: float = 0.01,
     first_indent_target: float = 0.0,
-    k_front: int = 3,
-    front_cap: float = 5.0,
+    # Legacy parameters (deprecated, kept for compatibility)
+    k_front: int = 3,  # DEPRECATED: Use Q1/Q4 mass control instead
+    front_cap: float = 5.0,  # DEPRECATED: Use q1_cap instead
     g_min: float = 1.01,
     g_max: float = 1.20,
     # New penalty weights
@@ -255,10 +256,10 @@ def evaluation_function(
     blocks: int = 3,
     wave_amp_min: float = 0.05,
     wave_amp_max: float = 0.30,
-    # Post-band controls and isotonic smoothing
-    g_min_post: float = 1.01,
-    g_max_post: float = 1.30,
-    isotonic_tail: bool = False,
+    # Legacy post-band controls (deprecated)
+    g_min_post: float = 1.01,  # DEPRECATED: Use m_min/m_max instead
+    g_max_post: float = 1.30,  # DEPRECATED: Use decaying ceiling instead
+    isotonic_tail: bool = False,  # DEPRECATED: HC pipeline handles monotonicity
     # Penalty weight preset
     penalty_preset: Optional[str] = None,
     # New hard constraints
@@ -276,12 +277,16 @@ def evaluation_function(
     slope_cap: float = 0.25,
     q1_cap: float = 22.0,
     tail_floor: float = 32.0,
+    # Head budget parameters
+    head_budget_pct: float = 2.0,
+    use_head_budget: bool = False,
+    use_hc0_bootstrap: bool = True,
     # New soft penalties
     target_std: float = 0.10,
     w_varm: float = 2.0,
     w_blocks: float = 1.0,
-    use_entropy: bool = False,
-    entropy_target: float = 1.0,
+    use_entropy: bool = False,  # DEPRECATED: Entropy handled by SP penalties
+    entropy_target: float = 1.0,  # DEPRECATED
     # New SP penalty weights
     w_second: float = 3.0,
     w_plateau: float = 2.0,
@@ -391,13 +396,13 @@ def evaluation_function(
             base_price,
             first_volume_target,
             first_indent_target,
-            k_front,
-            front_cap,
+            k_front,  # Still passed for now, but ignored in new pipeline
+            front_cap,  # Still passed for now, but ignored in new pipeline
             g_min,
             g_max,
-            g_min_post,
-            g_max_post,
-            isotonic_tail,
+            g_min_post,  # Still passed for now, but ignored
+            g_max_post,  # Still passed for now, but ignored
+            isotonic_tail,  # Still passed for now, but ignored
             # New HC parameters
             m2_min,
             m2_max,
@@ -412,6 +417,9 @@ def evaluation_function(
             slope_cap,
             q1_cap,
             tail_floor,
+            head_budget_pct,
+            use_head_budget,
+            use_hc0_bootstrap,
         )
         
         # Calculate core metrics from repaired arrays
@@ -471,11 +479,13 @@ def evaluation_function(
             "q4_share": float(repair_diag.get("q4_share", 0.0)),
             "plateau_max_run": int(repair_diag.get("plateau_max_run", 0)),
             "turn_count": int(repair_diag.get("turn_count", 0)),
+            "hc0_applied": bool(repair_diag.get("hc0_applied", False)),
+            "head_budget_applied": bool(repair_diag.get("head_budget_applied", False)),
             # Generation/repair flags
             "wave_mode": wave_mode,
             "anchors": int(anchors) if wave_mode == "anchors" else None,
             "blocks": int(blocks) if wave_mode == "blocks" else None,
-            "isotonic_applied": bool(isotonic_tail),
+            "isotonic_applied": bool(isotonic_tail),  # Legacy, always False now
         }
         if anchor_points_norm is not None:
             diagnostics["anchor_points"] = anchor_points_norm.tolist()

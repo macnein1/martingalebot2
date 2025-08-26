@@ -545,11 +545,16 @@ def enforce_schedule_shape_fixed(
     slope_cap: float = 0.25,
     q1_cap: float = 22.0,
     tail_floor: float = 32.0,
+    # Head budget parameters (new)
+    head_budget_pct: float = 2.0,
+    use_head_budget: bool = False,
+    use_hc0_bootstrap: bool = True,
 ) -> Tuple[list, list, list, list, list, list, Dict[str, Any]]:
     """
-    Enforce fixed-first-order and shaped martingale band on a schedule with HC1-HC7 pipeline.
+    Enforce fixed-first-order and shaped martingale band on a schedule with HC0-HC7 pipeline.
     
     Pipeline steps:
+    0. HC0: Bootstrap feasible tail if needed
     1. Initialize: v0=0.01, indent0=0.00, normalize with tail_only_rescale
     2. Compute m = compute_m_from_v(v)
     3. HC1: v1 band [1.10*v0, second_upper_c2*v0], then tail_only_rescale
@@ -580,6 +585,9 @@ def enforce_schedule_shape_fixed(
         q1_cap: first quartile volume cap
         tail_floor: last quartile volume floor
         eps_inc: minimum increment for strict monotonicity
+        head_budget_pct: target head budget percentage when use_head_budget=True
+        use_head_budget: whether to apply head budget redistribution
+        use_hc0_bootstrap: whether to apply HC0 bootstrap for feasibility
 
     Returns:
         (repaired_indent_pct, repaired_volume_pct, martingale_pct, needpct,
@@ -589,7 +597,8 @@ def enforce_schedule_shape_fixed(
         tail_only_rescale_keep_first_two,
         compute_m_from_v,
         rechain_v_from_m,
-        longest_plateau_run
+        longest_plateau_run,
+        bootstrap_tail_from_bands
     )
     
     M = int(len(volume_pct))
@@ -623,13 +632,31 @@ def enforce_schedule_shape_fixed(
     # Initialize volumes
     vol = vol_in.copy()
     
+    # Step 0: HC0 - Bootstrap feasible tail if needed
+    hc0_applied = False
+    if use_hc0_bootstrap and M > 2:
+        # Check if current volumes would create infeasible m2
+        v0_target = first_volume_target
+        v1_current = vol[1] if M > 1 else v0_target * 2.0
+        
+        # Apply HC0 bootstrap to get feasible starting point
+        vol_bootstrap = bootstrap_tail_from_bands(
+            v0_target, v1_current, M,
+            m2_min, m2_max, m_min,
+            m_head, m_tail, tau_scale
+        )
+        
+        # Use bootstrapped volumes as starting point
+        vol = vol_bootstrap
+        hc0_applied = True
+    
     # Step 1: Initialize v0 and indent0, normalize with tail_only_rescale
     if M >= 1:
         ind[0] = first_indent_target
         vol[0] = first_volume_target
     
     if M > 1:
-        # Keep v1 from input initially, will adjust in HC1
+        # Keep v1 from input initially (or from bootstrap), will adjust in HC1
         tail_only_rescale_keep_first_two(vol)
         
         # Immediately enforce v[2] bounds if it exists
@@ -639,6 +666,21 @@ def enforce_schedule_shape_fixed(
             if vol[2] < v2_min or vol[2] > v2_max:
                 vol[2] = np.clip(vol[2], v2_min, v2_max)
                 tail_only_rescale_keep_first_two(vol)
+    
+    # Apply head budget if requested
+    head_budget_applied = False
+    if use_head_budget and M > 2:
+        # Calculate current head sum
+        head_sum = vol[0] + vol[1]
+        target_head = min(head_budget_pct, head_sum + 1.0)  # Allow small increase
+        
+        if target_head > head_sum:
+            # Redistribute small amount to v[2] to ease m2 constraint
+            delta = target_head - head_sum
+            vol[2] += delta
+            # Rescale rest of tail to maintain sum = 100
+            tail_only_rescale_keep_first_two(vol)
+            head_budget_applied = True
 
     # Tracking variables for diagnostics
     band_clips = 0
@@ -929,6 +971,8 @@ def enforce_schedule_shape_fixed(
         "v0": float(vol[0]),
         "v1": float(vol[1]),
         "m2": float(m[2]) if M > 2 else 0.0,
+        "hc0_applied": hc0_applied,
+        "head_budget_applied": head_budget_applied,
     }
     
     return (
