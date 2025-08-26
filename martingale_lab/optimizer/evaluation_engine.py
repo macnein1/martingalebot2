@@ -289,6 +289,9 @@ def evaluation_function(
     w_tailweak: float = 2.0,
     w_slope: float = 1.0,
     w_wave_shape: float = 1.0,
+    # Adaptive parameters
+    use_adaptive: bool = False,
+    strategy_type: str = "balanced",
     **kwargs
 ) -> Dict[str, Any]:
     """
@@ -298,6 +301,40 @@ def evaluation_function(
     Never throws exceptions - returns error state in dict if needed.
     """
     start_time = time.time()
+    
+    # Import adaptive module
+    if use_adaptive:
+        from martingale_lab.core.adaptive import get_adaptive_parameters
+        
+        # Get adaptive parameters
+        adaptive_params = get_adaptive_parameters(
+            num_orders, 
+            overlap_pct,
+            strategy_type
+        )
+        
+        # Override with adaptive values
+        m2_min = adaptive_params.get('m2_min', m2_min)
+        m2_max = adaptive_params.get('m2_max', m2_max)
+        m_min = adaptive_params.get('m_min', m_min)
+        m_max = adaptive_params.get('m_max', m_max)
+        m_head = adaptive_params.get('m_head', m_head)
+        m_tail = adaptive_params.get('m_tail', m_tail)
+        tau_scale = adaptive_params.get('tau_scale', tau_scale)
+        slope_cap = adaptive_params.get('slope_cap', slope_cap)
+        q1_cap = adaptive_params.get('q1_cap', q1_cap)
+        tail_floor = adaptive_params.get('tail_floor', tail_floor)
+        
+        # Adaptive weights
+        w_front = adaptive_params.get('w_front', w_front)
+        w_tailweak = adaptive_params.get('w_tailweak', w_tailweak)
+        w_slope = adaptive_params.get('w_slope', w_slope)
+        w_plateau = adaptive_params.get('w_plateau', w_plateau)
+        
+        # Exit-ease weight adjustment
+        exit_ease_weight = adaptive_params.get('exit_ease_weight', 100.0)
+    else:
+        exit_ease_weight = 100.0
     
     # Log evaluation call only if sampling allows it
     if should_log_eval():
@@ -484,51 +521,29 @@ def evaluation_function(
         
         # Import exit-ease metrics
         from martingale_lab.core.metrics import compute_exit_ease_metrics
+        ee_metrics = compute_exit_ease_metrics(needpct, volume_pct)
         
-        # Compute exit-ease metrics
-        needpct_np = np.asarray(needpct, dtype=np.float64)
-        ee_metrics = compute_exit_ease_metrics(needpct_np, volume_pct_np)
-        
-        # Debug logging for HC steps
-        logger.debug(
-            f"POST-REPAIR: v[:5]={volume_pct_np[:5].round(3).tolist()}, "
-            f"m2={m[2] if len(m) > 2 else 0:.3f}, "
-            f"sum={np.sum(volume_pct_np):.6f}"
+        # Add micro pattern detection
+        from martingale_lab.core.pattern_detection import (
+            compute_pattern_penalties,
+            analyze_micro_patterns
         )
         
-        # Exit-ease logging
-        logger.debug(
-            f"EXIT-EASE: harmonic={ee_metrics['ee_harmonic']:.3f}, "
-            f"tail_weighted={ee_metrics['ee_tail_weighted']:.3f}, "
-            f"front_tail_ratio={ee_metrics['ee_front_tail_ratio']:.2f}"
+        # Compute pattern penalties
+        pattern_penalty = compute_pattern_penalties(
+            volume_pct,
+            martingale_pct,
+            w_plateau=w_plateau,
+            w_zigzag=1.0,  # Lower weight for zigzag
+            w_cliff=15.0,   # High penalty for cliffs
+            w_stagnation=2.0,
+            w_acceleration=3.0
         )
         
-        # Pattern detection logging
-        if len(m) > 2:
-            # Detect micro patterns
-            plateau_count = 0
-            sawtooth_count = 0
-            sudden_drops = 0
-            
-            for i in range(2, len(m)):
-                # Plateau detection
-                if abs(m[i] - 1.0) < 0.02:
-                    plateau_count += 1
-                
-                # Sudden drop detection
-                if i > 2 and m[i] < m[i-1] * 0.7:
-                    sudden_drops += 1
-                
-                # Sawtooth detection
-                if i > 3 and abs(m[i] - m[i-2]) < 0.01 and abs(m[i] - m[i-1]) > 0.1:
-                    sawtooth_count += 1
-            
-            logger.debug(
-                f"PATTERNS: plateau={plateau_count}, sawtooth={sawtooth_count}, "
-                f"sudden_drops={sudden_drops}, turn_count={repair_diag.get('turn_count', 0)}"
-            )
+        # Analyze patterns for diagnostics
+        pattern_analysis = analyze_micro_patterns(volume_pct, martingale_pct)
         
-        # Diagnostics (repaired)
+        # Add to diagnostics
         diagnostics = {
             "wci": float(_weight_center_index(volume_pct_np)),
             "sign_flips": int(_count_sign_flips(np.asarray(needpct, dtype=np.float64))),
@@ -554,6 +569,18 @@ def evaluation_function(
             "q4_share": float(repair_diag.get("q4_share", 0.0)),
             "plateau_max_run": int(repair_diag.get("plateau_max_run", 0)),
             "turn_count": int(repair_diag.get("turn_count", 0)),
+            # Exit-ease metrics
+            "ee_harmonic": float(ee_metrics.get("ee_harmonic", 0.0)),
+            "ee_tail_weighted": float(ee_metrics.get("ee_tail_weighted", 0.0)),
+            "ee_front_tail_ratio": float(ee_metrics.get("ee_front_tail_ratio", 0.0)),
+            "ee_balance_penalty": float(ee_metrics.get("ee_balance_penalty", 0.0)),
+            # Pattern analysis
+            "pattern_quality_score": float(pattern_analysis.get("pattern_quality_score", 0.0)),
+            "pattern_plateaus": int(pattern_analysis.get("plateau_count", 0)),
+            "pattern_zigzag": int(pattern_analysis.get("zigzag_count", 0)),
+            "pattern_cliffs": int(pattern_analysis.get("cliff_count", 0)),
+            "pattern_stagnation": int(pattern_analysis.get("stagnation_zones", 0)),
+            "pattern_max_acceleration": float(pattern_analysis.get("max_acceleration", 0.0)),
             "hc0_applied": bool(repair_diag.get("hc0_applied", False)),
             "head_budget_applied": bool(repair_diag.get("head_budget_applied", False)),
             # Generation/repair flags
@@ -704,9 +731,13 @@ def evaluation_function(
         
         # Final score
         penalty_sum = sum(penalties.values()) + shape_penalty_sum
+        
+        # Add pattern penalty
+        total_pattern_penalty = pattern_penalty
+        
         # Calculate final score with exit-ease bonus
         # Higher exit-ease (easier exits) should reduce (improve) the score
-        exit_ease_bonus = max(0.0, ee_metrics['ee_tail_weighted'] - 5.0) * 100.0  # Bonus for good exit-ease
+        exit_ease_bonus = max(0.0, ee_metrics['ee_tail_weighted'] - 5.0) * exit_ease_weight  # Adaptive weight
         exit_ease_penalty = ee_metrics['ee_balance_penalty'] * 10.0  # Penalty for unbalanced blocks
         
         score = (
@@ -715,6 +746,7 @@ def evaluation_function(
             + gamma * (1.0 - tail)
             + lambda_penalty * penalty_sum
             + shape_penalty_sum
+            + total_pattern_penalty  # Add pattern penalty
             - exit_ease_bonus  # Subtract bonus (lower score is better)
             + exit_ease_penalty  # Add penalty for imbalance
         )
