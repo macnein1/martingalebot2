@@ -521,7 +521,7 @@ def enforce_schedule_shape_fixed(
     indent_pct: list,
     volume_pct: list,
     base_price: float,
-    first_volume_target: float = 0.01,
+    first_volume_target: float = 1.0,  # Changed from 0.01 to 1.0
     first_indent_target: float = 0.0,
     k_front: int = 3,
     front_cap: float = 5.0,

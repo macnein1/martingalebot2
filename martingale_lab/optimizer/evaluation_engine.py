@@ -236,7 +236,7 @@ def evaluation_function(
     min_indent_step: float = 0.05,
     softmax_temp: float = 1.0,
     # New shape-enforcement parameters
-    first_volume_target: float = 0.01,
+    first_volume_target: float = 1.0,  # Changed from 0.01 to 1.0 for reasonable m2
     first_indent_target: float = 0.0,
     # Legacy parameters (deprecated, kept for compatibility)
     k_front: int = 3,  # DEPRECATED: Use Q1/Q4 mass control instead
@@ -348,22 +348,31 @@ def evaluation_function(
 
         # Ensure minimal pre-band (clip ratios for i>=2) and build monotone-biased raw chain
         for i in range(2, num_orders):
-            denom = max(vol_sample[i-1], 1e-12)
-            gi = vol_sample[i] / denom
-            gi = min(g_max, max(g_min, gi))
-            vol_sample[i] = vol_sample[i-1] * gi
+            if vol_sample[i] < vol_sample[i-1] * 1.01:
+                vol_sample[i] = vol_sample[i-1] * 1.01
 
-        # Normalize keeping v0 fixed, tail scaled with single factor
-        if num_orders > 1:
-            rest_sum = float(np.sum(vol_sample[1:]))
-            if rest_sum > 1e-12:
-                scale_rest = (100.0 - vol_sample[0]) / rest_sum
-                vol_sample[1:] *= scale_rest
-            else:
-                vol_sample[1:] = (100.0 - vol_sample[0]) / (num_orders - 1)
-        else:
-            vol_sample[0] = 100.0
-        volume_pct_initial = vol_sample.copy()
+        # Softmax normalization to get volume_pct
+        vol_sample = _softplus(vol_sample)
+        vol_sample = vol_sample / np.sum(vol_sample) * 100.0
+        volume_pct_initial = vol_sample.tolist()
+        
+        # Check if initial volumes are reasonable
+        if len(volume_pct_initial) > 2:
+            # If first two volumes take more than 30% of total, use geometric fallback
+            first_two_sum = volume_pct_initial[0] + volume_pct_initial[1]
+            if first_two_sum > 30.0 or first_two_sum < 0.5:
+                logger.debug(f"Initial volumes unreasonable (first_two={first_two_sum:.1f}%), using geometric fallback")
+                volume_pct_initial = []
+                v0 = 2.0  # Start with 2%
+                growth = 1.12  # 12% growth per order
+                for i in range(num_orders):
+                    if i == 0:
+                        volume_pct_initial.append(v0)
+                    else:
+                        volume_pct_initial.append(volume_pct_initial[-1] * growth)
+                # Normalize to 100%
+                total = sum(volume_pct_initial)
+                volume_pct_initial = [v / total * 100.0 for v in volume_pct_initial]
 
         # Optional preset overrides for penalty weights
         if penalty_preset:
@@ -447,6 +456,13 @@ def evaluation_function(
         volume_pct_np = np.asarray(volume_pct, dtype=np.float64)
         m = compute_m_from_v(volume_pct_np)
         
+        # Import exit-ease metrics
+        from martingale_lab.core.metrics import compute_exit_ease_metrics
+        
+        # Compute exit-ease metrics
+        needpct_np = np.asarray(needpct, dtype=np.float64)
+        ee_metrics = compute_exit_ease_metrics(needpct_np, volume_pct_np)
+        
         # Debug logging for HC steps
         logger.debug(
             f"POST-REPAIR: v[:5]={volume_pct_np[:5].round(3).tolist()}, "
@@ -454,24 +470,12 @@ def evaluation_function(
             f"sum={np.sum(volume_pct_np):.6f}"
         )
         
-        # Needpct distribution analysis
-        needpct_np = np.asarray(needpct, dtype=np.float64)
-        if len(needpct_np) > 0:
-            N = len(needpct_np)
-            q1_end = N // 4
-            q4_start = 3 * N // 4
-            
-            # Exit-ease calculation (1/needpct)
-            exit_ease = 1.0 / np.maximum(needpct_np, 0.1)
-            q1_median = np.median(exit_ease[:q1_end]) if q1_end > 0 else 0.0
-            q4_median = np.median(exit_ease[q4_start:]) if q4_start < N else 0.0
-            ratio = q1_median / q4_median if q4_median > 0 else 0.0
-            
-            logger.debug(
-                f"NEEDPCT: Q1_med={np.median(needpct_np[:q1_end]):.2f}%, "
-                f"Q4_med={np.median(needpct_np[q4_start:]):.2f}%, "
-                f"exit_ease_ratio={ratio:.2f}"
-            )
+        # Exit-ease logging
+        logger.debug(
+            f"EXIT-EASE: harmonic={ee_metrics['ee_harmonic']:.3f}, "
+            f"tail_weighted={ee_metrics['ee_tail_weighted']:.3f}, "
+            f"front_tail_ratio={ee_metrics['ee_front_tail_ratio']:.2f}"
+        )
         
         # Pattern detection logging
         if len(m) > 2:
@@ -535,6 +539,9 @@ def evaluation_function(
             diagnostics["anchor_points"] = anchor_points_norm.tolist()
         if anchor_logv is not None:
             diagnostics["anchor_logv"] = _ensure_json_serializable(anchor_logv)
+        
+        # Add exit-ease metrics to diagnostics
+        diagnostics.update(ee_metrics)
         
         # Penalties
         penalties: Dict[str, float] = {}
@@ -671,7 +678,20 @@ def evaluation_function(
         
         # Final score
         penalty_sum = sum(penalties.values()) + shape_penalty_sum
-        score = alpha * max_need + beta * var_need + gamma * tail + lambda_penalty * penalty_sum
+        # Calculate final score with exit-ease bonus
+        # Higher exit-ease (easier exits) should reduce (improve) the score
+        exit_ease_bonus = max(0.0, ee_metrics['ee_tail_weighted'] - 5.0) * 100.0  # Bonus for good exit-ease
+        exit_ease_penalty = ee_metrics['ee_balance_penalty'] * 10.0  # Penalty for unbalanced blocks
+        
+        score = (
+            alpha * max_need 
+            + beta * var_need 
+            + gamma * (1.0 - tail)
+            + lambda_penalty * penalty_sum
+            + shape_penalty_sum
+            - exit_ease_bonus  # Subtract bonus (lower score is better)
+            + exit_ease_penalty  # Add penalty for imbalance
+        )
         
         # Log successful evaluation only if sampling allows it
         duration_ms = (time.time() - start_time) * 1000
