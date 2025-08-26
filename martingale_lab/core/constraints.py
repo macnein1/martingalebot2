@@ -769,15 +769,35 @@ def enforce_schedule_shape_fixed(
         # Now rescale carefully to maintain sum=100 while preserving v0, v1
         tail_only_rescale_keep_first_two(vol)
         
-        # Verify m[2] is still in bounds after rescale
+        # CRITICAL FIX: After rescaling, m[2] might be out of bounds again
+        # Force v[2] to respect m2 bounds relative to the fixed v[1]
         m_check = compute_m_from_v(vol)
         if M > 2 and (m_check[2] < m2_min - 0.01 or m_check[2] > m2_max + 0.01):
             logger.warning(f"HC3: m[2]={m_check[2]:.3f} out of bounds after rescale, fixing...")
-            # Force v[2] to respect m2 bounds
-            v2_target = vol[1] * (1.0 + np.clip(m_check[2], m2_min, m2_max))
-            vol[2] = v2_target
-            tail_only_rescale_keep_first_two(vol)
+            # Directly set v[2] based on m2 bounds
+            # Use the midpoint of m2 range if current is out of bounds
+            if m_check[2] < m2_min:
+                m2_target = m2_min
+            elif m_check[2] > m2_max:
+                m2_target = m2_max
+            else:
+                m2_target = m_check[2]
+            
+            # Set v[2] directly
+            vol[2] = vol[1] * (1.0 + m2_target)
+            
+            # Now we need to rescale v[3:] to maintain sum=100
+            if M > 3:
+                tail_sum_target = 100.0 - vol[0] - vol[1] - vol[2]
+                tail_sum_current = np.sum(vol[3:])
+                if tail_sum_current > 0 and tail_sum_target > 0:
+                    scale_factor = tail_sum_target / tail_sum_current
+                    vol[3:] *= scale_factor
+                elif tail_sum_target > 0:
+                    # Distribute evenly if tail is zero
+                    vol[3:] = tail_sum_target / (M - 3)
         
+        # Final m computation
         m = compute_m_from_v(vol)
         logger.debug(f"HC3: After martingale bands, v[:5]={vol[:5].round(3).tolist() if M >= 5 else vol.round(3).tolist()}, m2={m[2]:.3f}")
     
@@ -826,6 +846,25 @@ def enforce_schedule_shape_fixed(
     
     # Step 7: Final tail-only rescale
     tail_only_rescale_keep_first_two(vol)
+    
+    # CRITICAL: After HC2 rescale, ensure m[2] is still valid
+    if M > 2:
+        m_check = compute_m_from_v(vol)
+        if m_check[2] < m2_min:
+            logger.debug(f"HC2: m[2]={m_check[2]:.3f} too small after rescale, fixing...")
+            # Force v[2] to respect m2_min
+            vol[2] = vol[1] * (1.0 + m2_min)
+            
+            # Rescale the rest of the tail to maintain sum=100
+            if M > 3:
+                tail_sum_target = 100.0 - vol[0] - vol[1] - vol[2]
+                tail_sum_current = np.sum(vol[3:])
+                if tail_sum_current > 0 and tail_sum_target > 0:
+                    scale_factor = tail_sum_target / tail_sum_current
+                    vol[3:] *= scale_factor
+                elif tail_sum_target > 0:
+                    # Distribute evenly if tail is zero
+                    vol[3:] = tail_sum_target / (M - 3)
     
     logger.debug(f"HC2: After strict monotonicity, v[:5]={vol[:5].round(3).tolist() if M >= 5 else vol.round(3).tolist()}")
     
@@ -943,6 +982,56 @@ def enforce_schedule_shape_fixed(
 
     # Final check: ensure v0 is still fixed
     vol[0] = first_volume_target
+    
+    # FINAL VALIDATION: Ensure m[2] is within bounds
+    if M > 2:
+        m_final = compute_m_from_v(vol)
+        if m_final[2] < m2_min - 0.001 or m_final[2] > m2_max + 0.001:
+            logger.warning(f"FINAL: m[2]={m_final[2]:.3f} out of bounds, forcing correction")
+            # Force v[2] to be at the appropriate bound
+            if m_final[2] < m2_min:
+                # Set to m2_min
+                target_m2 = m2_min
+            else:
+                # Set to m2_max
+                target_m2 = m2_max
+            
+            vol[2] = vol[1] * (1.0 + target_m2)
+            
+            # Rescale tail to maintain sum=100
+            if M > 3:
+                tail_sum_target = 100.0 - vol[0] - vol[1] - vol[2]
+                if tail_sum_target > 0:
+                    tail_sum_current = np.sum(vol[3:])
+                    if tail_sum_current > 0:
+                        vol[3:] *= tail_sum_target / tail_sum_current
+                    else:
+                        # Initialize tail with geometric progression
+                        for i in range(3, M):
+                            vol[i] = vol[i-1] * (1.0 + m_min)
+                        tail_sum_current = np.sum(vol[3:])
+                        if tail_sum_current > 0:
+                            vol[3:] *= tail_sum_target / tail_sum_current
+            
+            # Ensure monotonicity is maintained after rescaling
+            for i in range(3, M):
+                min_val = vol[i-1] + eps_inc
+                if vol[i] < min_val:
+                    vol[i] = min_val
+            
+            # Final normalization to ensure sum=100
+            total_sum = np.sum(vol)
+            if abs(total_sum - 100.0) > 0.01:
+                # Keep v0 and v1 fixed, rescale the rest
+                tail_sum = np.sum(vol[2:])
+                if tail_sum > 0:
+                    target_tail = 100.0 - vol[0] - vol[1]
+                    vol[2:] *= target_tail / tail_sum
+                    
+            # Double-check m[2] after all adjustments
+            m_final = compute_m_from_v(vol)
+            if M > 2:
+                logger.debug(f"FINAL: After correction, m[2]={m_final[2]:.3f}")
     
     # Repair indents to be non-decreasing
     for i in range(1, len(ind)):

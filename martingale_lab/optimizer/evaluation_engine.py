@@ -361,16 +361,37 @@ def evaluation_function(
         if len(volume_pct_initial) > 2:
             # If first two volumes take more than 30% of total, use geometric fallback
             first_two_sum = volume_pct_initial[0] + volume_pct_initial[1]
-            if first_two_sum > 30.0 or first_two_sum < 0.5:
-                logger.debug(f"Initial volumes unreasonable (first_two={first_two_sum:.1f}%), using geometric fallback")
+            
+            # Also check if volumes are too small or unbalanced
+            min_vol = min(volume_pct_initial)
+            max_vol = max(volume_pct_initial)
+            
+            if first_two_sum > 30.0 or first_two_sum < 0.5 or max_vol / (min_vol + 1e-10) > 100:
+                logger.debug(f"Initial volumes unreasonable (first_two={first_two_sum:.1f}%, ratio={max_vol/(min_vol+1e-10):.1f}), using geometric fallback")
                 volume_pct_initial = []
-                v0 = 2.0  # Start with 2%
-                growth = 1.12  # 12% growth per order
+                
+                # Create a reasonable geometric progression similar to your strategy
+                # Your strategy has m[2] ≈ 0.118, so growth ≈ 1.12
+                v0 = 1.0  # Start with 1% like your strategy
+                growth = 1.115  # 11.5% growth per order (similar to yours)
+                
                 for i in range(num_orders):
                     if i == 0:
                         volume_pct_initial.append(v0)
+                    elif i == 1:
+                        # Second order slightly higher than first
+                        volume_pct_initial.append(v0 * 1.10)
                     else:
-                        volume_pct_initial.append(volume_pct_initial[-1] * growth)
+                        # Geometric growth with slight variation
+                        base_growth = growth
+                        if i < 5:
+                            # Slower growth in early orders
+                            base_growth = 1.10 + (i - 2) * 0.02
+                        elif i > num_orders - 5:
+                            # Stronger growth in tail
+                            base_growth = growth * 1.05
+                        volume_pct_initial.append(volume_pct_initial[-1] * base_growth)
+                
                 # Normalize to 100%
                 total = sum(volume_pct_initial)
                 volume_pct_initial = [v / total * 100.0 for v in volume_pct_initial]
