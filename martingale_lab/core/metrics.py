@@ -8,20 +8,24 @@ from typing import Tuple, Dict, Any
 
 
 @njit(cache=True, fastmath=True)
-def compute_exit_ease(needpct: np.ndarray, guard_min: float = 0.1) -> np.ndarray:
+def compute_exit_ease(needpct: np.ndarray, guard_min: float = 0.001) -> np.ndarray:
     """
-    Compute exit-ease scores (inverse of needpct).
+    Compute exit-ease metric (inverse of need percentage).
     
-    Higher exit-ease means easier to exit at that order level.
+    Higher values = easier to exit at that level.
     
     Args:
-        needpct: Need percentages for each order
-        guard_min: Minimum needpct to avoid division by zero
+        needpct: Need percentages array
+        guard_min: Minimum value to avoid division by zero
         
     Returns:
         Exit-ease array (1/needpct)
     """
-    return 1.0 / np.maximum(needpct, guard_min)
+    # Ensure it's an array and apply maximum element-wise
+    result = np.zeros_like(needpct)
+    for i in range(len(needpct)):
+        result[i] = 1.0 / max(needpct[i], guard_min)
+    return result
 
 
 @njit(cache=True, fastmath=True)
@@ -155,13 +159,19 @@ def compute_exit_ease_metrics(needpct: np.ndarray, volumes: np.ndarray) -> Dict[
     Compute comprehensive exit-ease metrics.
     
     Args:
-        needpct: Need percentages
+        needpct: Need percentages (can be list or array)
         volumes: Volume percentages
         
     Returns:
-        Dictionary of metrics
+        Dictionary of exit-ease metrics
     """
-    # Basic exit-ease
+    # Ensure numpy arrays
+    if not isinstance(needpct, np.ndarray):
+        needpct = np.asarray(needpct, dtype=np.float64)
+    if not isinstance(volumes, np.ndarray):
+        volumes = np.asarray(volumes, dtype=np.float64)
+    
+    # Compute exit-ease scores
     exit_ease = compute_exit_ease(needpct)
     
     # Overall metrics

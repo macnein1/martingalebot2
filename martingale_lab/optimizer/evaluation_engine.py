@@ -543,6 +543,10 @@ def evaluation_function(
         # Analyze patterns for diagnostics
         pattern_analysis = analyze_micro_patterns(volume_pct, martingale_pct)
         
+        # Add portfolio metrics
+        from martingale_lab.core.portfolio_metrics import calculate_portfolio_metrics
+        portfolio_metrics = calculate_portfolio_metrics(volume_pct)
+        
         # Add to diagnostics
         diagnostics = {
             "wci": float(_weight_center_index(volume_pct_np)),
@@ -581,6 +585,14 @@ def evaluation_function(
             "pattern_cliffs": int(pattern_analysis.get("cliff_count", 0)),
             "pattern_stagnation": int(pattern_analysis.get("stagnation_zones", 0)),
             "pattern_max_acceleration": float(pattern_analysis.get("max_acceleration", 0.0)),
+            # Portfolio metrics
+            "sortino_ratio": float(portfolio_metrics.get("sortino_ratio", 0.0)),
+            "calmar_ratio": float(portfolio_metrics.get("calmar_ratio", 0.0)),
+            "omega_ratio": float(portfolio_metrics.get("omega_ratio", 0.0)),
+            "recovery_efficiency": float(portfolio_metrics.get("recovery_efficiency", 0.0)),
+            "tail_risk_ratio": float(portfolio_metrics.get("tail_risk_ratio", 0.0)),
+            "var_95": float(portfolio_metrics.get("var_95", 0.0)),
+            "cvar_95": float(portfolio_metrics.get("cvar_95", 0.0)),
             "hc0_applied": bool(repair_diag.get("hc0_applied", False)),
             "head_budget_applied": bool(repair_diag.get("head_budget_applied", False)),
             # Generation/repair flags

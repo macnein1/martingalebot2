@@ -148,7 +148,12 @@ def detect_stagnation(m: np.ndarray, window: int = 5, threshold: float = 0.03) -
     M = len(m)
     
     for i in range(2, M - window + 1):
-        window_avg = np.mean(m[i:i+window])
+        # Calculate window average manually for numba
+        window_sum = 0.0
+        for j in range(window):
+            window_sum += m[i + j]
+        window_avg = window_sum / window
+        
         if window_avg < threshold:
             stagnation_zones.append(i)
     
