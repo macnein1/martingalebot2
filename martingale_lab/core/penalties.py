@@ -529,6 +529,227 @@ def penalty_flat_blocks(volumes: np.ndarray, k_front: int = 3) -> float:
     return max(0.0, 2.0 - sign_changes)
 
 
+# ============= NEW PENALTY FUNCTIONS SP1-SP7 =============
+
+@njit(cache=True, fastmath=True)
+def penalty_second_band(v0: float, v1: float, v1_min_mult: float = 1.10, v1_max_mult: float = 2.0) -> float:
+    """
+    SP1: Penalty for v1 outside [v1_min_mult*v0, v1_max_mult*v0] band.
+    
+    Args:
+        v0: First volume value
+        v1: Second volume value
+        v1_min_mult: Minimum multiplier for v1/v0 ratio
+        v1_max_mult: Maximum multiplier for v1/v0 ratio
+        
+    Returns:
+        Squared penalty for violations
+    """
+    if v0 <= 1e-12:
+        return 0.0
+    
+    v1_min = v1_min_mult * v0
+    v1_max = v1_max_mult * v0
+    
+    penalty = 0.0
+    if v1 < v1_min:
+        penalty = (v1_min - v1) ** 2
+    elif v1 > v1_max:
+        penalty = (v1 - v1_max) ** 2
+    
+    return penalty
+
+
+@njit(cache=True, fastmath=True)
+def penalty_plateau(m_tail: np.ndarray, tol: float = 0.02, max_len: int = 3) -> float:
+    """
+    SP2: Penalty for plateau runs where |m - 1| < tol.
+    
+    Args:
+        m_tail: Martingale ratios for tail (m[2:])
+        tol: Tolerance for plateau detection
+        max_len: Maximum allowed plateau length
+        
+    Returns:
+        Sum of excess plateau lengths
+    """
+    if m_tail.size == 0:
+        return 0.0
+    
+    penalty = 0.0
+    current_run = 0
+    
+    for i in range(m_tail.size):
+        if abs(m_tail[i] - 1.0) < tol:
+            current_run += 1
+            if current_run > max_len:
+                penalty += 1.0  # Add 1 for each excess position
+        else:
+            current_run = 0
+    
+    return penalty
+
+
+@njit(cache=True, fastmath=True)
+def penalty_varm(m_tail: np.ndarray, target_std: float = 0.20) -> float:
+    """
+    SP3: Penalty for low variance in martingale ratios.
+    
+    Args:
+        m_tail: Martingale ratios for tail (m[2:])
+        target_std: Target standard deviation
+        
+    Returns:
+        max(0, target_std - std(m_tail))
+    """
+    if m_tail.size <= 1:
+        return target_std
+    
+    # Calculate standard deviation
+    mean_m = np.mean(m_tail)
+    var_m = 0.0
+    for i in range(m_tail.size):
+        diff = m_tail[i] - mean_m
+        var_m += diff * diff
+    var_m /= m_tail.size
+    std_m = math.sqrt(var_m)
+    
+    return max(0.0, target_std - std_m)
+
+
+@njit(cache=True, fastmath=True)
+def penalty_wave_shape(m_tail: np.ndarray, m_min: float, m_head: float, 
+                       m_tail_cap: float, tau: float, phase: float = 0.0) -> float:
+    """
+    SP4: L2 distance to ideal wave shape embedded in decaying ceiling.
+    
+    Args:
+        m_tail: Martingale ratios for tail (m[2:])
+        m_min: Minimum martingale value
+        m_head: Head value for decay
+        m_tail_cap: Tail value for decay
+        tau: Decay time constant
+        phase: Wave phase offset
+        
+    Returns:
+        L2 distance penalty (scaled by N)
+    """
+    if m_tail.size == 0:
+        return 0.0
+    
+    n = m_tail.size
+    penalty = 0.0
+    
+    for i in range(n):
+        # Compute ideal wave value with 1.5 waves
+        t = float(i) / max(1, n - 1)
+        wave_val = math.sin(1.5 * 2.0 * math.pi * t + phase)
+        
+        # Compute decaying ceiling
+        ceiling = m_tail_cap + (m_head - m_tail_cap) * math.exp(-i / max(1.0, tau))
+        
+        # Ideal value: wave scaled within [m_min, ceiling]
+        ideal = m_min + (ceiling - m_min) * (0.5 + 0.3 * wave_val)
+        
+        # L2 distance
+        diff = m_tail[i] - ideal
+        penalty += diff * diff
+    
+    # Scale by sqrt(n) to normalize
+    return math.sqrt(penalty / max(1, n))
+
+
+@njit(cache=True, fastmath=True)
+def penalty_front_share(volumes: np.ndarray, q1_cap: float = 22.0) -> float:
+    """
+    SP5: Penalty for first quartile exceeding cap.
+    
+    Args:
+        volumes: Volume percentages
+        q1_cap: Maximum allowed percentage for first quartile
+        
+    Returns:
+        Penalty for excess
+    """
+    if volumes.size == 0:
+        return 0.0
+    
+    n = volumes.size
+    q1_size = max(1, int(np.ceil(n / 4.0)))
+    
+    q1_sum = 0.0
+    for i in range(min(q1_size, n)):
+        q1_sum += volumes[i]
+    
+    if q1_sum > q1_cap:
+        return (q1_sum - q1_cap) ** 2
+    
+    return 0.0
+
+
+@njit(cache=True, fastmath=True)
+def penalty_tailweak(volumes: np.ndarray, tail_floor: float = 32.0) -> float:
+    """
+    SP6: Penalty for last quartile below floor.
+    
+    Args:
+        volumes: Volume percentages
+        tail_floor: Minimum required percentage for last quartile
+        
+    Returns:
+        Penalty for deficit
+    """
+    if volumes.size == 0:
+        return 0.0
+    
+    n = volumes.size
+    q4_size = max(1, int(np.ceil(n / 4.0)))
+    q4_start = max(0, n - q4_size)
+    
+    q4_sum = 0.0
+    for i in range(q4_start, n):
+        q4_sum += volumes[i]
+    
+    if q4_sum < tail_floor:
+        return (tail_floor - q4_sum) ** 2
+    
+    return 0.0
+
+
+@njit(cache=True, fastmath=True)
+def penalty_slope(m_tail: np.ndarray, delta_soft: float = 0.20, delta_cap: float = 0.25) -> float:
+    """
+    SP7: Quadratic penalty for |Δm| exceeding soft limit.
+    
+    Args:
+        m_tail: Martingale ratios for tail (m[2:])
+        delta_soft: Soft limit for |Δm| (quadratic penalty starts here)
+        delta_cap: Hard cap for |Δm| (strong penalty)
+        
+    Returns:
+        Quadratic cost for slope violations
+    """
+    if m_tail.size <= 1:
+        return 0.0
+    
+    penalty = 0.0
+    for i in range(1, m_tail.size):
+        delta = abs(m_tail[i] - m_tail[i-1])
+        
+        if delta > delta_soft:
+            if delta <= delta_cap:
+                # Quadratic penalty between soft and cap
+                excess = delta - delta_soft
+                penalty += excess * excess
+            else:
+                # Strong penalty beyond cap
+                excess_cap = delta - delta_cap
+                excess_soft = delta_cap - delta_soft
+                penalty += excess_soft * excess_soft + 10.0 * excess_cap * excess_cap
+    
+    return penalty
+
+
 def compute_shape_penalties(volumes: np.ndarray, indents: np.ndarray,
                             first_volume_target: float, first_indent_target: float,
                             g_min: float, g_max: float,
@@ -536,8 +757,24 @@ def compute_shape_penalties(volumes: np.ndarray, indents: np.ndarray,
                             martingales: np.ndarray = None,
                             target_std: float = 0.10,
                             use_entropy: bool = False,
-                            entropy_target: float = 1.0) -> Dict[str, float]:
-    """Compute shape-specific penalties after repair."""
+                            entropy_target: float = 1.0,
+                            # New SP parameters
+                            v1_min_mult: float = 1.10,
+                            v1_max_mult: float = 2.0,
+                            plateau_tol: float = 0.02,
+                            plateau_max_len: int = 3,
+                            target_std_varm: float = 0.20,
+                            q1_cap: float = 22.0,
+                            tail_floor: float = 32.0,
+                            slope_delta_soft: float = 0.20,
+                            slope_delta_cap: float = 0.25,
+                            wave_m_head: float = 0.40,
+                            wave_m_tail: float = 0.20,
+                            wave_tau_scale: float = 1/3,
+                            wave_phase: float = 0.0) -> Dict[str, float]:
+    """Compute shape-specific penalties after repair, including new SP1-SP7."""
+    from martingale_lab.core.repair import compute_m_from_v
+    
     penalties = {
         "penalty_first_fixed": penalty_first_fixed(volumes, indents, first_volume_target, first_indent_target),
         "penalty_second_leq": penalty_second_leq(volumes),
@@ -547,7 +784,41 @@ def compute_shape_penalties(volumes: np.ndarray, indents: np.ndarray,
         "penalty_wave": penalty_wave(volumes, 0.1),
     }
     
-    # Add new diversity penalties if martingales provided
+    # Add new SP penalties
+    if volumes.size > 1:
+        v0 = volumes[0]
+        v1 = volumes[1]
+        penalties["penalty_second_band"] = penalty_second_band(v0, v1, v1_min_mult, v1_max_mult)
+    else:
+        penalties["penalty_second_band"] = 0.0
+    
+    # Compute m for martingale-based penalties
+    if volumes.size > 2:
+        m = compute_m_from_v(volumes)
+        m_tail = m[2:]  # Tail martingales
+        
+        penalties["penalty_plateau"] = penalty_plateau(m_tail, plateau_tol, plateau_max_len)
+        penalties["penalty_varm"] = penalty_varm(m_tail, target_std_varm)
+        
+        # Wave shape penalty (need tau calculation)
+        n = volumes.size
+        tau = max(1.0, n * wave_tau_scale)
+        penalties["penalty_wave_shape"] = penalty_wave_shape(
+            m_tail, g_min - 1.0, wave_m_head, wave_m_tail, tau, wave_phase
+        )
+        
+        penalties["penalty_slope"] = penalty_slope(m_tail, slope_delta_soft, slope_delta_cap)
+    else:
+        penalties["penalty_plateau"] = 0.0
+        penalties["penalty_varm"] = 0.0
+        penalties["penalty_wave_shape"] = 0.0
+        penalties["penalty_slope"] = 0.0
+    
+    # Mass distribution penalties
+    penalties["penalty_front_share"] = penalty_front_share(volumes, q1_cap)
+    penalties["penalty_tailweak"] = penalty_tailweak(volumes, tail_floor)
+    
+    # Add old diversity penalties if martingales provided
     if martingales is not None:
         penalties["penalty_uniform"] = penalty_uniform_martingale(martingales, target_std)
         penalties["penalty_flat_blocks"] = penalty_flat_blocks(volumes, k_front)
