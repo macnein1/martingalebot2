@@ -796,9 +796,13 @@ def enforce_schedule_shape_fixed(
                 elif tail_sum_target > 0:
                     # Distribute evenly if tail is zero
                     vol[3:] = tail_sum_target / (M - 3)
+            
+            # Update m array after fixing
+            m = compute_m_from_v(vol)
+        else:
+            # Update m to be consistent
+            m = m_check
         
-        # Final m computation
-        m = compute_m_from_v(vol)
         logger.debug(f"HC3: After martingale bands, v[:5]={vol[:5].round(3).tolist() if M >= 5 else vol.round(3).tolist()}, m2={m[2]:.3f}")
     
     # Step 5: HC4 - Slope limits for smoothness
@@ -826,8 +830,31 @@ def enforce_schedule_shape_fixed(
         # Rescale to maintain sum=100
         tail_only_rescale_keep_first_two(vol)
         
-        # Update m for next steps
-        m = compute_m_from_v(vol)
+        # Check if m[2] is still within bounds after rescaling
+        m_check = compute_m_from_v(vol)
+        if M > 2 and (m_check[2] < m2_min - 0.01 or m_check[2] > m2_max + 0.01):
+            logger.debug(f"HC4: m[2]={m_check[2]:.3f} out of bounds after rescale, fixing...")
+            # Fix v[2] to respect m2 bounds
+            if m_check[2] < m2_min:
+                target_m2 = m2_min
+            else:
+                target_m2 = m2_max
+            
+            vol[2] = vol[1] * (1.0 + target_m2)
+            
+            # Rescale tail to maintain sum=100
+            if M > 3:
+                tail_sum_target = 100.0 - vol[0] - vol[1] - vol[2]
+                tail_sum_current = np.sum(vol[3:])
+                if tail_sum_current > 0 and tail_sum_target > 0:
+                    vol[3:] *= tail_sum_target / tail_sum_current
+                elif tail_sum_target > 0:
+                    vol[3:] = tail_sum_target / (M - 3)
+            
+            # Update m after fixing
+            m = compute_m_from_v(vol)
+        else:
+            m = m_check
         
         logger.debug(f"HC4: After slope limit, v[:5]={vol[:5].round(3).tolist() if M >= 5 else vol.round(3).tolist()}, m2={m[2]:.3f}")
     
@@ -865,6 +892,12 @@ def enforce_schedule_shape_fixed(
                 elif tail_sum_target > 0:
                     # Distribute evenly if tail is zero
                     vol[3:] = tail_sum_target / (M - 3)
+            
+            # Update m array after fixing
+            m = compute_m_from_v(vol)
+        else:
+            # Update m to be consistent
+            m = m_check
     
     logger.debug(f"HC2: After strict monotonicity, v[:5]={vol[:5].round(3).tolist() if M >= 5 else vol.round(3).tolist()}")
     
@@ -1027,11 +1060,16 @@ def enforce_schedule_shape_fixed(
                 if tail_sum > 0:
                     target_tail = 100.0 - vol[0] - vol[1]
                     vol[2:] *= target_tail / tail_sum
-                    
-            # Double-check m[2] after all adjustments
-            m_final = compute_m_from_v(vol)
-            if M > 2:
-                logger.debug(f"FINAL: After correction, m[2]={m_final[2]:.3f}")
+            
+            # Recalculate m after all corrections
+            m = compute_m_from_v(vol)
+            logger.debug(f"FINAL: After correction, m[2]={m[2]:.3f}")
+        else:
+            # Even if within bounds, update m to be consistent
+            m = m_final.copy()
+    else:
+        # Update m for consistency
+        m = compute_m_from_v(vol)
     
     # Repair indents to be non-decreasing
     for i in range(1, len(ind)):
@@ -1039,7 +1077,7 @@ def enforce_schedule_shape_fixed(
             ind[i] = ind[i-1]
     
     # Step 10: Compute derivatives
-    # Recompute martingale percentages
+    # Recompute martingale percentages from the updated m array
     mart = np.zeros(M, dtype=np.float64)
     for i in range(1, M):
         mart[i] = m[i] * 100.0
