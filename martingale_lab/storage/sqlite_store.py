@@ -16,6 +16,7 @@ class SQLiteStore:
         """Initialize SQLite store."""
         self.db_path = db_path
         self.init_database()
+        self.conn = None  # For potential persistent connection
     
     def init_database(self):
         """Initialize database tables."""
@@ -77,6 +78,82 @@ class SQLiteStore:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_top_rank ON top_results(rank)")
             
             conn.commit()
+    
+    def get_results(self, run_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        Get results for a specific run.
+        
+        Args:
+            run_id: Run identifier
+            limit: Maximum number of results
+            
+        Returns:
+            List of result dictionaries
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            
+            # Try to get from metadata
+            cursor.execute("""
+                SELECT params_json, score, schedule_json, metadata
+                FROM optimization_results
+                WHERE metadata LIKE ?
+                ORDER BY score ASC
+                LIMIT ?
+            """, (f'%"run_id": "{run_id}"%', limit))
+            
+            results = []
+            for row in cursor.fetchall():
+                result = {
+                    'params': json.loads(row[0]),
+                    'score': row[1],
+                    'schedule': json.loads(row[2]) if row[2] else None,
+                    'metadata': json.loads(row[3]) if row[3] else {}
+                }
+                results.append(result)
+            
+            return results
+    
+    def store_result(self, run_id: str, result_data: Dict[str, Any]):
+        """
+        Store result with simple interface (alias for compatibility).
+        
+        Args:
+            run_id: Run identifier
+            result_data: Dictionary with result data
+        """
+        # Extract required fields from result_data
+        score = result_data.get('score', float('inf'))
+        
+        # Create minimal params object
+        from martingale_lab.core.types import Params, ScoreBreakdown
+        
+        overlap = result_data.get('overlap_pct', 10.0)
+        num_orders = result_data.get('num_orders', 20)
+        
+        params = Params(
+            min_overlap=overlap,
+            max_overlap=overlap,
+            min_order=num_orders,
+            max_order=num_orders
+        )
+        
+        breakdown = ScoreBreakdown(
+            total_score=score,  # Add required field
+            max_score=score,
+            variance_score=0.0,
+            tail_score=0.0,
+            gini_penalty=0.0,
+            entropy_penalty=0.0,
+            monotone_penalty=0.0,
+            smoothness_penalty=0.0
+        )
+        
+        # Add run_id to metadata
+        metadata = result_data.copy()
+        metadata['run_id'] = run_id
+        
+        self.save_result(params, score, breakdown, metadata=metadata)
     
     def save_result(self, params: Params, score: float, breakdown: ScoreBreakdown, 
                    schedule: Optional[Schedule] = None, metadata: Optional[Dict] = None):
@@ -313,3 +390,14 @@ class SQLiteStore:
         """Create database backup."""
         import shutil
         shutil.copy2(self.db_path, backup_path)
+
+    def close(self):
+        """
+        Close database connection if open.
+        """
+        if self.conn:
+            try:
+                self.conn.close()
+                self.conn = None
+            except:
+                pass  # Ignore errors on close

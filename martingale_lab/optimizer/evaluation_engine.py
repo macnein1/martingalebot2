@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional, Tuple
 import math
+import traceback
 
 from martingale_lab.utils.logging import get_eval_logger, should_log_eval
 from martingale_lab.core.constraints import enforce_schedule_shape_fixed
@@ -236,10 +237,11 @@ def evaluation_function(
     min_indent_step: float = 0.05,
     softmax_temp: float = 1.0,
     # New shape-enforcement parameters
-    first_volume_target: float = 0.01,
+    first_volume_target: float = 1.0,  # Changed from 0.01 to 1.0 for reasonable m2
     first_indent_target: float = 0.0,
-    k_front: int = 3,
-    front_cap: float = 5.0,
+    # Legacy parameters (deprecated, kept for compatibility)
+    k_front: int = 3,  # DEPRECATED: Use Q1/Q4 mass control instead
+    front_cap: float = 5.0,  # DEPRECATED: Use q1_cap instead
     g_min: float = 1.01,
     g_max: float = 1.20,
     # New penalty weights
@@ -255,10 +257,6 @@ def evaluation_function(
     blocks: int = 3,
     wave_amp_min: float = 0.05,
     wave_amp_max: float = 0.30,
-    # Post-band controls and isotonic smoothing
-    g_min_post: float = 1.01,
-    g_max_post: float = 1.30,
-    isotonic_tail: bool = False,
     # Penalty weight preset
     penalty_preset: Optional[str] = None,
     # New hard constraints
@@ -267,13 +265,36 @@ def evaluation_function(
     m_min: float = 0.05,
     m_max: float = 1.00,
     firstK_min: float = 1.0,
-    strict_inc_eps: float = 1e-5,
+    strict_inc_eps: float = 1e-6,
+    # New HC parameters
+    second_upper_c2: float = 2.0,
+    m_head: float = 0.40,
+    m_tail: float = 0.20,
+    tau_scale: float = 1/3,
+    slope_cap: float = 0.25,
+    q1_cap: float = 22.0,
+    tail_floor: float = 32.0,
+    # Head budget parameters
+    head_budget_pct: float = 2.0,
+    use_head_budget: bool = False,
+    use_hc0_bootstrap: bool = True,
     # New soft penalties
     target_std: float = 0.10,
     w_varm: float = 2.0,
     w_blocks: float = 1.0,
-    use_entropy: bool = False,
-    entropy_target: float = 1.0,
+    # New SP penalty weights
+    w_second: float = 3.0,
+    w_plateau: float = 2.0,
+    w_front_share: float = 2.0,
+    w_tailweak: float = 2.0,
+    w_slope: float = 1.0,
+    w_wave_shape: float = 1.0,
+    # Adaptive parameters
+    use_adaptive: bool = False,
+    strategy_type: str = "balanced",
+    # Smart initial generation
+    use_smart_init: bool = False,
+    history_db: Optional[str] = None,
     **kwargs
 ) -> Dict[str, Any]:
     """
@@ -283,6 +304,40 @@ def evaluation_function(
     Never throws exceptions - returns error state in dict if needed.
     """
     start_time = time.time()
+    
+    # Import adaptive module
+    if use_adaptive:
+        from martingale_lab.core.adaptive import get_adaptive_parameters
+        
+        # Get adaptive parameters
+        adaptive_params = get_adaptive_parameters(
+            num_orders, 
+            overlap_pct,
+            strategy_type
+        )
+        
+        # Override with adaptive values
+        m2_min = adaptive_params.get('m2_min', m2_min)
+        m2_max = adaptive_params.get('m2_max', m2_max)
+        m_min = adaptive_params.get('m_min', m_min)
+        m_max = adaptive_params.get('m_max', m_max)
+        m_head = adaptive_params.get('m_head', m_head)
+        m_tail = adaptive_params.get('m_tail', m_tail)
+        tau_scale = adaptive_params.get('tau_scale', tau_scale)
+        slope_cap = adaptive_params.get('slope_cap', slope_cap)
+        q1_cap = adaptive_params.get('q1_cap', q1_cap)
+        tail_floor = adaptive_params.get('tail_floor', tail_floor)
+        
+        # Adaptive weights
+        w_front = adaptive_params.get('w_front', w_front)
+        w_tailweak = adaptive_params.get('w_tailweak', w_tailweak)
+        w_slope = adaptive_params.get('w_slope', w_slope)
+        w_plateau = adaptive_params.get('w_plateau', w_plateau)
+        
+        # Exit-ease weight adjustment
+        exit_ease_weight = adaptive_params.get('exit_ease_weight', 100.0)
+    else:
+        exit_ease_weight = 100.0
     
     # Log evaluation call only if sampling allows it
     if should_log_eval():
@@ -301,11 +356,10 @@ def evaluation_function(
         )
     
     try:
-        # Generate random parameters
+        # Generate random parameters for indents
         rng = np.random.default_rng(seed)
         raw_indents = rng.normal(0.0, 1.0, size=num_orders)
-        raw_volumes = rng.normal(0.0, 1.0, size=num_orders)
-
+        
         # 1. Build indent_pct with monotonic steps
         steps = _softplus(raw_indents)
         steps = np.maximum(steps, min_indent_step / 100.0)
@@ -316,40 +370,82 @@ def evaluation_function(
             steps = steps * (overlap_pct / 100.0) / steps_sum
         indent_cumulative = np.concatenate([[0.0], np.cumsum(steps)]) * 100.0
         indent_pct_initial = indent_cumulative[1:].tolist()
-
-        # 2. Volume generation (anchors/blocks) with v0 fixed and v1<=v0
-        vol_sample = np.zeros(num_orders, dtype=np.float64)
+        
+        # 2. Generate initial volumes
         anchor_points_norm = None
         anchor_logv = None
-        if wave_mode == "blocks":
-            vol_sample = _wave_blocks(num_orders, blocks, rng, first_volume_target, wave_amp_min, wave_amp_max)
-        else:
-            vol_sample, anchor_idx, logv = _interp_from_anchors(num_orders, max(4, min(anchors, 8)), rng, first_volume_target, 1.0)
-            # Normalize anchor indices to t-space [0,1]
-            if num_orders > 1:
-                anchor_points_norm = anchor_idx.astype(np.float64) / float(num_orders - 1)
+        
+        if use_smart_init:
+            # Try smart initial generation
+            try:
+                from martingale_lab.core.smart_init import get_smart_initial_strategy
+                
+                logger.debug(f"Using smart initial generation (history_db={history_db})")
+                volume_pct_array = get_smart_initial_strategy(
+                    num_orders,
+                    overlap_pct,
+                    seed=seed,
+                    history_db=history_db
+                )
+                volume_pct_initial = volume_pct_array.tolist()
+                
+                logger.debug(f"Smart init generated: v[:5]={volume_pct_initial[:5] if len(volume_pct_initial) >= 5 else volume_pct_initial}")
+                
+            except Exception as e:
+                logger.warning(f"Smart init failed, falling back to standard: {e}")
+                use_smart_init = False
+        
+        if not use_smart_init:
+            # Standard initial generation (current method)
+            if wave_mode == "blocks":
+                vol_sample = _wave_blocks(num_orders, blocks, rng, first_volume_target, wave_amp_min, wave_amp_max)
             else:
-                anchor_points_norm = anchor_idx.astype(np.float64)
-            anchor_logv = logv
+                vol_sample, anchor_idx, logv = _interp_from_anchors(num_orders, max(4, min(anchors, 8)), rng, first_volume_target, 1.0)
+                # Normalize anchor indices to t-space [0,1]
+                if num_orders > 1:
+                    anchor_points_norm = anchor_idx.astype(np.float64) / float(num_orders - 1)
+                else:
+                    anchor_points_norm = anchor_idx.astype(np.float64)
+                anchor_logv = logv
 
-        # Ensure minimal pre-band (clip ratios for i>=2) and build monotone-biased raw chain
-        for i in range(2, num_orders):
-            denom = max(vol_sample[i-1], 1e-12)
-            gi = vol_sample[i] / denom
-            gi = min(g_max, max(g_min, gi))
-            vol_sample[i] = vol_sample[i-1] * gi
+            # Ensure minimal pre-band (clip ratios for i>=2) and build monotone-biased raw chain
+            for i in range(2, num_orders):
+                if vol_sample[i] < vol_sample[i-1] * 1.01:
+                    vol_sample[i] = vol_sample[i-1] * 1.01
 
-        # Normalize keeping v0 fixed, tail scaled with single factor
-        if num_orders > 1:
-            rest_sum = float(np.sum(vol_sample[1:]))
-            if rest_sum > 1e-12:
-                scale_rest = (100.0 - vol_sample[0]) / rest_sum
-                vol_sample[1:] *= scale_rest
-            else:
-                vol_sample[1:] = (100.0 - vol_sample[0]) / (num_orders - 1)
-        else:
-            vol_sample[0] = 100.0
-        volume_pct_initial = vol_sample.copy()
+            # Softmax normalization to get volume_pct
+            vol_sample = _softplus(vol_sample)
+            vol_sample = vol_sample / np.sum(vol_sample) * 100.0
+            volume_pct_initial = vol_sample.tolist()
+            
+            # Check if initial volumes are reasonable (fallback mechanism)
+            if len(volume_pct_initial) > 2:
+                first_two_sum = volume_pct_initial[0] + volume_pct_initial[1]
+                min_vol = min(volume_pct_initial)
+                max_vol = max(volume_pct_initial)
+                
+                if first_two_sum > 30.0 or first_two_sum < 0.5 or max_vol / (min_vol + 1e-10) > 100:
+                    logger.debug(f"Initial volumes unreasonable, using geometric fallback")
+                    volume_pct_initial = []
+                    
+                    v0 = 1.0
+                    growth = 1.115
+                    
+                    for i in range(num_orders):
+                        if i == 0:
+                            volume_pct_initial.append(v0)
+                        elif i == 1:
+                            volume_pct_initial.append(v0 * 1.10)
+                        else:
+                            base_growth = growth
+                            if i < 5:
+                                base_growth = 1.10 + (i - 2) * 0.02
+                            elif i > num_orders - 5:
+                                base_growth = growth * 1.05
+                            volume_pct_initial.append(volume_pct_initial[-1] * base_growth)
+                    
+                    total = sum(volume_pct_initial)
+                    volume_pct_initial = [v / total * 100.0 for v in volume_pct_initial]
 
         # Optional preset overrides for penalty weights
         if penalty_preset:
@@ -372,24 +468,31 @@ def evaluation_function(
          price_step_pct,
          repair_diag) = enforce_schedule_shape_fixed(
             indent_pct_initial,
-            volume_pct_initial.tolist(),
+            volume_pct_initial,  # Already a list, no need for .tolist()
             base_price,
             first_volume_target,
             first_indent_target,
-            k_front,
-            front_cap,
+            k_front,  # Still passed for now, but ignored in new pipeline
+            front_cap,  # Still passed for now, but ignored in new pipeline
             g_min,
             g_max,
-            g_min_post,
-            g_max_post,
-            isotonic_tail,
-            # New parameters
+            # New HC parameters
             m2_min,
             m2_max,
             m_min,
             m_max,
             firstK_min,
             strict_inc_eps,
+            second_upper_c2,
+            m_head,
+            m_tail,
+            tau_scale,
+            slope_cap,
+            q1_cap,
+            tail_floor,
+            head_budget_pct,
+            use_head_budget,
+            use_hc0_bootstrap,
         )
         
         # Calculate core metrics from repaired arrays
@@ -422,8 +525,43 @@ def evaluation_function(
             "tail_overflow": bool((len(volume_pct) > 0) and (volume_pct[-1] > tail_cap * 100.0)),
         }
         
-        # Diagnostics (repaired)
+        # Calculate repair diagnostics
         volume_pct_np = np.asarray(volume_pct, dtype=np.float64)
+        
+        # Import at the beginning to avoid UnboundLocalError
+        from martingale_lab.core.repair import compute_m_from_v
+        
+        m = compute_m_from_v(volume_pct_np)
+        
+        # Import exit-ease metrics
+        from martingale_lab.core.metrics import compute_exit_ease_metrics
+        ee_metrics = compute_exit_ease_metrics(needpct, volume_pct)
+        
+        # Add micro pattern detection
+        from martingale_lab.core.pattern_detection import (
+            compute_pattern_penalties,
+            analyze_micro_patterns
+        )
+        
+        # Compute pattern penalties
+        pattern_penalty = compute_pattern_penalties(
+            volume_pct,
+            martingale_pct,
+            w_plateau=w_plateau,
+            w_zigzag=1.0,  # Lower weight for zigzag
+            w_cliff=15.0,   # High penalty for cliffs
+            w_stagnation=2.0,
+            w_acceleration=3.0
+        )
+        
+        # Analyze patterns for diagnostics
+        pattern_analysis = analyze_micro_patterns(volume_pct, martingale_pct)
+        
+        # Add portfolio metrics
+        from martingale_lab.core.portfolio_metrics import calculate_portfolio_metrics
+        portfolio_metrics = calculate_portfolio_metrics(volume_pct)
+        
+        # Add to diagnostics
         diagnostics = {
             "wci": float(_weight_center_index(volume_pct_np)),
             "sign_flips": int(_count_sign_flips(np.asarray(needpct, dtype=np.float64))),
@@ -435,24 +573,54 @@ def evaluation_function(
             "repair_front_excess_after": float(repair_diag.get("front_excess_after", 0.0)),
             "repair_tv_before": float(repair_diag.get("tv_before", 0.0)),
             "repair_tv_after": float(repair_diag.get("tv_after", 0.0)),
-            # New diagnostics
+            # New diagnostics from HC pipeline
             "first3_sum": float(repair_diag.get("first3_sum", 0.0)),
+            "v0": float(repair_diag.get("v0", 0.0)),
+            "v1": float(repair_diag.get("v1", 0.0)),
             "m2": float(repair_diag.get("m2", 0.0)),
             "std_m": float(repair_diag.get("std_m", 0.0)),
-            "sign_changes": float(repair_diag.get("sign_changes", 0.0)),
-            "clips_hi_count": int(repair_diag.get("clip_hi_post", 0)),
-            "clips_lo_count": int(repair_diag.get("clip_lo_post", 0)),
-            "iter_fix_loops": int(repair_diag.get("iter_fix_loops", 0)),
+            "v1_band_applied": bool(repair_diag.get("v1_band_applied", False)),
+            "m2_clip_applied": bool(repair_diag.get("m2_clip_applied", False)),
+            "decaying_clips": int(repair_diag.get("decaying_clips_count", 0)),
+            "slope_clips": int(repair_diag.get("slope_clips_count", 0)),
+            "q1_share": float(repair_diag.get("q1_share", 0.0)),
+            "q4_share": float(repair_diag.get("q4_share", 0.0)),
+            "plateau_max_run": int(repair_diag.get("plateau_max_run", 0)),
+            "turn_count": int(repair_diag.get("turn_count", 0)),
+            # Exit-ease metrics
+            "ee_harmonic": float(ee_metrics.get("ee_harmonic", 0.0)),
+            "ee_tail_weighted": float(ee_metrics.get("ee_tail_weighted", 0.0)),
+            "ee_front_tail_ratio": float(ee_metrics.get("ee_front_tail_ratio", 0.0)),
+            "ee_balance_penalty": float(ee_metrics.get("ee_balance_penalty", 0.0)),
+            # Pattern analysis
+            "pattern_quality_score": float(pattern_analysis.get("pattern_quality_score", 0.0)),
+            "pattern_plateaus": int(pattern_analysis.get("plateau_count", 0)),
+            "pattern_zigzag": int(pattern_analysis.get("zigzag_count", 0)),
+            "pattern_cliffs": int(pattern_analysis.get("cliff_count", 0)),
+            "pattern_stagnation": int(pattern_analysis.get("stagnation_zones", 0)),
+            "pattern_max_acceleration": float(pattern_analysis.get("max_acceleration", 0.0)),
+            # Portfolio metrics
+            "sortino_ratio": float(portfolio_metrics.get("sortino_ratio", 0.0)),
+            "calmar_ratio": float(portfolio_metrics.get("calmar_ratio", 0.0)),
+            "omega_ratio": float(portfolio_metrics.get("omega_ratio", 0.0)),
+            "recovery_efficiency": float(portfolio_metrics.get("recovery_efficiency", 0.0)),
+            "tail_risk_ratio": float(portfolio_metrics.get("tail_risk_ratio", 0.0)),
+            "var_95": float(portfolio_metrics.get("var_95", 0.0)),
+            "cvar_95": float(portfolio_metrics.get("cvar_95", 0.0)),
+            "hc0_applied": bool(repair_diag.get("hc0_applied", False)),
+            "head_budget_applied": bool(repair_diag.get("head_budget_applied", False)),
             # Generation/repair flags
             "wave_mode": wave_mode,
             "anchors": int(anchors) if wave_mode == "anchors" else None,
             "blocks": int(blocks) if wave_mode == "blocks" else None,
-            "isotonic_applied": bool(isotonic_tail),
         }
         if anchor_points_norm is not None:
             diagnostics["anchor_points"] = anchor_points_norm.tolist()
         if anchor_logv is not None:
             diagnostics["anchor_logv"] = _ensure_json_serializable(anchor_logv)
+        
+        # Add exit-ease metrics to diagnostics
+        diagnostics.update(ee_metrics)
         
         # Penalties
         penalties: Dict[str, float] = {}
@@ -491,23 +659,35 @@ def evaluation_function(
         penalties["P_wave"] = float(max(0.0, -wave_score))
         
         # New shape penalties after repair
+        # (compute_m_from_v already imported above)
+        
+        # Compute shape-related penalties
         shape_pens = compute_shape_penalties(
-            np.asarray(volume_pct, dtype=np.float64),
+            volume_pct_np,
             np.asarray(indent_pct, dtype=np.float64),
-            first_volume_target,
-            first_indent_target,
-            g_min,
-            g_max,
             k_front,
             front_cap,
             np.asarray(martingale_pct, dtype=np.float64),
             target_std,
-            use_entropy,
-            entropy_target,
+            # New SP parameters
+            1.10,  # v1_min_mult
+            second_upper_c2,  # v1_max_mult
+            0.02,  # plateau_tol
+            3,  # plateau_max_len
+            target_std,  # target_std_varm
+            g_min,  # g_min (still used for wave calculation)
+            m_head,  # wave_m_head
+            m_tail,  # wave_m_tail
+            tau_scale,  # wave_tau_scale
+            0.0,  # wave_phase
+            q1_cap,  # q1_cap
+            tail_floor,  # tail_floor
+            slope_cap * 0.8,  # slope_delta_soft
+            slope_cap,  # slope_delta_cap
         )
         penalties.update(shape_pens)
         
-        # Weighted sum of shape penalties
+        # Weighted sum of shape penalties (including new SP penalties)
         shape_penalty_sum = (
             w_fixed_local * shape_pens["penalty_first_fixed"] +
             w_sec_local * shape_pens.get("penalty_second_leq", 0.0) +
@@ -516,33 +696,44 @@ def evaluation_function(
             w_tv_local * shape_pens["penalty_tv_vol"] +
             w_wave_local * shape_pens.get("penalty_wave", 0.0) +
             w_varm * shape_pens.get("penalty_uniform", 0.0) +
-            w_blocks * shape_pens.get("penalty_flat_blocks", 0.0)
+            w_blocks * shape_pens.get("penalty_flat_blocks", 0.0) +
+            # New SP penalties
+            w_second * shape_pens.get("penalty_second_band", 0.0) +
+            w_plateau * shape_pens.get("penalty_plateau", 0.0) +
+            w_varm * shape_pens.get("penalty_varm", 0.0) +
+            w_wave_shape * shape_pens.get("penalty_wave_shape", 0.0) +
+            w_front_share * shape_pens.get("penalty_front_share", 0.0) +
+            w_tailweak * shape_pens.get("penalty_tailweak", 0.0) +
+            w_slope * shape_pens.get("penalty_slope", 0.0)
         )
         
         # Add entropy penalty if enabled
-        if use_entropy and "penalty_low_entropy" in shape_pens:
+        if "penalty_low_entropy" in shape_pens:
             shape_penalty_sum += w_varm * shape_pens["penalty_low_entropy"]
         
-        # Log repair diagnostics and penalties (INFO)
+        # Log repair diagnostics and penalties (INFO) - updated format
         logger.info(
-            f"REPAIR v0={first_volume_target:.3f} v1={volume_pct[1] if len(volume_pct) > 1 else 0:.3f} "
-            f"m2={repair_diag.get('m2', 0):+.1%} first3={repair_diag.get('first3_sum', 0):.2%} "
-            f"clips_hi={repair_diag.get('clip_hi_post', 0)} clips_lo={repair_diag.get('clip_lo_post', 0)} "
-            f"iters={repair_diag.get('iter_fix_loops', 0)}",
+            f"REPAIR: v0={repair_diag.get('v0', 0):.5f} v1={repair_diag.get('v1', 0):.5f} "
+            f"m2={repair_diag.get('m2', 0):.2%} first3={repair_diag.get('first3_sum', 0):.2%} "
+            f"clips(decay={repair_diag.get('decaying_clips_count', 0)}/slope={repair_diag.get('slope_clips_count', 0)}) "
+            f"q1={repair_diag.get('q1_share', 0):.1f}% q4={repair_diag.get('q4_share', 0):.1f}% "
+            f"plateau_max={repair_diag.get('plateau_max_run', 0)} std_m={repair_diag.get('std_m', 0):.3f} "
+            f"turns={repair_diag.get('turn_count', 0)}",
             extra={
                 "event": "REPAIR",
-                "clipped_frac": repair_diag.get("clipped_frac", 0.0),
-                "front_excess_before": repair_diag.get("front_excess_before", 0.0),
-                "front_excess_after": repair_diag.get("front_excess_after", 0.0),
-                "tv_before": repair_diag.get("tv_before", 0.0),
-                "tv_after": repair_diag.get("tv_after", 0.0),
-                "first3_sum": repair_diag.get("first3_sum", 0.0),
-                "g2": repair_diag.get("g2", 0.0),
-                "clip_hi_post": repair_diag.get("clip_hi_post", 0),
-                "clip_lo_post": repair_diag.get("clip_lo_post", 0),
-                "m2": repair_diag.get("m2", 0.0),
-                "std_m": repair_diag.get("std_m", 0.0),
-                "iter_fix_loops": repair_diag.get("iter_fix_loops", 0),
+                "v0": float(repair_diag.get("v0", 0.0)),
+                "v1": float(repair_diag.get("v1", 0.0)),
+                "m2": float(repair_diag.get("m2", 0.0)),
+                "first3_sum": float(repair_diag.get("first3_sum", 0.0)),
+                "decaying_clips": int(repair_diag.get("decaying_clips_count", 0)),
+                "slope_clips": int(repair_diag.get("slope_clips_count", 0)),
+                "q1_share": float(repair_diag.get("q1_share", 0.0)),
+                "q4_share": float(repair_diag.get("q4_share", 0.0)),
+                "plateau_max_run": int(repair_diag.get("plateau_max_run", 0)),
+                "std_m": float(repair_diag.get("std_m", 0.0)),
+                "turn_count": int(repair_diag.get("turn_count", 0)),
+                "hc0_applied": bool(repair_diag.get("hc0_applied", False)),
+                "head_budget_applied": bool(repair_diag.get("head_budget_applied", False)),
             },
         )
         logger.info(
@@ -566,7 +757,25 @@ def evaluation_function(
         
         # Final score
         penalty_sum = sum(penalties.values()) + shape_penalty_sum
-        score = alpha * max_need + beta * var_need + gamma * tail + lambda_penalty * penalty_sum
+        
+        # Add pattern penalty
+        total_pattern_penalty = pattern_penalty
+        
+        # Calculate final score with exit-ease bonus
+        # Higher exit-ease (easier exits) should reduce (improve) the score
+        exit_ease_bonus = max(0.0, ee_metrics['ee_tail_weighted'] - 5.0) * exit_ease_weight  # Adaptive weight
+        exit_ease_penalty = ee_metrics['ee_balance_penalty'] * 10.0  # Penalty for unbalanced blocks
+        
+        score = (
+            alpha * max_need 
+            + beta * var_need 
+            + gamma * (1.0 - tail)
+            + lambda_penalty * penalty_sum
+            + shape_penalty_sum
+            + total_pattern_penalty  # Add pattern penalty
+            - exit_ease_bonus  # Subtract bonus (lower score is better)
+            + exit_ease_penalty  # Add penalty for imbalance
+        )
         
         # Log successful evaluation only if sampling allows it
         duration_ms = (time.time() - start_time) * 1000
@@ -603,17 +812,19 @@ def evaluation_function(
     except Exception as e:
         # Log evaluation error only if sampling allows it
         duration_ms = (time.time() - start_time) * 1000
-        if should_log_eval():
-            logger.debug(
-                f"Evaluation failed: {str(e)}",
-                extra={
-                    "event": "EVAL_ERROR",
-                    "error": str(e),
-                    "duration_ms": duration_ms,
-                    "overlap": overlap_pct,
-                    "orders": num_orders
-                }
-            )
+        
+        # Always log exceptions for debugging
+        logger.error(
+            f"Evaluation failed with exception: {str(e)}",
+            extra={
+                "event": "EVAL_ERROR",
+                "error": str(e),
+                "traceback": traceback.format_exc(),
+                "duration_ms": duration_ms,
+                "overlap": overlap_pct,
+                "orders": num_orders
+            }
+        )
         
         # Never throw - return error state as complete dict
         return {
