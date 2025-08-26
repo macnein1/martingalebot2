@@ -633,6 +633,29 @@ def enforce_schedule_shape_fixed(
     # Initialize volumes
     vol = vol_in.copy()
     
+    # Check if initial volumes are extremely unbalanced
+    if M > 2:
+        initial_sum = np.sum(vol)
+        if initial_sum > 0:
+            vol_normalized = vol / initial_sum * 100.0
+            # If first two orders take more than 50% of total, we have a problem
+            if vol_normalized[0] + vol_normalized[1] > 50.0:
+                logger.warning(f"Initial volumes extremely unbalanced: v0+v1={vol_normalized[0]+vol_normalized[1]:.1f}%")
+                # Create a reasonable geometric progression
+                vol = np.zeros(M)
+                vol[0] = first_volume_target
+                vol[1] = first_volume_target * 1.5  # v1 = 1.5 * v0
+                # Geometric growth for the rest
+                growth_rate = 1.15
+                for i in range(2, M):
+                    vol[i] = vol[i-1] * growth_rate
+                # Normalize to sum=100
+                vol = vol / np.sum(vol) * 100.0
+                # Fix v0
+                vol[0] = first_volume_target
+                tail_only_rescale_keep_first_two(vol)
+                logger.info(f"Using fallback geometric progression: v[:5]={vol[:5].round(3).tolist()}")
+    
     # Step 0: HC0 - Bootstrap feasible tail if needed
     hc0_applied = False
     if use_hc0_bootstrap and M > 2:
@@ -714,70 +737,79 @@ def enforce_schedule_shape_fixed(
     
     # Step 4: HC3 - Martingale bands with decaying ceiling
     if M > 2:
-        # Apply m[2] bounds - m[2] is the growth ratio minus 1
-        # m[2] = v[2]/v[1] - 1, so v[2] = v[1] * (1 + m[2])
+        # First ensure v[2] is within m2 bounds
         v2_min = vol[1] * (1.0 + m2_min)
         v2_max = vol[1] * (1.0 + m2_max)
         vol[2] = np.clip(vol[2], v2_min, v2_max)
         
-        # Update m after v2 adjustment
+        # Compute m after v[2] adjustment
         m = compute_m_from_v(vol)
+        
+        # Track if we clipped m[2]
         if abs(m[2] - np.clip(m[2], m2_min, m2_max)) > 1e-6:
             m2_clip_applied = True
             band_clips += 1
+        
+        # Ensure m[2] is within bounds (defensive)
+        m[2] = np.clip(m[2], m2_min, m2_max)
         
         # Apply decaying ceiling for i>=3
         for i in range(3, M):
             m_max_i = _decay_ceiling(i, M, m_head, m_tail, tau_scale)
             m_original = m[i]
-            m[i] = np.clip(m[i], m_min, m_max_i)
-            if m[i] != m_original:
+            # Ensure m[i] is not negative and within bounds
+            m[i] = np.clip(m[i], m_min, min(m_max_i, m_max))
+            if abs(m[i] - m_original) > 1e-6:
                 decaying_clips += 1
                 band_clips += 1
         
         # Rechain volumes from adjusted m
         vol = rechain_v_from_m(vol[0], vol[1], m)
+        
+        # Now rescale carefully to maintain sum=100 while preserving v0, v1
         tail_only_rescale_keep_first_two(vol)
         
-        # After rescaling, ensure m[2] is still within bounds
-        m = compute_m_from_v(vol)
-        if m[2] < m2_min or m[2] > m2_max:
-            # Force m[2] to be within bounds
-            m[2] = np.clip(m[2], m2_min, m2_max)
-            # Rechain from m[2] onwards
-            for i in range(2, M):
-                if i == 2:
-                    vol[i] = vol[1] * (1.0 + m[2])
-                else:
-                    vol[i] = vol[i-1] * (1.0 + m[i])
-            # Final rescale
+        # Verify m[2] is still in bounds after rescale
+        m_check = compute_m_from_v(vol)
+        if M > 2 and (m_check[2] < m2_min - 0.01 or m_check[2] > m2_max + 0.01):
+            logger.warning(f"HC3: m[2]={m_check[2]:.3f} out of bounds after rescale, fixing...")
+            # Force v[2] to respect m2 bounds
+            v2_target = vol[1] * (1.0 + np.clip(m_check[2], m2_min, m2_max))
+            vol[2] = v2_target
             tail_only_rescale_keep_first_two(vol)
-            m = compute_m_from_v(vol)
         
-        logger.debug(f"HC3: After martingale bands, v[:5]={vol[:5].round(3).tolist() if M >= 5 else vol.round(3).tolist()}, m2={m[2] if M > 2 else 0:.3f}")
+        m = compute_m_from_v(vol)
+        logger.debug(f"HC3: After martingale bands, v[:5]={vol[:5].round(3).tolist() if M >= 5 else vol.round(3).tolist()}, m2={m[2]:.3f}")
     
     # Step 5: HC4 - Slope limits for smoothness
     if M > 3:
+        # m should already be computed from HC3
+        
         logger.debug(f"HC4: Before slope limit, m[2:6]={m[2:6].round(3).tolist() if len(m) >= 6 else m[2:].round(3).tolist()}")
         
+        # Apply slope limits more carefully
         for i in range(3, M):
-            # Limit change from previous m
             m_prev = m[i-1]
-            m_min_slope = m_prev - slope_cap
-            m_max_slope = m_prev + slope_cap
+            # Ensure we don't create negative or huge m values
+            m_min_slope = max(m_min, m_prev - slope_cap)
+            m_max_slope = min(m_max, m_prev + slope_cap)
             m_original = m[i]
             m[i] = np.clip(m[i], m_min_slope, m_max_slope)
-            if m[i] != m_original:
+            if abs(m[i] - m_original) > 1e-6:
                 slope_clips += 1
         
         logger.debug(f"HC4: After slope limit, m[2:6]={m[2:6].round(3).tolist() if len(m) >= 6 else m[2:].round(3).tolist()}")
         
-        # Rechain and rescale
+        # Rechain volumes from adjusted m
         vol = rechain_v_from_m(vol[0], vol[1], m)
+        
+        # Rescale to maintain sum=100
         tail_only_rescale_keep_first_two(vol)
+        
+        # Update m for next steps
         m = compute_m_from_v(vol)
         
-        logger.debug(f"HC4: After slope limit, v[:5]={vol[:5].round(3).tolist() if M >= 5 else vol.round(3).tolist()}")
+        logger.debug(f"HC4: After slope limit, v[:5]={vol[:5].round(3).tolist() if M >= 5 else vol.round(3).tolist()}, m2={m[2]:.3f}")
     
     # Step 6: HC2 - Strict monotonicity (respecting m2_min for v[2])
     for i in range(1, M):
@@ -866,6 +898,12 @@ def enforce_schedule_shape_fixed(
         tail_only_rescale_keep_first_two(vol)
         m = compute_m_from_v(vol)
         
+        # Recalculate turn count
+        turn_count = 0
+        for i in range(3, M):
+            if (m[i] - 1.0) * (m[i-1] - 1.0) < 0:
+                turn_count += 1
+
         logger.debug(f"HC6: After plateau breaker, plateau_max_run={plateau_max_run_final}")
     
     # Additional wave enforcement if not enough turns
@@ -894,6 +932,12 @@ def enforce_schedule_shape_fixed(
             vol = rechain_v_from_m(vol[0], vol[1], m)
             tail_only_rescale_keep_first_two(vol)
             m = compute_m_from_v(vol)
+
+            # Recalculate turn count
+            turn_count = 0
+            for i in range(3, M):
+                if (m[i] - 1.0) * (m[i-1] - 1.0) < 0:
+                    turn_count += 1
 
             logger.debug(f"HC7: After wave enforcement, turn_count={turn_count}")
 
