@@ -292,6 +292,9 @@ def evaluation_function(
     # Adaptive parameters
     use_adaptive: bool = False,
     strategy_type: str = "balanced",
+    # Smart initial generation
+    use_smart_init: bool = False,
+    history_db: Optional[str] = None,
     **kwargs
 ) -> Dict[str, Any]:
     """
@@ -353,11 +356,10 @@ def evaluation_function(
         )
     
     try:
-        # Generate random parameters
+        # Generate random parameters for indents
         rng = np.random.default_rng(seed)
         raw_indents = rng.normal(0.0, 1.0, size=num_orders)
-        raw_volumes = rng.normal(0.0, 1.0, size=num_orders)
-
+        
         # 1. Build indent_pct with monotonic steps
         steps = _softplus(raw_indents)
         steps = np.maximum(steps, min_indent_step / 100.0)
@@ -368,70 +370,82 @@ def evaluation_function(
             steps = steps * (overlap_pct / 100.0) / steps_sum
         indent_cumulative = np.concatenate([[0.0], np.cumsum(steps)]) * 100.0
         indent_pct_initial = indent_cumulative[1:].tolist()
-
-        # 2. Volume generation (anchors/blocks) with v0 fixed and v1<=v0
-        vol_sample = np.zeros(num_orders, dtype=np.float64)
+        
+        # 2. Generate initial volumes
         anchor_points_norm = None
         anchor_logv = None
-        if wave_mode == "blocks":
-            vol_sample = _wave_blocks(num_orders, blocks, rng, first_volume_target, wave_amp_min, wave_amp_max)
-        else:
-            vol_sample, anchor_idx, logv = _interp_from_anchors(num_orders, max(4, min(anchors, 8)), rng, first_volume_target, 1.0)
-            # Normalize anchor indices to t-space [0,1]
-            if num_orders > 1:
-                anchor_points_norm = anchor_idx.astype(np.float64) / float(num_orders - 1)
-            else:
-                anchor_points_norm = anchor_idx.astype(np.float64)
-            anchor_logv = logv
-
-        # Ensure minimal pre-band (clip ratios for i>=2) and build monotone-biased raw chain
-        for i in range(2, num_orders):
-            if vol_sample[i] < vol_sample[i-1] * 1.01:
-                vol_sample[i] = vol_sample[i-1] * 1.01
-
-        # Softmax normalization to get volume_pct
-        vol_sample = _softplus(vol_sample)
-        vol_sample = vol_sample / np.sum(vol_sample) * 100.0
-        volume_pct_initial = vol_sample.tolist()
         
-        # Check if initial volumes are reasonable
-        if len(volume_pct_initial) > 2:
-            # If first two volumes take more than 30% of total, use geometric fallback
-            first_two_sum = volume_pct_initial[0] + volume_pct_initial[1]
+        if use_smart_init:
+            # Try smart initial generation
+            try:
+                from martingale_lab.core.smart_init import get_smart_initial_strategy
+                
+                logger.debug(f"Using smart initial generation (history_db={history_db})")
+                volume_pct_array = get_smart_initial_strategy(
+                    num_orders,
+                    overlap_pct,
+                    seed=seed,
+                    history_db=history_db
+                )
+                volume_pct_initial = volume_pct_array.tolist()
+                
+                logger.debug(f"Smart init generated: v[:5]={volume_pct_initial[:5] if len(volume_pct_initial) >= 5 else volume_pct_initial}")
+                
+            except Exception as e:
+                logger.warning(f"Smart init failed, falling back to standard: {e}")
+                use_smart_init = False
+        
+        if not use_smart_init:
+            # Standard initial generation (current method)
+            if wave_mode == "blocks":
+                vol_sample = _wave_blocks(num_orders, blocks, rng, first_volume_target, wave_amp_min, wave_amp_max)
+            else:
+                vol_sample, anchor_idx, logv = _interp_from_anchors(num_orders, max(4, min(anchors, 8)), rng, first_volume_target, 1.0)
+                # Normalize anchor indices to t-space [0,1]
+                if num_orders > 1:
+                    anchor_points_norm = anchor_idx.astype(np.float64) / float(num_orders - 1)
+                else:
+                    anchor_points_norm = anchor_idx.astype(np.float64)
+                anchor_logv = logv
+
+            # Ensure minimal pre-band (clip ratios for i>=2) and build monotone-biased raw chain
+            for i in range(2, num_orders):
+                if vol_sample[i] < vol_sample[i-1] * 1.01:
+                    vol_sample[i] = vol_sample[i-1] * 1.01
+
+            # Softmax normalization to get volume_pct
+            vol_sample = _softplus(vol_sample)
+            vol_sample = vol_sample / np.sum(vol_sample) * 100.0
+            volume_pct_initial = vol_sample.tolist()
             
-            # Also check if volumes are too small or unbalanced
-            min_vol = min(volume_pct_initial)
-            max_vol = max(volume_pct_initial)
-            
-            if first_two_sum > 30.0 or first_two_sum < 0.5 or max_vol / (min_vol + 1e-10) > 100:
-                logger.debug(f"Initial volumes unreasonable (first_two={first_two_sum:.1f}%, ratio={max_vol/(min_vol+1e-10):.1f}), using geometric fallback")
-                volume_pct_initial = []
+            # Check if initial volumes are reasonable (fallback mechanism)
+            if len(volume_pct_initial) > 2:
+                first_two_sum = volume_pct_initial[0] + volume_pct_initial[1]
+                min_vol = min(volume_pct_initial)
+                max_vol = max(volume_pct_initial)
                 
-                # Create a reasonable geometric progression similar to your strategy
-                # Your strategy has m[2] ≈ 0.118, so growth ≈ 1.12
-                v0 = 1.0  # Start with 1% like your strategy
-                growth = 1.115  # 11.5% growth per order (similar to yours)
-                
-                for i in range(num_orders):
-                    if i == 0:
-                        volume_pct_initial.append(v0)
-                    elif i == 1:
-                        # Second order slightly higher than first
-                        volume_pct_initial.append(v0 * 1.10)
-                    else:
-                        # Geometric growth with slight variation
-                        base_growth = growth
-                        if i < 5:
-                            # Slower growth in early orders
-                            base_growth = 1.10 + (i - 2) * 0.02
-                        elif i > num_orders - 5:
-                            # Stronger growth in tail
-                            base_growth = growth * 1.05
-                        volume_pct_initial.append(volume_pct_initial[-1] * base_growth)
-                
-                # Normalize to 100%
-                total = sum(volume_pct_initial)
-                volume_pct_initial = [v / total * 100.0 for v in volume_pct_initial]
+                if first_two_sum > 30.0 or first_two_sum < 0.5 or max_vol / (min_vol + 1e-10) > 100:
+                    logger.debug(f"Initial volumes unreasonable, using geometric fallback")
+                    volume_pct_initial = []
+                    
+                    v0 = 1.0
+                    growth = 1.115
+                    
+                    for i in range(num_orders):
+                        if i == 0:
+                            volume_pct_initial.append(v0)
+                        elif i == 1:
+                            volume_pct_initial.append(v0 * 1.10)
+                        else:
+                            base_growth = growth
+                            if i < 5:
+                                base_growth = 1.10 + (i - 2) * 0.02
+                            elif i > num_orders - 5:
+                                base_growth = growth * 1.05
+                            volume_pct_initial.append(volume_pct_initial[-1] * base_growth)
+                    
+                    total = sum(volume_pct_initial)
+                    volume_pct_initial = [v / total * 100.0 for v in volume_pct_initial]
 
         # Optional preset overrides for penalty weights
         if penalty_preset:
