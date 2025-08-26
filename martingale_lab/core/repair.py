@@ -34,13 +34,53 @@ def tail_only_rescale_keep_first_two(v: np.ndarray) -> float:
     # Calculate needed tail sum to reach 100 total
     needed_tail_sum = 100.0 - sum_first_two
     
-    # Calculate scaling factor
-    if sum_tail > 1e-12 and needed_tail_sum > 0:
-        f = needed_tail_sum / sum_tail
-        v[2:] *= f
-        return f
+    # Apply scaling factor to tail
+    if sum_tail > 0:
+        scale_factor = needed_tail_sum / sum_tail
+        v[2:] *= scale_factor
+        return scale_factor
+    else:
+        return 1.0
+
+
+def tail_only_rescale_keep_first_three(v: np.ndarray) -> float:
+    """
+    Keep v[0], v[1], v[2] fixed; rescale v[3:] with a single factor so that sum(v) = 100.
+    This is crucial for maintaining m[2] = (v[2] - v[1])/v[1] unchanged.
     
-    return 1.0
+    Args:
+        v: Volume array to rescale
+        
+    Returns:
+        Scaling factor applied to tail (v[3:])
+    """
+    n = len(v)
+    if n <= 3:
+        return 1.0
+    
+    # Calculate current sum of first three elements
+    sum_first_three = v[0] + v[1] + v[2]
+    
+    # Calculate current sum of tail
+    sum_tail = np.sum(v[3:])
+    
+    # If tail sum is zero or near zero, create a small geometric ramp
+    if sum_tail < 1e-12:
+        # Create a small increasing geometric sequence for tail
+        for i in range(3, n):
+            v[i] = v[2] * (1.01 ** (i - 2))
+        sum_tail = np.sum(v[3:])
+    
+    # Calculate needed tail sum to reach 100 total
+    needed_tail_sum = 100.0 - sum_first_three
+    
+    # Apply scaling factor to tail
+    if sum_tail > 0 and needed_tail_sum > 0:
+        scale_factor = needed_tail_sum / sum_tail
+        v[3:] *= scale_factor
+        return scale_factor
+    else:
+        return 1.0
 
 
 def compute_m_from_v(v: np.ndarray) -> np.ndarray:

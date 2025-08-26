@@ -592,6 +592,7 @@ def enforce_schedule_shape_fixed(
     """
     from martingale_lab.core.repair import (
         tail_only_rescale_keep_first_two,
+        tail_only_rescale_keep_first_three,  # New function for preserving m[2]
         compute_m_from_v,
         rechain_v_from_m,
         longest_plateau_run,
@@ -766,8 +767,9 @@ def enforce_schedule_shape_fixed(
         # Rechain volumes from adjusted m
         vol = rechain_v_from_m(vol[0], vol[1], m)
         
-        # Now rescale carefully to maintain sum=100 while preserving v0, v1
-        tail_only_rescale_keep_first_two(vol)
+        # Now rescale carefully to maintain sum=100 while preserving v0, v1, AND v2
+        # CRITICAL: Since we just set m[2] correctly, we must preserve v[2]!
+        tail_only_rescale_keep_first_three(vol)
         
         # CRITICAL FIX: After rescaling, m[2] might be out of bounds again
         # Force v[2] to respect m2 bounds relative to the fixed v[1]
@@ -787,15 +789,9 @@ def enforce_schedule_shape_fixed(
             vol[2] = vol[1] * (1.0 + m2_target)
             
             # Now we need to rescale v[3:] to maintain sum=100
+            # CRITICAL: Use tail_only_rescale_keep_first_three to preserve m[2]
             if M > 3:
-                tail_sum_target = 100.0 - vol[0] - vol[1] - vol[2]
-                tail_sum_current = np.sum(vol[3:])
-                if tail_sum_current > 0 and tail_sum_target > 0:
-                    scale_factor = tail_sum_target / tail_sum_current
-                    vol[3:] *= scale_factor
-                elif tail_sum_target > 0:
-                    # Distribute evenly if tail is zero
-                    vol[3:] = tail_sum_target / (M - 3)
+                tail_only_rescale_keep_first_three(vol)
             
             # Update m array after fixing
             m = compute_m_from_v(vol)
@@ -1055,11 +1051,11 @@ def enforce_schedule_shape_fixed(
             # Final normalization to ensure sum=100
             total_sum = np.sum(vol)
             if abs(total_sum - 100.0) > 0.01:
-                # Keep v0 and v1 fixed, rescale the rest
-                tail_sum = np.sum(vol[2:])
-                if tail_sum > 0:
-                    target_tail = 100.0 - vol[0] - vol[1]
-                    vol[2:] *= target_tail / tail_sum
+                # Keep v0, v1, AND v2 fixed since we just set v2 for m2 bounds
+                tail_sum = np.sum(vol[3:])
+                if tail_sum > 0 and M > 3:
+                    target_tail = 100.0 - vol[0] - vol[1] - vol[2]
+                    vol[3:] *= target_tail / tail_sum
             
             # Recalculate m after all corrections
             m = compute_m_from_v(vol)
