@@ -527,9 +527,6 @@ def enforce_schedule_shape_fixed(
     front_cap: float = 5.0,
     g_min: float = 1.01,
     g_max: float = 1.20,
-    g_min_post: float = 1.01,
-    g_max_post: float = 1.30,
-    isotonic_tail: bool = True,
     # New parameters for HC constraints
     m2_min: float = 0.10,
     m2_max: float = 1.00,
@@ -601,6 +598,10 @@ def enforce_schedule_shape_fixed(
         bootstrap_tail_from_bands
     )
     
+    # Initialize logger
+    import logging
+    logger = logging.getLogger(__name__)
+
     M = int(len(volume_pct))
     if M == 0:
         return [], [], [], [], [], [], {
@@ -649,6 +650,9 @@ def enforce_schedule_shape_fixed(
         # Use bootstrapped volumes as starting point
         vol = vol_bootstrap
         hc0_applied = True
+        
+        # Debug log for HC0
+        logger.debug(f"HC0: Applied bootstrap, v[:5]={vol[:5].round(3).tolist() if M >= 5 else vol.round(3).tolist()}")
     
     # Step 1: Initialize v0 and indent0, normalize with tail_only_rescale
     if M >= 1:
@@ -666,6 +670,8 @@ def enforce_schedule_shape_fixed(
             if vol[2] < v2_min or vol[2] > v2_max:
                 vol[2] = np.clip(vol[2], v2_min, v2_max)
                 tail_only_rescale_keep_first_two(vol)
+        
+        logger.debug(f"HC1: After init, v[:5]={vol[:5].round(3).tolist() if M >= 5 else vol.round(3).tolist()}")
     
     # Apply head budget if requested
     head_budget_applied = False
@@ -703,6 +709,8 @@ def enforce_schedule_shape_fixed(
             band_clips += 1
         tail_only_rescale_keep_first_two(vol)
         m = compute_m_from_v(vol)
+        
+        logger.debug(f"HC1: v1 band applied, v[:5]={vol[:5].round(3).tolist() if M >= 5 else vol.round(3).tolist()}")
     
     # Step 4: HC3 - Martingale bands with decaying ceiling
     if M > 2:
@@ -730,10 +738,28 @@ def enforce_schedule_shape_fixed(
         # Rechain volumes from adjusted m
         vol = rechain_v_from_m(vol[0], vol[1], m)
         tail_only_rescale_keep_first_two(vol)
+        
+        # After rescaling, ensure m[2] is still within bounds
         m = compute_m_from_v(vol)
+        if m[2] < m2_min or m[2] > m2_max:
+            # Force m[2] to be within bounds
+            m[2] = np.clip(m[2], m2_min, m2_max)
+            # Rechain from m[2] onwards
+            for i in range(2, M):
+                if i == 2:
+                    vol[i] = vol[1] * (1.0 + m[2])
+                else:
+                    vol[i] = vol[i-1] * (1.0 + m[i])
+            # Final rescale
+            tail_only_rescale_keep_first_two(vol)
+            m = compute_m_from_v(vol)
+        
+        logger.debug(f"HC3: After martingale bands, v[:5]={vol[:5].round(3).tolist() if M >= 5 else vol.round(3).tolist()}, m2={m[2] if M > 2 else 0:.3f}")
     
     # Step 5: HC4 - Slope limits for smoothness
     if M > 3:
+        logger.debug(f"HC4: Before slope limit, m[2:6]={m[2:6].round(3).tolist() if len(m) >= 6 else m[2:].round(3).tolist()}")
+        
         for i in range(3, M):
             # Limit change from previous m
             m_prev = m[i-1]
@@ -744,10 +770,14 @@ def enforce_schedule_shape_fixed(
             if m[i] != m_original:
                 slope_clips += 1
         
+        logger.debug(f"HC4: After slope limit, m[2:6]={m[2:6].round(3).tolist() if len(m) >= 6 else m[2:].round(3).tolist()}")
+        
         # Rechain and rescale
         vol = rechain_v_from_m(vol[0], vol[1], m)
         tail_only_rescale_keep_first_two(vol)
         m = compute_m_from_v(vol)
+        
+        logger.debug(f"HC4: After slope limit, v[:5]={vol[:5].round(3).tolist() if M >= 5 else vol.round(3).tolist()}")
     
     # Step 6: HC2 - Strict monotonicity (respecting m2_min for v[2])
     for i in range(1, M):
@@ -762,25 +792,10 @@ def enforce_schedule_shape_fixed(
         if vol[i] < min_vol:
             vol[i] = min_vol
     
-    # Step 7: Tail-only rescale after monotonicity
+    # Step 7: Final tail-only rescale
     tail_only_rescale_keep_first_two(vol)
-    m = compute_m_from_v(vol)
     
-    # Re-check and enforce m2 bounds after monotonicity
-    if M > 2:
-        m2_current = m[2]
-        if m2_current < m2_min or m2_current > m2_max:
-            # Clamp m2 to valid range
-            m[2] = np.clip(m2_current, m2_min, m2_max)
-            # Rechain from this point
-            vol = rechain_v_from_m(vol[0], vol[1], m)
-            # Ensure monotonicity is maintained
-            for i in range(3, M):
-                min_vol = vol[i-1] + eps_inc
-                if vol[i] < min_vol:
-                    vol[i] = min_vol
-            tail_only_rescale_keep_first_two(vol)
-            m = compute_m_from_v(vol)
+    logger.debug(f"HC2: After strict monotonicity, v[:5]={vol[:5].round(3).tolist() if M >= 5 else vol.round(3).tolist()}")
     
     # Step 8: HC5 - Mass control (Q1 cap, Q4 floor)
     Q1 = min(M, max(1, int(np.ceil(M / 4.0))))
@@ -823,21 +838,18 @@ def enforce_schedule_shape_fixed(
                     vol[2:Q1] *= (front2_sum - deficit) / front2_sum
                     vol[q4_start:] *= tail_floor / q4_sum
     
-    # Re-apply HC2 and rescale after mass control (respecting m2_min)
-    for i in range(1, M):
-        if i == 2 and M > 2:
-            # For v[2], ensure it respects both monotonicity and m2_min
-            min_vol_mono = vol[1] + eps_inc
-            min_vol_m2 = vol[1] * (1.0 + m2_min)
-            min_vol = max(min_vol_mono, min_vol_m2)
-        else:
-            min_vol = vol[i-1] + eps_inc
-        
-        if vol[i] < min_vol:
-            vol[i] = min_vol
+    # Final rescale
     tail_only_rescale_keep_first_two(vol)
-    m = compute_m_from_v(vol)
     
+    # Recalculate shares after mass control
+    q1_share = float(np.sum(vol[:Q1])) if Q1 > 0 else 0.0
+    q4_share = float(np.sum(vol[q4_start:])) if q4_start < M else 0.0
+    
+    logger.debug(f"HC5: After mass control, q1={q1_share:.1f}%, q4={q4_share:.1f}%")
+    
+    # Recalculate m after mass control
+    m = compute_m_from_v(vol)
+
     # Step 9: HC6 - Plateau breaker
     plateau_max_run, plateau_start = longest_plateau_run(m, center=1.0, tol=0.02, start_idx=2)
     if plateau_max_run > 3 and plateau_start >= 2:
@@ -853,6 +865,8 @@ def enforce_schedule_shape_fixed(
         vol = rechain_v_from_m(vol[0], vol[1], m)
         tail_only_rescale_keep_first_two(vol)
         m = compute_m_from_v(vol)
+        
+        logger.debug(f"HC6: After plateau breaker, plateau_max_run={plateau_max_run_final}")
     
     # Additional wave enforcement if not enough turns
     if M > 6:
@@ -880,6 +894,8 @@ def enforce_schedule_shape_fixed(
             vol = rechain_v_from_m(vol[0], vol[1], m)
             tail_only_rescale_keep_first_two(vol)
             m = compute_m_from_v(vol)
+
+            logger.debug(f"HC7: After wave enforcement, turn_count={turn_count}")
 
     # Final check: ensure v0 is still fixed
     vol[0] = first_volume_target

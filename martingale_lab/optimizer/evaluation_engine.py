@@ -256,10 +256,6 @@ def evaluation_function(
     blocks: int = 3,
     wave_amp_min: float = 0.05,
     wave_amp_max: float = 0.30,
-    # Legacy post-band controls (deprecated)
-    g_min_post: float = 1.01,  # DEPRECATED: Use m_min/m_max instead
-    g_max_post: float = 1.30,  # DEPRECATED: Use decaying ceiling instead
-    isotonic_tail: bool = False,  # DEPRECATED: HC pipeline handles monotonicity
     # Penalty weight preset
     penalty_preset: Optional[str] = None,
     # New hard constraints
@@ -285,8 +281,6 @@ def evaluation_function(
     target_std: float = 0.10,
     w_varm: float = 2.0,
     w_blocks: float = 1.0,
-    use_entropy: bool = False,  # DEPRECATED: Entropy handled by SP penalties
-    entropy_target: float = 1.0,  # DEPRECATED
     # New SP penalty weights
     w_second: float = 3.0,
     w_plateau: float = 2.0,
@@ -400,9 +394,6 @@ def evaluation_function(
             front_cap,  # Still passed for now, but ignored in new pipeline
             g_min,
             g_max,
-            g_min_post,  # Still passed for now, but ignored
-            g_max_post,  # Still passed for now, but ignored
-            isotonic_tail,  # Still passed for now, but ignored
             # New HC parameters
             m2_min,
             m2_max,
@@ -452,8 +443,62 @@ def evaluation_function(
             "tail_overflow": bool((len(volume_pct) > 0) and (volume_pct[-1] > tail_cap * 100.0)),
         }
         
-        # Diagnostics (repaired)
+        # Calculate repair diagnostics
         volume_pct_np = np.asarray(volume_pct, dtype=np.float64)
+        m = compute_m_from_v(volume_pct_np)
+        
+        # Debug logging for HC steps
+        logger.debug(
+            f"POST-REPAIR: v[:5]={volume_pct_np[:5].round(3).tolist()}, "
+            f"m2={m[2] if len(m) > 2 else 0:.3f}, "
+            f"sum={np.sum(volume_pct_np):.6f}"
+        )
+        
+        # Needpct distribution analysis
+        needpct_np = np.asarray(needpct, dtype=np.float64)
+        if len(needpct_np) > 0:
+            N = len(needpct_np)
+            q1_end = N // 4
+            q4_start = 3 * N // 4
+            
+            # Exit-ease calculation (1/needpct)
+            exit_ease = 1.0 / np.maximum(needpct_np, 0.1)
+            q1_median = np.median(exit_ease[:q1_end]) if q1_end > 0 else 0.0
+            q4_median = np.median(exit_ease[q4_start:]) if q4_start < N else 0.0
+            ratio = q1_median / q4_median if q4_median > 0 else 0.0
+            
+            logger.debug(
+                f"NEEDPCT: Q1_med={np.median(needpct_np[:q1_end]):.2f}%, "
+                f"Q4_med={np.median(needpct_np[q4_start:]):.2f}%, "
+                f"exit_ease_ratio={ratio:.2f}"
+            )
+        
+        # Pattern detection logging
+        if len(m) > 2:
+            # Detect micro patterns
+            plateau_count = 0
+            sawtooth_count = 0
+            sudden_drops = 0
+            
+            for i in range(2, len(m)):
+                # Plateau detection
+                if abs(m[i] - 1.0) < 0.02:
+                    plateau_count += 1
+                
+                # Sudden drop detection
+                if i > 2 and m[i] < m[i-1] * 0.7:
+                    sudden_drops += 1
+                
+                # Sawtooth detection
+                if i > 3 and abs(m[i] - m[i-2]) < 0.01 and abs(m[i] - m[i-1]) > 0.1:
+                    sawtooth_count += 1
+            
+            logger.debug(
+                f"PATTERNS: plateau={plateau_count}, sawtooth={sawtooth_count}, "
+                f"sudden_drops={sudden_drops}, turn_count={repair_diag.get('turn_count', 0)}"
+            )
+        
+        # Diagnostics (repaired)
         diagnostics = {
             "wci": float(_weight_center_index(volume_pct_np)),
             "sign_flips": int(_count_sign_flips(np.asarray(needpct, dtype=np.float64))),
@@ -485,7 +530,6 @@ def evaluation_function(
             "wave_mode": wave_mode,
             "anchors": int(anchors) if wave_mode == "anchors" else None,
             "blocks": int(blocks) if wave_mode == "blocks" else None,
-            "isotonic_applied": bool(isotonic_tail),  # Legacy, always False now
         }
         if anchor_points_norm is not None:
             diagnostics["anchor_points"] = anchor_points_norm.tolist()
@@ -531,33 +575,29 @@ def evaluation_function(
         # New shape penalties after repair
         from martingale_lab.core.repair import compute_m_from_v
         
+        # Compute shape-related penalties
         shape_pens = compute_shape_penalties(
-            np.asarray(volume_pct, dtype=np.float64),
+            volume_pct_np,
             np.asarray(indent_pct, dtype=np.float64),
-            first_volume_target,
-            first_indent_target,
-            g_min,
-            g_max,
             k_front,
             front_cap,
             np.asarray(martingale_pct, dtype=np.float64),
             target_std,
-            use_entropy,
-            entropy_target,
             # New SP parameters
             1.10,  # v1_min_mult
             second_upper_c2,  # v1_max_mult
             0.02,  # plateau_tol
             3,  # plateau_max_len
-            0.20,  # target_std_varm
-            q1_cap,
-            tail_floor,
-            0.20,  # slope_delta_soft
-            slope_cap,  # slope_delta_cap
-            m_head,
-            m_tail,
-            tau_scale,
+            target_std,  # target_std_varm
+            g_min,  # g_min (still used for wave calculation)
+            m_head,  # wave_m_head
+            m_tail,  # wave_m_tail
+            tau_scale,  # wave_tau_scale
             0.0,  # wave_phase
+            q1_cap,  # q1_cap
+            tail_floor,  # tail_floor
+            slope_cap * 0.8,  # slope_delta_soft
+            slope_cap,  # slope_delta_cap
         )
         penalties.update(shape_pens)
         
@@ -582,7 +622,7 @@ def evaluation_function(
         )
         
         # Add entropy penalty if enabled
-        if use_entropy and "penalty_low_entropy" in shape_pens:
+        if "penalty_low_entropy" in shape_pens:
             shape_penalty_sum += w_varm * shape_pens["penalty_low_entropy"]
         
         # Log repair diagnostics and penalties (INFO) - updated format
@@ -595,24 +635,19 @@ def evaluation_function(
             f"turns={repair_diag.get('turn_count', 0)}",
             extra={
                 "event": "REPAIR",
-                "clipped_frac": repair_diag.get("clipped_frac", 0.0),
-                "front_excess_before": repair_diag.get("front_excess_before", 0.0),
-                "front_excess_after": repair_diag.get("front_excess_after", 0.0),
-                "tv_before": repair_diag.get("tv_before", 0.0),
-                "tv_after": repair_diag.get("tv_after", 0.0),
-                "first3_sum": repair_diag.get("first3_sum", 0.0),
-                "v0": repair_diag.get("v0", 0.0),
-                "v1": repair_diag.get("v1", 0.0),
-                "m2": repair_diag.get("m2", 0.0),
-                "std_m": repair_diag.get("std_m", 0.0),
-                "v1_band_applied": repair_diag.get("v1_band_applied", False),
-                "m2_clip_applied": repair_diag.get("m2_clip_applied", False),
-                "decaying_clips": repair_diag.get("decaying_clips_count", 0),
-                "slope_clips": repair_diag.get("slope_clips_count", 0),
-                "q1_share": repair_diag.get("q1_share", 0.0),
-                "q4_share": repair_diag.get("q4_share", 0.0),
-                "plateau_max_run": repair_diag.get("plateau_max_run", 0),
-                "turn_count": repair_diag.get("turn_count", 0),
+                "v0": float(repair_diag.get("v0", 0.0)),
+                "v1": float(repair_diag.get("v1", 0.0)),
+                "m2": float(repair_diag.get("m2", 0.0)),
+                "first3_sum": float(repair_diag.get("first3_sum", 0.0)),
+                "decaying_clips": int(repair_diag.get("decaying_clips_count", 0)),
+                "slope_clips": int(repair_diag.get("slope_clips_count", 0)),
+                "q1_share": float(repair_diag.get("q1_share", 0.0)),
+                "q4_share": float(repair_diag.get("q4_share", 0.0)),
+                "plateau_max_run": int(repair_diag.get("plateau_max_run", 0)),
+                "std_m": float(repair_diag.get("std_m", 0.0)),
+                "turn_count": int(repair_diag.get("turn_count", 0)),
+                "hc0_applied": bool(repair_diag.get("hc0_applied", False)),
+                "head_budget_applied": bool(repair_diag.get("head_budget_applied", False)),
             },
         )
         logger.info(

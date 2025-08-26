@@ -7,8 +7,9 @@ from __future__ import annotations
 
 import numpy as np
 from numba import njit
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import math
+from martingale_lab.core.repair import compute_m_from_v
 
 
 @njit(cache=True, fastmath=True)
@@ -750,53 +751,76 @@ def penalty_slope(m_tail: np.ndarray, delta_soft: float = 0.20, delta_cap: float
     return penalty
 
 
-def compute_shape_penalties(volumes: np.ndarray, indents: np.ndarray,
-                            first_volume_target: float, first_indent_target: float,
-                            g_min: float, g_max: float,
-                            k_front: int, front_cap: float,
-                            martingales: np.ndarray = None,
-                            target_std: float = 0.10,
-                            use_entropy: bool = False,
-                            entropy_target: float = 1.0,
-                            # New SP parameters
-                            v1_min_mult: float = 1.10,
-                            v1_max_mult: float = 2.0,
-                            plateau_tol: float = 0.02,
-                            plateau_max_len: int = 3,
-                            target_std_varm: float = 0.20,
-                            q1_cap: float = 22.0,
-                            tail_floor: float = 32.0,
-                            slope_delta_soft: float = 0.20,
-                            slope_delta_cap: float = 0.25,
-                            wave_m_head: float = 0.40,
-                            wave_m_tail: float = 0.20,
-                            wave_tau_scale: float = 1/3,
-                            wave_phase: float = 0.0) -> Dict[str, float]:
-    """Compute shape-specific penalties after repair, including new SP1-SP7."""
-    from martingale_lab.core.repair import compute_m_from_v
+def compute_shape_penalties(
+    volumes: np.ndarray,
+    indents: np.ndarray,
+    k_front: int,
+    front_cap: float,
+    martingales: Optional[np.ndarray],
+    target_std: float,
+    # New SP parameters
+    v1_min_mult: float = 1.10,
+    v1_max_mult: float = 2.0,
+    plateau_tol: float = 0.02,
+    plateau_max_len: int = 3,
+    target_std_varm: float = 0.20,
+    g_min: float = 1.05,
+    wave_m_head: float = 0.40,
+    wave_m_tail: float = 0.20,
+    wave_tau_scale: float = 1/3,
+    wave_phase: float = 0.0,
+    q1_cap: float = 22.0,
+    tail_floor: float = 32.0,
+    slope_delta_soft: float = 0.20,
+    slope_delta_cap: float = 0.25,
+) -> Dict[str, float]:
+    """
+    Compute shape-related penalties for martingale optimization.
     
-    penalties = {
-        "penalty_first_fixed": penalty_first_fixed(volumes, indents, first_volume_target, first_indent_target),
-        "penalty_second_leq": penalty_second_leq(volumes),
-        "penalty_g_band": penalty_g_band(volumes, g_min, g_max),
-        "penalty_frontload": penalty_frontload(volumes, k_front, front_cap),
-        "penalty_tv_vol": penalty_total_variation_vol(volumes),
-        "penalty_wave": penalty_wave(volumes, 0.1),
-    }
+    Args:
+        volumes: Volume percentages
+        indents: Indent percentages
+        k_front: Number of front orders
+        front_cap: Front volume cap
+        martingales: Martingale percentages (optional)
+        target_std: Target standard deviation for diversity
+        v1_min_mult/v1_max_mult: Bounds for v1 relative to v0
+        plateau_tol: Tolerance for plateau detection
+        plateau_max_len: Maximum allowed plateau length
+        target_std_varm: Target std for martingale variance
+        g_min: Minimum growth ratio
+        wave_m_head/wave_m_tail: Wave shape parameters
+        wave_tau_scale: Decay scale for wave
+        wave_phase: Phase offset for wave
+        q1_cap: First quartile cap
+        tail_floor: Last quartile floor
+        slope_delta_soft/slope_delta_cap: Slope penalty parameters
+        
+    Returns:
+        Dictionary of penalty components
+    """
+    penalties = {}
     
-    # Add new SP penalties
-    if volumes.size > 1:
+    # Front excess penalty
+    penalties["penalty_front_excess"] = penalty_front_excess(volumes, k_front, front_cap)
+    
+    # Total variation penalty
+    penalties["penalty_tv"] = penalty_total_variation(volumes)
+    
+    # Second order band penalty (SP1)
+    if volumes.size >= 2:
         v0 = volumes[0]
         v1 = volumes[1]
         penalties["penalty_second_band"] = penalty_second_band(v0, v1, v1_min_mult, v1_max_mult)
     else:
         penalties["penalty_second_band"] = 0.0
     
-    # Compute m for martingale-based penalties
-    if volumes.size > 2:
-        m = compute_m_from_v(volumes)
-        m_tail = m[2:]  # Tail martingales
-        
+    # Compute martingale ratios for other penalties
+    m = compute_m_from_v(volumes)
+    
+    # Martingale-based penalties (SP2-SP4, SP7)
+    if m.size > 2:
+        m_tail = m[2:]
         penalties["penalty_plateau"] = penalty_plateau(m_tail, plateau_tol, plateau_max_len)
         penalties["penalty_varm"] = penalty_varm(m_tail, target_std_varm)
         
@@ -822,9 +846,7 @@ def compute_shape_penalties(volumes: np.ndarray, indents: np.ndarray,
     if martingales is not None:
         penalties["penalty_uniform"] = penalty_uniform_martingale(martingales, target_std)
         penalties["penalty_flat_blocks"] = penalty_flat_blocks(volumes, k_front)
-        
-        if use_entropy:
-            penalties["penalty_low_entropy"] = penalty_low_entropy(martingales, entropy_target)
+        # Entropy penalty removed - handled by other penalties
     
     return penalties
 
