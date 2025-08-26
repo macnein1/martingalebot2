@@ -530,16 +530,41 @@ def enforce_schedule_shape_fixed(
     g_min_post: float = 1.01,
     g_max_post: float = 1.30,
     isotonic_tail: bool = True,
-    # New parameters
+    # New parameters for HC constraints
     m2_min: float = 0.10,
     m2_max: float = 1.00,
     m_min: float = 0.05,
     m_max: float = 1.00,
     firstK_min: float = 1.0,
     eps_inc: float = 1e-5,
+    # Additional new parameters
+    second_upper_c2: float = 2.0,
+    m_head: float = 0.40,
+    m_tail: float = 0.20,
+    tau_scale: float = 1/3,
+    slope_cap: float = 0.25,
+    q1_cap: float = 22.0,
+    tail_floor: float = 32.0,
+    # Head budget parameters (new)
+    head_budget_pct: float = 2.0,
+    use_head_budget: bool = False,
+    use_hc0_bootstrap: bool = True,
 ) -> Tuple[list, list, list, list, list, list, Dict[str, Any]]:
     """
-    Enforce fixed-first-order and shaped martingale band on a schedule, then renormalize.
+    Enforce fixed-first-order and shaped martingale band on a schedule with HC0-HC7 pipeline.
+    
+    Pipeline steps:
+    0. HC0: Bootstrap feasible tail if needed
+    1. Initialize: v0=0.01, indent0=0.00, normalize with tail_only_rescale
+    2. Compute m = compute_m_from_v(v)
+    3. HC1: v1 band [1.10*v0, second_upper_c2*v0], then tail_only_rescale
+    4. HC3: martingale bands with decaying ceiling, then rechain and tail_only_rescale
+    5. HC4: slope limits for smoothness, then rechain and tail_only_rescale
+    6. HC2: strict monotonicity v[i] >= v[i-1] + eps_inc
+    7. Tail-only rescale
+    8. HC5: mass control (Q1 cap, Q4 floor)
+    9. HC6: plateau breaker
+    10. Compute derivatives
 
     Args:
         indent_pct: cumulative indent percentages per order (length M)
@@ -551,11 +576,31 @@ def enforce_schedule_shape_fixed(
         front_cap: maximum total volume percentage allowed in the first k_front orders
         g_min: minimum allowed growth ratio for i>=2 (vol[i]/vol[i-1])
         g_max: maximum allowed growth ratio for i>=2
+        second_upper_c2: upper bound multiplier for v1 (v1 <= c2*v0)
+        m2_min/m2_max: bounds for m[2]
+        m_min/m_max: general bounds for m[i] where i>=3
+        m_head/m_tail: parameters for decaying ceiling
+        tau_scale: decay rate scale (tau = N * tau_scale)
+        slope_cap: maximum |Δm| for i>=3
+        q1_cap: first quartile volume cap
+        tail_floor: last quartile volume floor
+        eps_inc: minimum increment for strict monotonicity
+        head_budget_pct: target head budget percentage when use_head_budget=True
+        use_head_budget: whether to apply head budget redistribution
+        use_hc0_bootstrap: whether to apply HC0 bootstrap for feasibility
 
     Returns:
         (repaired_indent_pct, repaired_volume_pct, martingale_pct, needpct,
          order_prices, price_step_pct, diagnostics)
     """
+    from martingale_lab.core.repair import (
+        tail_only_rescale_keep_first_two,
+        compute_m_from_v,
+        rechain_v_from_m,
+        longest_plateau_run,
+        bootstrap_tail_from_bands
+    )
+    
     M = int(len(volume_pct))
     if M == 0:
         return [], [], [], [], [], [], {
@@ -578,137 +623,281 @@ def enforce_schedule_shape_fixed(
     tv_before = _total_variation(vol_in)
     front_sum_before = float(np.sum(vol_in[: min(k_front, M)]))
 
-    # Ensure first indent and first volume fixed
+    # Helper: decaying ceiling function
+    def _decay_ceiling(i: int, N: int, m_head: float, m_tail_cap: float, tau_scale: float) -> float:
+        """Compute decaying ceiling for martingale at position i."""
+        tau = max(1.0, N * tau_scale)
+        return m_tail_cap + (m_head - m_tail_cap) * np.exp(-(i - 2) / tau)
+
+    # Initialize volumes
+    vol = vol_in.copy()
+    
+    # Step 0: HC0 - Bootstrap feasible tail if needed
+    hc0_applied = False
+    if use_hc0_bootstrap and M > 2:
+        # Check if current volumes would create infeasible m2
+        v0_target = first_volume_target
+        v1_current = vol[1] if M > 1 else v0_target * 2.0
+        
+        # Apply HC0 bootstrap to get feasible starting point
+        vol_bootstrap = bootstrap_tail_from_bands(
+            v0_target, v1_current, M,
+            m2_min, m2_max, m_min,
+            m_head, m_tail, tau_scale
+        )
+        
+        # Use bootstrapped volumes as starting point
+        vol = vol_bootstrap
+        hc0_applied = True
+    
+    # Step 1: Initialize v0 and indent0, normalize with tail_only_rescale
     if M >= 1:
         ind[0] = first_indent_target
-    vol = np.zeros(M, dtype=np.float64)
-    vol[0] = first_volume_target
-
-    # Compute input ratios g_i from provided volumes to guide repair
-    g_input = np.ones(M, dtype=np.float64)
-    for i in range(1, M):
-        if vol_in[i-1] > 1e-12:
-            g_input[i] = vol_in[i] / max(vol_in[i-1], 1e-12)
-        else:
-            g_input[i] = 1.0
-
-    # NEW ALGORITHM: Apply new hard constraints with iteration
-    band_clips = 0
-    clips_hi = 0
-    clips_lo = 0
-    iter_fix_loops = 0
+        vol[0] = first_volume_target
     
-    # 1) v0 sabit: v0 := first_volume (0.01)
-    vol[0] = first_volume_target
-    
-    # 2) v1 bandı: v1_raw := max( v0*(1+m2_min), min(v1_raw, v0*(1+m2_max) ) )
     if M > 1:
-        v1_raw = vol_in[1] if len(vol_in) > 1 else first_volume_target
-        v1_min = vol[0] * (1 + m2_min)
-        v1_max = vol[0] * (1 + m2_max)
-        vol[1] = max(v1_min, min(v1_raw, v1_max))
-        if vol[1] != v1_raw:
+        # Keep v1 from input initially (or from bootstrap), will adjust in HC1
+        tail_only_rescale_keep_first_two(vol)
+        
+        # Immediately enforce v[2] bounds if it exists
+        if M > 2:
+            v2_min = vol[1] * (1.0 + m2_min)
+            v2_max = vol[1] * (1.0 + m2_max)
+            if vol[2] < v2_min or vol[2] > v2_max:
+                vol[2] = np.clip(vol[2], v2_min, v2_max)
+                tail_only_rescale_keep_first_two(vol)
+    
+    # Apply head budget if requested
+    head_budget_applied = False
+    if use_head_budget and M > 2:
+        # Calculate current head sum
+        head_sum = vol[0] + vol[1]
+        target_head = min(head_budget_pct, head_sum + 1.0)  # Allow small increase
+        
+        if target_head > head_sum:
+            # Redistribute small amount to v[2] to ease m2 constraint
+            delta = target_head - head_sum
+            vol[2] += delta
+            # Rescale rest of tail to maintain sum = 100
+            tail_only_rescale_keep_first_two(vol)
+            head_budget_applied = True
+
+    # Tracking variables for diagnostics
+    band_clips = 0
+    v1_band_applied = False
+    m2_clip_applied = False
+    decaying_clips = 0
+    slope_clips = 0
+    
+    # Step 2: Compute initial m
+    m = compute_m_from_v(vol)
+    
+    # Step 3: HC1 - v1 band constraint
+    if M > 1:
+        v1_min = 1.10 * vol[0]
+        v1_max = second_upper_c2 * vol[0]
+        v1_original = vol[1]
+        vol[1] = np.clip(vol[1], v1_min, v1_max)
+        if vol[1] != v1_original:
+            v1_band_applied = True
             band_clips += 1
+        tail_only_rescale_keep_first_two(vol)
+        m = compute_m_from_v(vol)
     
-    # 3) Tüm tail (i≥2) için martingale bantı (post)
-    for i in range(2, M):
-        if vol[i-1] > 1e-12:
-            g_i = vol_in[i] / vol[i-1] if i < len(vol_in) else 1.0
-            # g_i ← clip(g_i, 1+m_min, 1+m_max)
-            g_i = max(1 + m_min, min(g_i, 1 + m_max))
-            vol[i] = vol[i-1] * g_i
-            if g_i != (vol_in[i] / vol[i-1] if i < len(vol_in) else 1.0):
+    # Step 4: HC3 - Martingale bands with decaying ceiling
+    if M > 2:
+        # Apply m[2] bounds - m[2] is the growth ratio minus 1
+        # m[2] = v[2]/v[1] - 1, so v[2] = v[1] * (1 + m[2])
+        v2_min = vol[1] * (1.0 + m2_min)
+        v2_max = vol[1] * (1.0 + m2_max)
+        vol[2] = np.clip(vol[2], v2_min, v2_max)
+        
+        # Update m after v2 adjustment
+        m = compute_m_from_v(vol)
+        if abs(m[2] - np.clip(m[2], m2_min, m2_max)) > 1e-6:
+            m2_clip_applied = True
+            band_clips += 1
+        
+        # Apply decaying ceiling for i>=3
+        for i in range(3, M):
+            m_max_i = _decay_ceiling(i, M, m_head, m_tail, tau_scale)
+            m_original = m[i]
+            m[i] = np.clip(m[i], m_min, m_max_i)
+            if m[i] != m_original:
+                decaying_clips += 1
                 band_clips += 1
-        else:
-            vol[i] = vol[i-1] * (1 + m_min)
+        
+        # Rechain volumes from adjusted m
+        vol = rechain_v_from_m(vol[0], vol[1], m)
+        tail_only_rescale_keep_first_two(vol)
+        m = compute_m_from_v(vol)
     
-    # 4) Katı artış: v_i ← max(v_i, v_{i-1} + eps_inc)
+    # Step 5: HC4 - Slope limits for smoothness
+    if M > 3:
+        for i in range(3, M):
+            # Limit change from previous m
+            m_prev = m[i-1]
+            m_min_slope = m_prev - slope_cap
+            m_max_slope = m_prev + slope_cap
+            m_original = m[i]
+            m[i] = np.clip(m[i], m_min_slope, m_max_slope)
+            if m[i] != m_original:
+                slope_clips += 1
+        
+        # Rechain and rescale
+        vol = rechain_v_from_m(vol[0], vol[1], m)
+        tail_only_rescale_keep_first_two(vol)
+        m = compute_m_from_v(vol)
+    
+    # Step 6: HC2 - Strict monotonicity (respecting m2_min for v[2])
     for i in range(1, M):
-        min_vol = vol[i-1] + eps_inc
+        if i == 2 and M > 2:
+            # For v[2], ensure it respects both monotonicity and m2_min
+            min_vol_mono = vol[1] + eps_inc
+            min_vol_m2 = vol[1] * (1.0 + m2_min)
+            min_vol = max(min_vol_mono, min_vol_m2)
+        else:
+            min_vol = vol[i-1] + eps_inc
+        
         if vol[i] < min_vol:
             vol[i] = min_vol
-            clips_lo += 1
     
-    # 5) Ön kısım alt sınırı: sum3 := v0+v1+v2. Eğer sum3 < firstK_min:
-    if M >= 3:
-        sum3 = vol[0] + vol[1] + vol[2]
-        if sum3 < firstK_min:
-            delta = firstK_min - sum3
-            # Bunu yalnızca i∈{2..K-1} üzerinde oransal ekle
-            k_orders = min(3, M)
-            if k_orders > 2:
-                vol[2] += delta  # Add to v2 only
-                clips_hi += 1
+    # Step 7: Tail-only rescale after monotonicity
+    tail_only_rescale_keep_first_two(vol)
+    m = compute_m_from_v(vol)
     
-    # 6) Front-cap ve sum=100 normalize: v0/v1 sabit, tail tek ölçek
-    # Front cap enforcement
-    kf = min(k_front, M)
-    if kf >= 1:
-        target_front_sum = min(front_cap, 100.0)
-        if kf == 1:
-            pass  # only v0 in front; nothing to scale
+    # Re-check and enforce m2 bounds after monotonicity
+    if M > 2:
+        m2_current = m[2]
+        if m2_current < m2_min or m2_current > m2_max:
+            # Clamp m2 to valid range
+            m[2] = np.clip(m2_current, m2_min, m2_max)
+            # Rechain from this point
+            vol = rechain_v_from_m(vol[0], vol[1], m)
+            # Ensure monotonicity is maintained
+            for i in range(3, M):
+                min_vol = vol[i-1] + eps_inc
+                if vol[i] < min_vol:
+                    vol[i] = min_vol
+            tail_only_rescale_keep_first_two(vol)
+            m = compute_m_from_v(vol)
+    
+    # Step 8: HC5 - Mass control (Q1 cap, Q4 floor)
+    Q1 = min(M, max(1, int(np.ceil(M / 4.0))))
+    Q4 = min(M, max(1, int(np.ceil(M / 4.0))))
+    
+    # Calculate current shares
+    q1_sum = float(np.sum(vol[:Q1]))
+    q4_start = max(0, M - Q4)
+    q4_sum = float(np.sum(vol[q4_start:]))
+    
+    # Apply Q1 cap
+    if q1_sum > q1_cap and Q1 > 2:
+        # Scale down orders [2..Q1-1] to meet cap
+        front2_sum = float(np.sum(vol[2:Q1]))
+        if front2_sum > 1e-12:
+            target_front2 = max(0.0, q1_cap - vol[0] - vol[1])
+            scale_front2 = target_front2 / front2_sum
+            vol[2:Q1] *= scale_front2
+            # Add excess to tail
+            excess = front2_sum - target_front2
+            tail_sum = float(np.sum(vol[Q1:]))
+            if tail_sum > 1e-12:
+                vol[Q1:] *= (tail_sum + excess) / tail_sum
+    
+    # Apply Q4 floor
+    if q4_sum < tail_floor and q4_start < M:
+        # Scale up tail to meet floor
+        deficit = tail_floor - q4_sum
+        # Try to take from middle section
+        if Q1 < q4_start:
+            mid_sum = float(np.sum(vol[Q1:q4_start]))
+            if mid_sum > deficit:
+                vol[Q1:q4_start] *= (mid_sum - deficit) / mid_sum
+                vol[q4_start:] *= tail_floor / q4_sum
         else:
-            front_sum = float(np.sum(vol[:kf]))
-            if front_sum > target_front_sum + 1e-12:
-                current_front_rest2 = float(np.sum(vol[2:kf])) if kf > 2 else 0.0
-                target_front_rest2 = max(0.0, target_front_sum - vol[0] - vol[1])
-                if current_front_rest2 > 1e-12:
-                    s_front2 = target_front_rest2 / current_front_rest2
-                    vol[2:kf] *= s_front2
-                # Now scale tail (kf..M-1) to keep total 100
-                tail_sum = float(np.sum(vol[kf:]))
-                needed_tail = max(0.0, 100.0 - (vol[0] + vol[1] + float(np.sum(vol[2:kf]))))
-                if tail_sum > 1e-12:
-                    s_tail = needed_tail / tail_sum
-                    vol[kf:] *= s_tail
-                else:
-                    if kf > 2:
-                        vol[kf-1] = max(0.0, 100.0 - (vol[0] + vol[1] + float(np.sum(vol[2:kf-1]))))
+            # Take from front2 if no middle section
+            if Q1 > 2:
+                front2_sum = float(np.sum(vol[2:Q1]))
+                if front2_sum > deficit:
+                    vol[2:Q1] *= (front2_sum - deficit) / front2_sum
+                    vol[q4_start:] *= tail_floor / q4_sum
     
-    # Final normalization to sum=100
-    total = float(np.sum(vol))
-    if total > 1e-9:
-        vol *= 100.0 / total
-    
-    # 7) İTERASYON: 2→6 adımlarını 2–3 kez döndür
-    for iteration in range(2):  # 2 iterations
-        iter_fix_loops += 1
-        
-        # Re-apply martingale bands after normalization
-        for i in range(2, M):
-            if vol[i-1] > 1e-12:
-                g_i = vol[i] / vol[i-1]
-                g_i = max(1 + m_min, min(g_i, 1 + m_max))
-                vol[i] = vol[i-1] * g_i
-        
-        # Re-apply strict increase
-        for i in range(1, M):
+    # Re-apply HC2 and rescale after mass control (respecting m2_min)
+    for i in range(1, M):
+        if i == 2 and M > 2:
+            # For v[2], ensure it respects both monotonicity and m2_min
+            min_vol_mono = vol[1] + eps_inc
+            min_vol_m2 = vol[1] * (1.0 + m2_min)
+            min_vol = max(min_vol_mono, min_vol_m2)
+        else:
             min_vol = vol[i-1] + eps_inc
-            if vol[i] < min_vol:
-                vol[i] = min_vol
         
-        # Re-normalize
-        total = float(np.sum(vol))
-        if total > 1e-9:
-            vol *= 100.0 / total
+        if vol[i] < min_vol:
+            vol[i] = min_vol
+    tail_only_rescale_keep_first_two(vol)
+    m = compute_m_from_v(vol)
+    
+    # Step 9: HC6 - Plateau breaker
+    plateau_max_run, plateau_start = longest_plateau_run(m, center=1.0, tol=0.02, start_idx=2)
+    if plateau_max_run > 3 and plateau_start >= 2:
+        # Apply alternating perturbations to break plateau
+        delta = min(0.01, slope_cap / 2)  # Small perturbation within slope limits
+        for i in range(plateau_start, min(plateau_start + plateau_max_run, M)):
+            if (i - plateau_start) % 2 == 0:
+                m[i] = min(m[i] + delta, _decay_ceiling(i, M, m_head, m_tail, tau_scale))
+            else:
+                m[i] = max(m[i] - delta, m_min)
+        
+        # Rechain and rescale
+        vol = rechain_v_from_m(vol[0], vol[1], m)
+        tail_only_rescale_keep_first_two(vol)
+        m = compute_m_from_v(vol)
+    
+    # Additional wave enforcement if not enough turns
+    if M > 6:
+        # Count current turns
+        turn_count_current = 0
+        for i in range(3, M):
+            prev_sign = np.sign(m[i-1] - 1.0) if abs(m[i-1] - 1.0) > 0.01 else 0
+            curr_sign = np.sign(m[i] - 1.0) if abs(m[i] - 1.0) > 0.01 else 0
+            if prev_sign != 0 and curr_sign != 0 and prev_sign != curr_sign:
+                turn_count_current += 1
+        
+        # If not enough turns, add some wave pattern
+        if turn_count_current < 2:
+            # Apply a gentle wave pattern
+            wave_period = max(3, M // 4)
+            for i in range(3, M):
+                phase = ((i - 3) % wave_period) / float(wave_period)
+                wave_val = np.sin(2 * np.pi * phase)
+                # Add small wave perturbation
+                delta = 0.05 * wave_val
+                m_max_i = _decay_ceiling(i, M, m_head, m_tail, tau_scale)
+                m[i] = np.clip(m[i] + delta, m_min, m_max_i)
+            
+            # Rechain and rescale
+            vol = rechain_v_from_m(vol[0], vol[1], m)
+            tail_only_rescale_keep_first_two(vol)
+            m = compute_m_from_v(vol)
 
-    # Ensure v0 is fixed after all operations
+    # Final check: ensure v0 is still fixed
     vol[0] = first_volume_target
-
-    # Repair indents to be non-decreasing and anchored at first_indent_target
+    
+    # Repair indents to be non-decreasing
     for i in range(1, len(ind)):
         if ind[i] < ind[i-1]:
             ind[i] = ind[i-1]
-
-    # Recompute martingale percentages from repaired volumes (no clamping)
+    
+    # Step 10: Compute derivatives
+    # Recompute martingale percentages
     mart = np.zeros(M, dtype=np.float64)
     for i in range(1, M):
-        denom = max(vol[i-1], 1e-12)
-        mart[i] = (vol[i] / denom - 1.0) * 100.0
-
+        mart[i] = m[i] * 100.0
+    
     # Build indent cumulative (prepend 0)
     indent_cum = np.concatenate([[0.0], ind.astype(np.float64)])
-
+    
     # Recompute order prices from base price and indents
     order_prices = np.empty(M + 1, dtype=np.float64)
     order_prices[0] = base_price
@@ -716,12 +905,11 @@ def enforce_schedule_shape_fixed(
         if i < len(indent_cum):
             order_prices[i] = base_price * (1.0 - indent_cum[i] / 100.0)
         else:
-            # Fallback if indent_cum is shorter than expected
             order_prices[i] = base_price * (1.0 - indent_cum[-1] / 100.0)
-
+    
     # Price steps
     price_step_pct = np.diff(indent_cum)
-
+    
     # Recompute needpct
     needpct = np.empty(M, dtype=np.float64)
     vol_acc = 0.0
@@ -731,31 +919,37 @@ def enforce_schedule_shape_fixed(
         val_acc += vol[i] * order_prices[i + 1]
         avg_price = val_acc / vol_acc if vol_acc > 1e-12 else base_price
         needpct[i] = ((base_price - avg_price) / base_price) * 100.0
-
-    # Diagnostics
+    
+    # Calculate diagnostic metrics
     tv_after = _total_variation(vol)
-    front_sum_after = float(np.sum(vol[:kf]))
+    front_sum_after = float(np.sum(vol[:min(k_front, M)]))
     l1_change = float(np.sum(np.abs(vol - vol_in)))
     clipped_frac = float(band_clips) / float(max(1, M - 1))
     
-    # Calculate m2 (v1/v0 - 1)
-    m2 = 0.0
-    if M > 1 and vol[0] > 1e-12:
-        m2 = (vol[1] / vol[0]) - 1.0
+    # Calculate additional metrics
+    first3_sum = float(np.sum(vol[:min(3, M)]))
+    q1_share = float(np.sum(vol[:Q1]))
+    q4_share = float(np.sum(vol[q4_start:]))
     
-    # Calculate std_m for martingale diversity
+    # Calculate std_m for tail diversity
     std_m = 0.0
     if M > 2:
-        m_values = []
-        for i in range(2, M):
-            if vol[i-1] > 1e-12:
-                g_i = vol[i] / vol[i-1]
-                m_values.append(g_i - 1.0)
-        if m_values:
-            mean_m = sum(m_values) / len(m_values)
-            var_m = sum((m - mean_m) ** 2 for m in m_values) / len(m_values)
-            std_m = var_m ** 0.5
-
+        m_tail = m[2:]
+        if len(m_tail) > 0:
+            std_m = float(np.std(m_tail))
+    
+    # Count sign changes (turns) in m
+    turn_count = 0
+    if M > 3:
+        for i in range(3, M):
+            prev_sign = np.sign(m[i-1] - 1.0)
+            curr_sign = np.sign(m[i] - 1.0)
+            if prev_sign != 0 and curr_sign != 0 and prev_sign != curr_sign:
+                turn_count += 1
+    
+    # Update plateau info after potential breaking
+    plateau_max_run_final, _ = longest_plateau_run(m, center=1.0, tol=0.02, start_idx=2)
+    
     diagnostics = {
         "clipped_frac": clipped_frac,
         "band_clips": int(band_clips),
@@ -764,16 +958,23 @@ def enforce_schedule_shape_fixed(
         "tv_before": float(tv_before),
         "tv_after": float(tv_after),
         "l1_change": float(l1_change),
-        "clip_hi_post": clips_hi,
-        "clip_lo_post": clips_lo,
-        "first3_sum": float(np.sum(vol[: min(3, M)])),
-        "g2": float((vol[2] / max(vol[1], 1e-12)) if M > 2 else 0.0),
-        "m2": m2,
+        "first3_sum": first3_sum,
+        "v1_band_applied": v1_band_applied,
+        "m2_clip_applied": m2_clip_applied,
+        "decaying_clips_count": decaying_clips,
+        "slope_clips_count": slope_clips,
+        "q1_share": q1_share,
+        "q4_share": q4_share,
+        "plateau_max_run": plateau_max_run_final,
         "std_m": std_m,
-        "sign_changes": 0,  # Will be calculated in penalties
-        "iter_fix_loops": iter_fix_loops,
+        "turn_count": turn_count,
+        "v0": float(vol[0]),
+        "v1": float(vol[1]),
+        "m2": float(m[2]) if M > 2 else 0.0,
+        "hc0_applied": hc0_applied,
+        "head_budget_applied": head_budget_applied,
     }
-
+    
     return (
         ind.tolist(),
         vol.tolist(),
