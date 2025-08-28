@@ -213,6 +213,18 @@ class DCAConfig:
     firstK_min: float = 1.0
     strict_inc_eps: float = 1e-5
     
+    # New HC parameters (HC0-HC7)
+    second_upper_c2: float = 2.0
+    m_head: float = 0.40
+    m_tail: float = 0.20
+    tau_scale: float = 1/3
+    slope_cap: float = 0.25
+    q1_cap: float = 22.0
+    tail_floor: float = 32.0
+    head_budget_pct: float = 2.0
+    use_head_budget: bool = False
+    use_hc0_bootstrap: bool = True
+    
     # New soft penalties
     target_std: float = 0.10
     w_varm: float = 2.0
@@ -359,6 +371,24 @@ class DCAOrchestrator:
                 "g_min_post": self.config.g_post_min,
                 "g_max_post": self.config.g_post_max,
                 "isotonic_tail": self.config.isotonic_tail,
+                # New hard constraints
+                "m2_min": self.config.m2_min,
+                "m2_max": self.config.m2_max,
+                "m_min": self.config.m_min,
+                "m_max": self.config.m_max,
+                "firstK_min": self.config.firstK_min,
+                "strict_inc_eps": self.config.strict_inc_eps,
+                # New HC parameters (HC0-HC7)
+                "second_upper_c2": self.config.second_upper_c2,
+                "m_head": self.config.m_head,
+                "m_tail": self.config.m_tail,
+                "tau_scale": self.config.tau_scale,
+                "slope_cap": self.config.slope_cap,
+                "q1_cap": self.config.q1_cap,
+                "tail_floor": self.config.tail_floor,
+                "head_budget_pct": self.config.head_budget_pct,
+                "use_head_budget": self.config.use_head_budget,
+                "use_hc0_bootstrap": self.config.use_hc0_bootstrap,
                 # Penalty weights/preset
                 "penalty_preset": self.config.penalty_preset,
                 "w_fixed": self.config.w_fixed,

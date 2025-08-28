@@ -94,6 +94,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--strict-inc-eps", type=float, default=1e-5,
                        help="Strict increase epsilon (v_i >= v_{i-1} + eps)")
     
+    # New HC parameters (HC0-HC7)
+    parser.add_argument("--second-upper-c2", type=float, default=2.0,
+                       help="Upper bound coefficient for second order (v1 <= v0*c2)")
+    parser.add_argument("--m-head", type=float, default=0.40,
+                       help="Martingale head coefficient for wave shape")
+    parser.add_argument("--m-tail", type=float, default=0.20,
+                       help="Martingale tail coefficient for wave shape")
+    parser.add_argument("--tau-scale", type=float, default=1/3,
+                       help="Decay scale factor for wave shape")
+    parser.add_argument("--slope-cap", type=float, default=0.25,
+                       help="Maximum slope change cap")
+    parser.add_argument("--q1-cap", type=float, default=22.0,
+                       help="First quartile volume cap percentage")
+    parser.add_argument("--tail-floor", type=float, default=32.0,
+                       help="Last quartile volume floor percentage")
+    parser.add_argument("--head-budget-pct", type=float, default=2.0,
+                       help="Head budget percentage for HC0 bootstrap")
+    parser.add_argument("--use-head-budget", action="store_true",
+                       help="Enable head budget constraint")
+    parser.add_argument("--use-hc0-bootstrap", action="store_true",
+                       help="Enable HC0 bootstrap mode")
+    
     # New soft penalties
     parser.add_argument("--target-std", type=float, default=0.10,
                        help="Target standard deviation for martingale diversity")
@@ -273,6 +295,18 @@ def create_orchestrator_config(args: argparse.Namespace) -> tuple[DCAConfig, Orc
         m_max=args.m_max,
         firstK_min=args.firstK_min,
         strict_inc_eps=args.strict_inc_eps,
+        
+        # New HC parameters (HC0-HC7)
+        second_upper_c2=args.second_upper_c2,
+        m_head=args.m_head,
+        m_tail=args.m_tail,
+        tau_scale=args.tau_scale,
+        slope_cap=args.slope_cap,
+        q1_cap=args.q1_cap,
+        tail_floor=args.tail_floor,
+        head_budget_pct=args.head_budget_pct,
+        use_head_budget=args.use_head_budget,
+        use_hc0_bootstrap=args.use_hc0_bootstrap,
         
         # New soft penalties
         target_std=args.target_std,
