@@ -537,6 +537,7 @@ def enforce_schedule_shape_fixed(
     m_max: float = 1.00,
     firstK_min: float = 1.0,
     eps_inc: float = 1e-5,
+    slope_cap: float = 0.25,  # Maximum martingale slope change
 ) -> Tuple[list, list, list, list, list, list, Dict[str, Any]]:
     """
     Enforce fixed-first-order and shaped martingale band on a schedule, then renormalize.
@@ -605,22 +606,33 @@ def enforce_schedule_shape_fixed(
     if M > 1:
         v1_raw = vol_in[1] if len(vol_in) > 1 else first_volume_target
         v1_min = vol[0] * (1 + m2_min)
-        v1_max = vol[0] * (1 + m2_max)
+        # Apply slope cap to m2_max (m[1] - m[0] = m[1] - 0 <= slope_cap)
+        m2_max_capped = min(m2_max, slope_cap)
+        v1_max = vol[0] * (1 + m2_max_capped)
         vol[1] = max(v1_min, min(v1_raw, v1_max))
         if vol[1] != v1_raw:
             band_clips += 1
     
     # 3) Tüm tail (i≥2) için martingale bantı (post)
+    prev_m = (vol[1] / vol[0] - 1.0) if M > 1 and vol[0] > 1e-12 else m_min
     for i in range(2, M):
         if vol[i-1] > 1e-12:
             g_i = vol_in[i] / vol[i-1] if i < len(vol_in) else 1.0
             # g_i ← clip(g_i, 1+m_min, 1+m_max)
             g_i = max(1 + m_min, min(g_i, 1 + m_max))
+            
+            # Apply slope cap: limit change from previous martingale
+            m_i = g_i - 1.0
+            m_i = max(prev_m - slope_cap, min(m_i, prev_m + slope_cap))
+            g_i = 1.0 + m_i
+            prev_m = m_i
+            
             vol[i] = vol[i-1] * g_i
             if g_i != (vol_in[i] / vol[i-1] if i < len(vol_in) else 1.0):
                 band_clips += 1
         else:
             vol[i] = vol[i-1] * (1 + m_min)
+            prev_m = m_min
     
     # 4) Katı artış: v_i ← max(v_i, v_{i-1} + eps_inc)
     for i in range(1, M):
@@ -674,11 +686,29 @@ def enforce_schedule_shape_fixed(
     for iteration in range(2):  # 2 iterations
         iter_fix_loops += 1
         
-        # Re-apply martingale bands after normalization
+        # Ensure v0 is fixed
+        vol[0] = first_volume_target
+        
+        # Re-apply v1 band constraint with slope cap
+        if M > 1:
+            v1_min = vol[0] * (1 + m2_min)
+            m2_max_capped = min(m2_max, slope_cap)
+            v1_max = vol[0] * (1 + m2_max_capped)
+            vol[1] = max(v1_min, min(vol[1], v1_max))
+        
+        # Re-apply martingale bands after normalization with slope cap
+        prev_m = (vol[1] / vol[0] - 1.0) if M > 1 and vol[0] > 1e-12 else m_min
         for i in range(2, M):
             if vol[i-1] > 1e-12:
                 g_i = vol[i] / vol[i-1]
                 g_i = max(1 + m_min, min(g_i, 1 + m_max))
+                
+                # Apply slope cap
+                m_i = g_i - 1.0
+                m_i = max(prev_m - slope_cap, min(m_i, prev_m + slope_cap))
+                g_i = 1.0 + m_i
+                prev_m = m_i
+                
                 vol[i] = vol[i-1] * g_i
         
         # Re-apply strict increase
@@ -687,13 +717,19 @@ def enforce_schedule_shape_fixed(
             if vol[i] < min_vol:
                 vol[i] = min_vol
         
-        # Re-normalize
-        total = float(np.sum(vol))
-        if total > 1e-9:
-            vol *= 100.0 / total
+        # Re-normalize preserving v0
+        tail_sum = float(np.sum(vol[1:]))
+        if tail_sum > 1e-9:
+            target_tail = 100.0 - vol[0]
+            vol[1:] *= target_tail / tail_sum
 
-    # Ensure v0 is fixed after all operations
+    # Final ensure v0 and v1 band with slope cap
     vol[0] = first_volume_target
+    if M > 1:
+        v1_min = vol[0] * (1 + m2_min)
+        m2_max_capped = min(m2_max, slope_cap)
+        v1_max = vol[0] * (1 + m2_max_capped)
+        vol[1] = max(v1_min, min(vol[1], v1_max))
 
     # Repair indents to be non-decreasing and anchored at first_indent_target
     for i in range(1, len(ind)):
