@@ -15,6 +15,7 @@ import traceback
 from martingale_lab.utils.logging import get_eval_logger, should_log_eval
 from martingale_lab.core.constraints import enforce_schedule_shape_fixed
 from martingale_lab.core.penalties import compute_shape_penalties
+from martingale_lab.core.parameter_forwarding import filter_kwargs_for_function
 
 # Use the new centralized logging system
 logger = get_eval_logger()
@@ -460,33 +461,39 @@ def evaluation_function(
                 w_fixed_local = w_fixed; w_sec_local = w_sec; w_band_local = w_band; w_front_local = w_front; w_tv_local = w_tv; w_wave_local = w_wave
         else:
             w_fixed_local = w_fixed; w_sec_local = w_sec; w_band_local = w_band; w_front_local = w_front; w_tv_local = w_tv; w_wave_local = w_wave
+        # Prepare all constraint parameters
+        constraint_params = {
+            "indent_pct": indent_pct_initial,
+            "volume_pct": volume_pct_initial,
+            "base_price": base_price,
+            "first_volume_target": first_volume_target,
+            "first_indent_target": first_indent_target,
+            "k_front": k_front,
+            "front_cap": front_cap,
+            "g_min": g_min,
+            "g_max": g_max,
+            "g_min_post": 1.01,  # Default value
+            "g_max_post": 1.30,  # Default value
+            "isotonic_tail": True,  # Default value
+            "m2_min": m2_min,
+            "m2_max": m2_max,
+            "m_min": m_min,
+            "m_max": m_max,
+            "firstK_min": firstK_min,
+            "eps_inc": strict_inc_eps,
+            "slope_cap": slope_cap,
+        }
+        
+        # Filter parameters to only those accepted by enforce_schedule_shape_fixed
+        safe_params = filter_kwargs_for_function(enforce_schedule_shape_fixed, constraint_params)
+        
         (indent_pct,
          volume_pct,
          martingale_pct,
          needpct,
          order_prices,
          price_step_pct,
-         repair_diag) = enforce_schedule_shape_fixed(
-            indent_pct=indent_pct_initial,
-            volume_pct=volume_pct_initial,  # Already a list, no need for .tolist()
-            base_price=base_price,
-            first_volume_target=first_volume_target,
-            first_indent_target=first_indent_target,
-            k_front=k_front,  # Still passed for now, but ignored in new pipeline
-            front_cap=front_cap,  # Still passed for now, but ignored in new pipeline
-            g_min=g_min,
-            g_max=g_max,
-            g_min_post=1.01,  # Default value
-            g_max_post=1.30,  # Default value
-            isotonic_tail=True,  # Default value
-            # These are the only additional parameters accepted by the function
-            m2_min=m2_min,
-            m2_max=m2_max,
-            m_min=m_min,
-            m_max=m_max,
-            firstK_min=firstK_min,
-            eps_inc=strict_inc_eps,
-        )
+         repair_diag) = enforce_schedule_shape_fixed(**safe_params)
         
         # Calculate core metrics from repaired arrays
         max_need = float(np.max(needpct)) if len(needpct) > 0 else 0.0

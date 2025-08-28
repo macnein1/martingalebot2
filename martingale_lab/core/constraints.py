@@ -8,6 +8,8 @@ import numpy as np
 from numba import njit
 from typing import Dict, Any, Tuple
 from martingale_lab.core.repair import hard_clip_local_growth, isotonic_non_decreasing
+from martingale_lab.core.slope_enforcement import enforce_martingale_slopes, project_to_slope_feasible
+from martingale_lab.core.two_phase_enforcement import apply_two_phase_enforcement, validate_slope_constraints
 import math
 
 
@@ -537,6 +539,7 @@ def enforce_schedule_shape_fixed(
     m_max: float = 1.00,
     firstK_min: float = 1.0,
     eps_inc: float = 1e-5,
+    slope_cap: float = 0.25,  # Maximum martingale slope change
 ) -> Tuple[list, list, list, list, list, list, Dict[str, Any]]:
     """
     Enforce fixed-first-order and shaped martingale band on a schedule, then renormalize.
@@ -572,8 +575,9 @@ def enforce_schedule_shape_fixed(
     vol_in = np.asarray(volume_pct, dtype=np.float64).copy()
 
     # Diagnostics baselines
-    def _total_variation(v: np.ndarray) -> float:
-        return float(np.sum(np.abs(np.diff(v)))) if v.size > 1 else 0.0
+    def _total_variation(v) -> float:
+        v_arr = np.asarray(v) if not isinstance(v, np.ndarray) else v
+        return float(np.sum(np.abs(np.diff(v_arr)))) if v_arr.size > 1 else 0.0
 
     tv_before = _total_variation(vol_in)
     front_sum_before = float(np.sum(vol_in[: min(k_front, M)]))
@@ -605,22 +609,33 @@ def enforce_schedule_shape_fixed(
     if M > 1:
         v1_raw = vol_in[1] if len(vol_in) > 1 else first_volume_target
         v1_min = vol[0] * (1 + m2_min)
-        v1_max = vol[0] * (1 + m2_max)
+        # Apply slope cap to m2_max (m[1] - m[0] = m[1] - 0 <= slope_cap)
+        m2_max_capped = min(m2_max, slope_cap)
+        v1_max = vol[0] * (1 + m2_max_capped)
         vol[1] = max(v1_min, min(v1_raw, v1_max))
         if vol[1] != v1_raw:
             band_clips += 1
     
     # 3) Tüm tail (i≥2) için martingale bantı (post)
+    prev_m = (vol[1] / vol[0] - 1.0) if M > 1 and vol[0] > 1e-12 else m_min
     for i in range(2, M):
         if vol[i-1] > 1e-12:
             g_i = vol_in[i] / vol[i-1] if i < len(vol_in) else 1.0
             # g_i ← clip(g_i, 1+m_min, 1+m_max)
             g_i = max(1 + m_min, min(g_i, 1 + m_max))
+            
+            # Apply slope cap: limit change from previous martingale
+            m_i = g_i - 1.0
+            m_i = max(prev_m - slope_cap, min(m_i, prev_m + slope_cap))
+            g_i = 1.0 + m_i
+            prev_m = m_i
+            
             vol[i] = vol[i-1] * g_i
             if g_i != (vol_in[i] / vol[i-1] if i < len(vol_in) else 1.0):
                 band_clips += 1
         else:
             vol[i] = vol[i-1] * (1 + m_min)
+            prev_m = m_min
     
     # 4) Katı artış: v_i ← max(v_i, v_{i-1} + eps_inc)
     for i in range(1, M):
@@ -670,30 +685,37 @@ def enforce_schedule_shape_fixed(
     if total > 1e-9:
         vol *= 100.0 / total
     
-    # 7) İTERASYON: 2→6 adımlarını 2–3 kez döndür
-    for iteration in range(2):  # 2 iterations
-        iter_fix_loops += 1
-        
-        # Re-apply martingale bands after normalization
-        for i in range(2, M):
-            if vol[i-1] > 1e-12:
-                g_i = vol[i] / vol[i-1]
-                g_i = max(1 + m_min, min(g_i, 1 + m_max))
-                vol[i] = vol[i-1] * g_i
-        
-        # Re-apply strict increase
-        for i in range(1, M):
-            min_vol = vol[i-1] + eps_inc
-            if vol[i] < min_vol:
-                vol[i] = min_vol
-        
-        # Re-normalize
-        total = float(np.sum(vol))
-        if total > 1e-9:
-            vol *= 100.0 / total
-
-    # Ensure v0 is fixed after all operations
-    vol[0] = first_volume_target
+    # 7) Apply two-phase enforcement for perfect slope control
+    vol_array = np.asarray(vol, dtype=np.float64)
+    
+    # Calculate m2 target (capped by slope_cap since m[0] = 0)
+    m2_target = min(m2_max, slope_cap)
+    if M > 1 and vol[0] > 1e-12:
+        # Use current v1/v0 ratio as hint, but cap it
+        current_m2 = vol[1] / vol[0] - 1.0
+        m2_target = max(m2_min, min(current_m2, m2_target))
+    
+    # Apply two-phase enforcement
+    vol_array, converged = apply_two_phase_enforcement(
+        vol_array,
+        v0_target=first_volume_target,
+        m2_target=m2_target,
+        slope_cap=slope_cap,
+        m_min=m_min,
+        m_max=m_max
+    )
+    
+    # Validate the result
+    is_valid, num_violations, max_violation = validate_slope_constraints(vol_array, slope_cap)
+    
+    # Store diagnostics about slope enforcement
+    slope_diagnostics = {
+        'slope_violations': int(num_violations),
+        'max_slope_violation': float(max_violation),
+        'slope_converged': bool(converged)
+    }
+    
+    vol = vol_array  # Keep as numpy array for now
 
     # Repair indents to be non-decreasing and anchored at first_indent_target
     for i in range(1, len(ind)):
@@ -772,11 +794,12 @@ def enforce_schedule_shape_fixed(
         "std_m": std_m,
         "sign_changes": 0,  # Will be calculated in penalties
         "iter_fix_loops": iter_fix_loops,
+        **slope_diagnostics  # Add slope enforcement diagnostics
     }
 
     return (
         ind.tolist(),
-        vol.tolist(),
+        vol.tolist() if isinstance(vol, np.ndarray) else list(vol),
         mart.tolist(),
         needpct.tolist(),
         order_prices.tolist(),
