@@ -2,11 +2,11 @@
 set -euo pipefail
 
 echo "== step 0: env =="
-python -V || true
-which python || true
+python3 -V || true
+which python3 || true
 
 echo "== step 1: constraints imzası kontrol =="
-python - <<'PY'
+python3 - <<'PY'
 import inspect, sys
 from importlib import import_module
 C = import_module("martingale_lab.core.constraints")
@@ -43,9 +43,9 @@ if [ $FORWARD_OK -eq 0 ]; then
   echo "[HINT] Yukarıdaki WARN alanlarını enforce_schedule_shape_fixed çağrısına forward et."
 fi
 
-echo "== step 3: temiz DB ve optimizasyon koşusu =="
+echo "== step 3: temiz DB ve optimizasyon koşulu =="
 rm -rf db_results/
-python -m martingale_lab.cli.optimize \
+python3 -m martingale_lab.cli.optimize \
   --overlap-min 10.0 --overlap-max 10.2 \
   --orders-min 16 --orders-max 16 \
   --first-volume 0.01 --first-indent 0.00 \
@@ -66,155 +66,80 @@ python -m martingale_lab.cli.optimize \
 
 echo "== step 4: sqlite kontrolleri =="
 set +e
+python3 - <<'PY'
+import sqlite3, json, math, sys
 
-echo "-- v0/v1 band & first3 --"
-sqlite3 -cmd ".headers on" -cmd ".mode column" db_results/experiments.db "
-WITH best AS (
-  SELECT r.payload_json
-  FROM results r JOIN (SELECT MAX(id) id FROM experiments) l ON r.experiment_id=l.id
-  ORDER BY r.score ASC LIMIT 1
-),
-v AS ( SELECT CAST(j.key AS INT) i, j.value v
-       FROM best, json_each(best.payload_json,'$.schedule.volume_pct') j )
-SELECT
-  printf('%.5f',(SELECT v FROM v WHERE i=0)) AS v0,
-  printf('%.5f',(SELECT v FROM v WHERE i=1)) AS v1,
-  CASE WHEN (SELECT v FROM v WHERE i=1) BETWEEN 1.10*(SELECT v FROM v WHERE i=0)
-                                             AND 2.00*(SELECT v FROM v WHERE i=0)
-       THEN 'OK' ELSE 'VIOL' END AS v1_band,
-  printf('%.5f',(SELECT SUM(v) FROM v WHERE i IN (0,1,2))) AS first3_sum;
-"
+try:
+    con = sqlite3.connect("db_results/experiments.db")
+    cur = con.cursor()
+    row = cur.execute(
+        """
+        SELECT r.payload_json, r.diagnostics_json
+        FROM results r JOIN (SELECT MAX(id) id FROM experiments) l ON r.experiment_id=l.id
+        ORDER BY r.score ASC LIMIT 1
+        """
+    ).fetchone()
+except Exception as e:
+    print(f"[FAIL] DB open/query error: {e}")
+    sys.exit(1)
 
-echo "-- m-tail varyans / slope / plateau --"
-sqlite3 -cmd ".headers on" -cmd ".mode column" db_results/experiments.db "
-WITH best AS (
-  SELECT r.payload_json, r.diagnostics_json
-  FROM results r JOIN (SELECT MAX(id) id FROM experiments) l ON r.experiment_id=l.id
-  ORDER BY r.score ASC LIMIT 1
-),
-m_tail AS (
-  SELECT CAST(j.key AS INT) AS i, j.value/100.0 AS m
-  FROM best, json_each(best.payload_json,'$.schedule.martingale_pct') AS j
-  WHERE CAST(j.key AS INT) >= 2
-),
-pairs AS ( SELECT a.i, a.m AS m_i, b.m AS m_prev
-           FROM m_tail a JOIN m_tail b ON a.i = b.i + 1 ),
-mean_m AS (SELECT AVG(m_i) AS mu FROM pairs)
-SELECT
-  printf('%.5f', sqrt(AVG((m_i - mu)*(m_i - mu)))) AS std_m_tail,
-  SUM(CASE WHEN ABS(m_i - m_prev) > 0.25 THEN 1 ELSE 0 END) AS slope_violations,
-  json_extract(best.diagnostics_json,'$.plateau_max_run') AS plateau_max_run
-FROM pairs, mean_m, best;
-"
+if not row:
+    print("[FAIL] En iyi kayıt bulunamadı.")
+    sys.exit(1)
 
-echo "-- monotonicity & toplam yüzde --"
-sqlite3 -cmd ".headers on" -cmd ".mode column" db_results/experiments.db "
-WITH best AS (
-  SELECT r.payload_json
-  FROM results r JOIN (SELECT MAX(id) id FROM experiments) l ON r.experiment_id=l.id
-  ORDER BY r.score ASC LIMIT 1
-),
-v AS ( SELECT CAST(j.key AS INT) AS i, j.value AS v
-       FROM best, json_each(best.payload_json,'$.schedule.volume_pct') AS j ),
-pairs AS ( SELECT a.i, a.v AS v_i, b.v AS v_prev
-           FROM v a JOIN v b ON a.i = b.i + 1 )
-SELECT
-  SUM(CASE WHEN v_i <= v_prev THEN 1 ELSE 0 END) AS monotonicity_violations,
-  printf('%.6f',(SELECT SUM(v) FROM v)) AS total_sum
-FROM pairs;
-"
+payload_json, diagnostics_json = row
+payload = json.loads(payload_json)
+diag = json.loads(diagnostics_json) if diagnostics_json else {}
 
-echo "-- Q1/Q4 payları ve m2 --"
-sqlite3 -cmd ".headers on" -cmd ".mode column" db_results/experiments.db "
-WITH best AS (
-  SELECT r.payload_json
-  FROM results r JOIN (SELECT MAX(id) id FROM experiments) l ON r.experiment_id=l.id
-  ORDER BY r.score ASC LIMIT 1
-),
-v AS ( SELECT CAST(j.key AS INT) AS i, j.value AS v
-       FROM best, json_each(best.payload_json,'$.schedule.volume_pct') AS j ),
-m AS ( SELECT CAST(j.key AS INT) AS i, j.value/100.0 AS m
-       FROM best, json_each(best.payload_json,'$.schedule.martingale_pct') AS j ),
-n AS (SELECT MAX(i)+1 AS N FROM v),
-q AS (SELECT CAST(ceil(N/4.0) AS INT) AS Q FROM n)
-SELECT
-  printf('%.2f', (SELECT SUM(v) FROM v, q WHERE i < Q))      AS q1_share_pct,
-  printf('%.2f', (SELECT SUM(v) FROM v, n, q WHERE i >= N-Q)) AS q4_share_pct,
-  printf('%.2f', (SELECT m FROM m WHERE i=2)*100.0)           AS m2_pct;
-"
+sched = payload.get("schedule", {})
+vol = list(sched.get("volume_pct", []))
+mart = list(sched.get("martingale_pct", []))
 
-echo "== step 5: hızlı verdict =="
-# küçük bir heuristik: v1 band OK, m2_pct 10-80, q1<=22, q4>=32, monotonicity=0, slope_violations=0
-verdict_py=$(python - <<'PY'
-import json, subprocess, re, sys
+# v0/v1 band & first3
+v0 = float(vol[0]) if len(vol) > 0 else 0.0
+v1 = float(vol[1]) if len(vol) > 1 else 0.0
+v1_band_ok = (v1 >= 1.10*v0 and v1 <= 2.00*v0) if v0 > 0 else False
+first3_sum = float(sum(vol[:3]))
+print("-- v0/v1 band & first3 --")
+print(f"v0={v0:.5f}")
+print(f"v1={v1:.5f}")
+print(f"v1_band={'OK' if v1_band_ok else 'VIOL'}")
+print(f"first3_sum={first3_sum:.5f}")
 
-def q(sql):
-    out = subprocess.check_output(["sqlite3", "db_results/experiments.db", sql], text=True).strip()
-    return out
+# m-tail varyans / slope / plateau
+m_tail = [(float(m)/100.0) for m in mart[2:]] if len(mart) > 2 else []
+pairs = list(zip(m_tail[1:], m_tail[:-1])) if len(m_tail) > 1 else []
+mu = (sum(m for m,_ in pairs)/len(pairs)) if pairs else 0.0
+std_m = ((sum((m-mu)*(m-mu) for m,_ in pairs)/len(pairs))**0.5) if pairs else 0.0
+slope_viol = sum(1 for m,prev in pairs if abs(m - prev) > 0.25)
+plateau_max_run = diag.get("plateau_max_run")
+print("-- m-tail varyans / slope / plateau --")
+print(f"std_m_tail={std_m:.5f}")
+print(f"slope_violations={slope_viol}")
+print(f"plateau_max_run={plateau_max_run}")
 
-# v1 band & first3
-vblock = q("""
-WITH best AS ( SELECT r.payload_json FROM results r JOIN (SELECT MAX(id) id FROM experiments) l ON r.experiment_id=l.id
-               ORDER BY r.score ASC LIMIT 1 ),
-v AS ( SELECT CAST(j.key AS INT) i, j.value v
-       FROM best, json_each(best.payload_json,'$.schedule.volume_pct') j )
-SELECT (SELECT v FROM v WHERE i=0), (SELECT v FROM v WHERE i=1),
-       CASE WHEN (SELECT v FROM v WHERE i=1) BETWEEN 1.10*(SELECT v FROM v WHERE i=0)
-                                            AND 2.00*(SELECT v FROM v WHERE i=0) THEN 'OK' ELSE 'VIOL' END,
-       (SELECT SUM(v) FROM v WHERE i IN (0,1,2));
-""")
-v0, v1, v1band, first3 = vblock.split('|')
-v0=float(v0); v1=float(v1); first3=float(first3)
+# monotonicity & toplam yüzde
+mono_viol = sum(1 for i in range(1, len(vol)) if vol[i] <= vol[i-1])
+total_sum = float(sum(vol))
+print("-- monotonicity & toplam yüzde --")
+print(f"monotonicity_violations={mono_viol}")
+print(f"total_sum={total_sum:.6f}")
 
-# tail stats
-tblock = q("""
-WITH best AS ( SELECT r.payload_json, r.diagnostics_json FROM results r JOIN (SELECT MAX(id) id FROM experiments) l ON r.experiment_id=l.id
-               ORDER BY r.score ASC LIMIT 1 ),
-m_tail AS ( SELECT CAST(j.key AS INT) AS i, j.value/100.0 AS m
-            FROM best, json_each(best.payload_json,'$.schedule.martingale_pct') AS j WHERE CAST(j.key AS INT) >= 2 ),
-pairs AS ( SELECT a.i, a.m AS m_i, b.m AS m_prev FROM m_tail a JOIN m_tail b ON a.i = b.i + 1 ),
-mean_m AS (SELECT AVG(m_i) AS mu FROM pairs)
-SELECT (SELECT printf('%.5f', sqrt(AVG((m_i - mu)*(m_i - mu)))) FROM pairs, mean_m),
-       (SELECT SUM(CASE WHEN ABS(m_i - m_prev) > 0.25 THEN 1 ELSE 0 END) FROM pairs),
-       (SELECT json_extract(best.diagnostics_json,'$.plateau_max_run') FROM best);
-""")
-std_m, slope_v, plateau = tblock.split('|')
-std_m=float(std_m); slope_v=int(slope_v or 0)
+# Q1/Q4 payları ve m2
+N = len(vol)
+Q = int(math.ceil(N/4.0)) if N > 0 else 0
+q1_share = float(sum(vol[:Q])) if Q > 0 else 0.0
+q4_share = float(sum(vol[N-Q:])) if Q > 0 else 0.0
+m2 = (float(mart[2])/100.0) if len(mart) > 2 else 0.0
+print("-- Q1/Q4 payları ve m2 --")
+print(f"q1_share_pct={q1_share:.2f}")
+print(f"q4_share_pct={q4_share:.2f}")
+print(f"m2_pct={m2*100.0:.2f}")
 
-# q1 q4 m2
-qblock = q("""
-WITH best AS ( SELECT r.payload_json FROM results r JOIN (SELECT MAX(id) id FROM experiments) l ON r.experiment_id=l.id
-               ORDER BY r.score ASC LIMIT 1 ),
-v AS ( SELECT CAST(j.key AS INT) AS i, j.value AS v
-       FROM best, json_each(best.payload_json,'$.schedule.volume_pct') AS j ),
-m AS ( SELECT CAST(j.key AS INT) AS i, j.value/100.0 AS m
-       FROM best, json_each(best.payload_json,'$.schedule.martingale_pct') AS j ),
-n AS (SELECT MAX(i)+1 AS N FROM v),
-q AS (SELECT CAST(ceil(N/4.0) AS INT) AS Q FROM n)
-SELECT (SELECT SUM(v) FROM v, q WHERE i < Q),
-       (SELECT SUM(v) FROM v, n, q WHERE i >= N-Q),
-       (SELECT m FROM m WHERE i=2);
-""")
-q1, q4, m2 = qblock.split('|')
-q1=float(q1); q4=float(q4); m2=float(m2)
-
-# monotonicity & total
-mblock = q("""
-WITH best AS ( SELECT r.payload_json FROM results r JOIN (SELECT MAX(id) id FROM experiments) l ON r.experiment_id=l.id
-               ORDER BY r.score ASC LIMIT 1 ),
-v AS ( SELECT CAST(j.key AS INT) AS i, j.value AS v
-       FROM best, json_each(best.payload_json,'$.schedule.volume_pct') AS j ),
-pairs AS ( SELECT a.i, a.v AS v_i, b.v AS v_prev FROM v a JOIN v b ON a.i = b.i + 1 )
-SELECT (SELECT SUM(CASE WHEN v_i <= v_prev THEN 1 ELSE 0 END) FROM pairs),
-       (SELECT SUM(v) FROM v);
-""")
-mono, tot = mblock.split('|')
-mono=int(mono or 0); tot=float(tot)
-
-ok = (v1band=="OK" and 0.10 <= m2 <= 0.80 and q1 <= 22.0 and q4 >= 32.0 and mono==0 and slope_v==0 and abs(tot-100.0) < 0.2)
+# == step 5: hızlı verdict ==
+ok = (v1_band_ok and 0.10 <= m2 <= 0.80 and q1_share <= 22.0 and q4_share >= 32.0 and mono_viol==0 and slope_viol==0 and abs(total_sum-100.0) < 0.2)
+print("== step 5: hızlı verdict ==")
 print("VERDICT: " + ("OK ✅" if ok else "NEEDS FIX ❌"))
-print(f"(v0={v0:.5f}, v1={v1:.5f}, v1_band={v1band}, m2={m2*100:.2f}%, q1={q1:.2f}, q4={q4:.2f}, mono={mono}, slope_viol={slope_v}, std_m_tail={std_m:.4f}, total={tot:.4f})")
+print(f"(v0={v0:.5f}, v1={v1:.5f}, v1_band={'OK' if v1_band_ok else 'VIOL'}, m2={m2*100.0:.2f}%, q1={q1_share:.2f}, q4={q4_share:.2f}, mono={mono_viol}, slope_viol={slope_viol}, std_m_tail={std_m:.4f}, total={total_sum:.4f})")
 PY
-)
-echo "$verdict_py"
 
