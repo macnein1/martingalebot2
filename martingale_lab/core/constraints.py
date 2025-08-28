@@ -9,6 +9,7 @@ from numba import njit
 from typing import Dict, Any, Tuple
 from martingale_lab.core.repair import hard_clip_local_growth, isotonic_non_decreasing
 from martingale_lab.core.slope_enforcement import enforce_martingale_slopes, project_to_slope_feasible
+from martingale_lab.core.two_phase_enforcement import apply_two_phase_enforcement, validate_slope_constraints
 import math
 
 
@@ -684,36 +685,37 @@ def enforce_schedule_shape_fixed(
     if total > 1e-9:
         vol *= 100.0 / total
     
-    # 7) Apply better slope enforcement with projection
-    # First ensure v0 is fixed
-    vol[0] = first_volume_target
-    
-    # Project to slope-feasible region
+    # 7) Apply two-phase enforcement for perfect slope control
     vol_array = np.asarray(vol, dtype=np.float64)
-    vol_array, num_proj_iters = project_to_slope_feasible(vol_array, slope_cap, preserve_sum=False)
-    vol = vol_array  # Keep as numpy array for now
     
-    # Final normalization preserving v0
-    vol[0] = first_volume_target
-    tail_sum = float(np.sum(vol[1:]))
-    if tail_sum > 1e-9:
-        target_tail = 100.0 - vol[0]
-        vol[1:] *= target_tail / tail_sum
-
-    # Final ensure v0 and v1 band with slope cap
-    vol[0] = first_volume_target
-    if M > 1:
-        v1_min = vol[0] * (1 + m2_min)
-        m2_max_capped = min(m2_max, slope_cap)
-        v1_max = vol[0] * (1 + m2_max_capped)
-        vol[1] = max(v1_min, min(vol[1], v1_max))
-        
-        # Re-normalize tail after v1 adjustment
-        if M > 2:
-            tail_sum = float(np.sum(vol[2:]))
-            if tail_sum > 1e-9:
-                target_tail = 100.0 - vol[0] - vol[1]
-                vol[2:] *= target_tail / tail_sum
+    # Calculate m2 target (capped by slope_cap since m[0] = 0)
+    m2_target = min(m2_max, slope_cap)
+    if M > 1 and vol[0] > 1e-12:
+        # Use current v1/v0 ratio as hint, but cap it
+        current_m2 = vol[1] / vol[0] - 1.0
+        m2_target = max(m2_min, min(current_m2, m2_target))
+    
+    # Apply two-phase enforcement
+    vol_array, converged = apply_two_phase_enforcement(
+        vol_array,
+        v0_target=first_volume_target,
+        m2_target=m2_target,
+        slope_cap=slope_cap,
+        m_min=m_min,
+        m_max=m_max
+    )
+    
+    # Validate the result
+    is_valid, num_violations, max_violation = validate_slope_constraints(vol_array, slope_cap)
+    
+    # Store diagnostics about slope enforcement
+    slope_diagnostics = {
+        'slope_violations': int(num_violations),
+        'max_slope_violation': float(max_violation),
+        'slope_converged': bool(converged)
+    }
+    
+    vol = vol_array  # Keep as numpy array for now
 
     # Repair indents to be non-decreasing and anchored at first_indent_target
     for i in range(1, len(ind)):
@@ -792,6 +794,7 @@ def enforce_schedule_shape_fixed(
         "std_m": std_m,
         "sign_changes": 0,  # Will be calculated in penalties
         "iter_fix_loops": iter_fix_loops,
+        **slope_diagnostics  # Add slope enforcement diagnostics
     }
 
     return (
