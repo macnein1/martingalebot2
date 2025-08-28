@@ -486,6 +486,17 @@ def evaluation_function(
             m_max=m_max,
             firstK_min=firstK_min,
             eps_inc=strict_inc_eps,
+            # Forward HC0–HC7 parameters
+            second_upper_c2=second_upper_c2,
+            m_head=m_head,
+            m_tail=m_tail,
+            tau_scale=tau_scale,
+            slope_cap=slope_cap,
+            q1_cap=q1_cap,
+            tail_floor=tail_floor,
+            use_hc0_bootstrap=use_hc0_bootstrap,
+            use_head_budget=use_head_budget,
+            head_budget_pct=head_budget_pct,
         )
         
         # Calculate core metrics from repaired arrays

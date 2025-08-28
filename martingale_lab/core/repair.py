@@ -83,6 +83,36 @@ def tail_only_rescale_keep_first_three(v: np.ndarray) -> float:
         return 1.0
 
 
+def tail_only_rescale_keep_prefix(v: np.ndarray, k: int) -> float:
+    """
+    Keep v[:k] fixed; rescale v[k:] with a single factor so that sum(v) = 100.
+
+    Args:
+        v: Volume array to rescale (modified in-place)
+        k: Number of head elements to keep fixed
+
+    Returns:
+        Scaling factor applied to tail (v[k:])
+    """
+    n = len(v)
+    if k >= n:
+        return 1.0
+
+    sum_head = float(np.sum(v[:k]))
+    sum_tail = float(np.sum(v[k:]))
+
+    if sum_tail < 1e-12:
+        return 1.0
+
+    needed_tail_sum = 100.0 - sum_head
+    if needed_tail_sum <= 0:
+        return 1.0
+
+    scale = needed_tail_sum / sum_tail
+    v[k:] *= scale
+    return float(scale)
+
+
 def compute_m_from_v(v: np.ndarray) -> np.ndarray:
     """
     Compute martingale ratios from volumes.
@@ -173,6 +203,54 @@ def longest_plateau_run(m: np.ndarray, center: float = 1.0, tol: float = 0.02, s
     
     return max_run, max_run_start
 
+
+def enforce_slope_cap_on_m_tail(
+    m: np.ndarray,
+    start_idx: int,
+    slope_cap: float,
+    m_min: float,
+    m_max: float,
+    target: float | None = None,
+    blend: float = 0.3,
+) -> np.ndarray:
+    """
+    Enforce |m[i]-m[i-1]| <= slope_cap for i>=start_idx, and m in [m_min,m_max].
+    Optionally pull values towards target using convex blend controlled by blend.
+
+    Args:
+        m: Martingale ratios array (modified copy returned)
+        start_idx: Index to start enforcing from (typically 3)
+        slope_cap: Maximum allowed step change between consecutive m's
+        m_min/m_max: Absolute bounds for m values
+        target: Optional target value to pull towards (e.g., m_tail)
+        blend: Blending coefficient in [0,1] for pulling towards target
+
+    Returns:
+        New martingale ratio array with slope caps enforced from start_idx.
+    """
+    n = int(m.size)
+    if n <= start_idx:
+        return m.astype(np.float64).copy()
+
+    out = m.astype(np.float64).copy()
+    cap = max(0.0, float(slope_cap) - 1e-6)
+    prev = float(out[start_idx - 1])
+    for i in range(start_idx, n):
+        val = float(out[i])
+        if target is not None:
+            val = (1.0 - blend) * val + blend * float(target)
+        # Absolute bounds
+        val = max(m_min, min(val, m_max))
+        # Slope cap bounds
+        lo = prev - cap
+        hi = prev + cap
+        if val < lo:
+            val = lo
+        elif val > hi:
+            val = hi
+        out[i] = val
+        prev = val
+    return out
 
 def bootstrap_tail_from_bands(v0: float, v1: float, N: int,
                               m2_min: float, m2_max: float,
