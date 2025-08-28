@@ -467,32 +467,25 @@ def evaluation_function(
          order_prices,
          price_step_pct,
          repair_diag) = enforce_schedule_shape_fixed(
-            indent_pct_initial,
-            volume_pct_initial,  # Already a list, no need for .tolist()
-            base_price,
-            first_volume_target,
-            first_indent_target,
-            k_front,  # Still passed for now, but ignored in new pipeline
-            front_cap,  # Still passed for now, but ignored in new pipeline
-            g_min,
-            g_max,
-            # New HC parameters
-            m2_min,
-            m2_max,
-            m_min,
-            m_max,
-            firstK_min,
-            strict_inc_eps,
-            second_upper_c2,
-            m_head,
-            m_tail,
-            tau_scale,
-            slope_cap,
-            q1_cap,
-            tail_floor,
-            head_budget_pct,
-            use_head_budget,
-            use_hc0_bootstrap,
+            indent_pct=indent_pct_initial,
+            volume_pct=volume_pct_initial,  # Already a list, no need for .tolist()
+            base_price=base_price,
+            first_volume_target=first_volume_target,
+            first_indent_target=first_indent_target,
+            k_front=k_front,  # Still passed for now, but ignored in new pipeline
+            front_cap=front_cap,  # Still passed for now, but ignored in new pipeline
+            g_min=g_min,
+            g_max=g_max,
+            g_min_post=1.01,  # Default value
+            g_max_post=1.30,  # Default value
+            isotonic_tail=True,  # Default value
+            # These are the only additional parameters accepted by the function
+            m2_min=m2_min,
+            m2_max=m2_max,
+            m_min=m_min,
+            m_max=m_max,
+            firstK_min=firstK_min,
+            eps_inc=strict_inc_eps,
         )
         
         # Calculate core metrics from repaired arrays
@@ -819,10 +812,19 @@ def evaluation_function(
             extra={
                 "event": "EVAL_ERROR",
                 "error": str(e),
+                "error_type": type(e).__name__,
                 "traceback": traceback.format_exc(),
                 "duration_ms": duration_ms,
                 "overlap": overlap_pct,
-                "orders": num_orders
+                "orders": num_orders,
+                "params": {
+                    "base_price": base_price,
+                    "first_volume_target": first_volume_target,
+                    "first_indent_target": first_indent_target,
+                    "m2_min": m2_min,
+                    "m2_max": m2_max,
+                    "m_min": m_min
+                }
             }
         )
         
@@ -852,7 +854,9 @@ def evaluation_function(
                 "wci": 0.0,
                 "sign_flips": 0,
                 "gini": 1.0,
-                "entropy": 0.0
+                "entropy": 0.0,
+                "error_type": type(e).__name__,
+                "error_msg": str(e)
             },
             
             "penalties": {
