@@ -255,6 +255,12 @@ class DCAConfig:
     log_eval_sample: float = 0.0  # Per-evaluation log sampling rate (0.0-1.0)
     log_every_batch: int = 1      # Log batch summary every N batches
     max_time_sec: Optional[int] = None  # Maximum runtime in seconds
+    
+    # Schedule normalization parameters
+    post_round_2dp: bool = True
+    post_round_strategy: str = "tail-first"
+    post_round_m2_tolerance: float = 0.05
+    post_round_keep_v1_band: bool = True
 
 
 class DCAOrchestrator:
@@ -397,6 +403,11 @@ class DCAOrchestrator:
                 "w_front": self.config.w_front,
                 "w_tv": self.config.w_tv,
                 "w_wave": self.config.w_wave,
+                # Schedule normalization
+                "post_round_2dp": self.config.post_round_2dp,
+                "post_round_strategy": self.config.post_round_strategy,
+                "post_round_m2_tolerance": self.config.post_round_m2_tolerance,
+                "post_round_keep_v1_band": self.config.post_round_keep_v1_band,
             }
             parameters.append(params)
         

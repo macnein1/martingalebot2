@@ -203,6 +203,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume-into", type=str, default=None,
                        help="Resume into a specific run_id (instead of latest)")
     
+    # Schedule normalization parameters
+    parser.add_argument("--post-round-2dp", action="store_true", default=True,
+                       help="Round schedule outputs to 2 decimal places (default: on)")
+    parser.add_argument("--no-post-round-2dp", dest="post_round_2dp", action="store_false",
+                       help="Disable rounding of schedule outputs")
+    parser.add_argument("--post-round-strategy", choices=["tail-first", "largest-remainder", "balanced"],
+                       default="tail-first",
+                       help="Strategy for adjusting sum to 100 after rounding")
+    parser.add_argument("--post-round-m2-tolerance", type=float, default=0.05,
+                       help="Tolerance for m2 preservation in percentage points")
+    parser.add_argument("--post-round-keep-v1-band", action="store_true", default=True,
+                       help="Preserve v1 band constraint during normalization")
+    
     return parser.parse_args()
 
 
@@ -333,7 +346,13 @@ def create_orchestrator_config(args: argparse.Namespace) -> tuple[DCAConfig, Orc
         # Logging configuration
         log_eval_sample=args.log_eval_sample,
         log_every_batch=args.log_every_batch,
-        max_time_sec=args.max_time_sec
+        max_time_sec=args.max_time_sec,
+        
+        # Schedule normalization
+        post_round_2dp=args.post_round_2dp,
+        post_round_strategy=args.post_round_strategy,
+        post_round_m2_tolerance=args.post_round_m2_tolerance,
+        post_round_keep_v1_band=args.post_round_keep_v1_band
     )
     
     orch_config = OrchestratorConfig(
