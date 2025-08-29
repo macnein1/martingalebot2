@@ -19,6 +19,7 @@ from threading import Lock
 from .schema_manager import get_schema_manager
 from .memory_manager import BoundedBestCandidates, BatchAccumulator
 from .config_store import ConfigStore
+from .write_queue_manager import WriteQueueManager, get_write_queue, WriteOperation
 
 logger = logging.getLogger(__name__)
 
@@ -36,13 +37,15 @@ class UnifiedStore:
     """
     
     def __init__(self, db_path: str = "db_results/experiments.db", 
-                 max_candidates_memory: int = 500):
+                 max_candidates_memory: int = 500,
+                 use_write_queue: bool = True):
         """
         Initialize unified store.
         
         Args:
             db_path: Path to SQLite database
             max_candidates_memory: Maximum candidates to keep in memory
+            use_write_queue: Whether to use write queue for better concurrency
         """
         self.db_path = db_path
         self._lock = Lock()  # Thread safety
@@ -54,6 +57,17 @@ class UnifiedStore:
         
         # Config store
         self.config_store = ConfigStore(db_path)
+        
+        # Write queue for concurrent safety
+        self.use_write_queue = use_write_queue
+        if use_write_queue:
+            self._write_queue = get_write_queue(
+                db_path,
+                batch_size=500,
+                flush_interval_ms=100
+            )
+        else:
+            self._write_queue = None
         
         # Connection pool (simple implementation)
         self._connection_pool: List[sqlite3.Connection] = []
@@ -240,47 +254,82 @@ class UnifiedStore:
         # Add to memory cache (bounded)
         kept_in_memory = self._candidates_cache.add_batch(results)
         
-        inserted = 0
-        with self.transaction() as cursor:
+        # Use write queue if available
+        if self.use_write_queue and self._write_queue:
+            # Prepare batch data
+            batch_data = []
             for result in results:
-                try:
-                    # Generate stable ID if not present
-                    stable_id = result.get('stable_id') or self._generate_stable_id(result)
-                    
-                    cursor.execute("""
-                        INSERT OR REPLACE INTO results (
-                            experiment_id, stable_id, score, max_need, var_need, tail,
-                            payload_json, schedule_json, sanity_json, 
-                            diagnostics_json, penalties_json, params_json
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        exp_id,
-                        stable_id,
-                        result.get('score', float('inf')),
-                        result.get('max_need'),
-                        result.get('var_need'),
-                        result.get('tail'),
-                        json.dumps(result),
-                        json.dumps(result.get('schedule', {})),
-                        json.dumps(result.get('sanity', {})),
-                        json.dumps(result.get('diagnostics', {})),
-                        json.dumps(result.get('penalties', {})),
-                        json.dumps(result.get('params', {}))
-                    ))
-                    inserted += 1
-                    
-                except sqlite3.IntegrityError as e:
-                    # Duplicate stable_id, skip
-                    logger.debug(f"Skipping duplicate result: {stable_id}")
-                except Exception as e:
-                    logger.error(f"Failed to insert result: {e}")
+                stable_id = result.get('stable_id') or self._generate_stable_id(result)
+                batch_data.append({
+                    'experiment_id': exp_id,
+                    'stable_id': stable_id,
+                    'score': result.get('score', float('inf')),
+                    'max_need': result.get('max_need'),
+                    'var_need': result.get('var_need'),
+                    'tail': result.get('tail'),
+                    'payload_json': json.dumps(result),
+                    'schedule_json': json.dumps(result.get('schedule', {})),
+                    'sanity_json': json.dumps(result.get('sanity', {})),
+                    'diagnostics_json': json.dumps(result.get('diagnostics', {})),
+                    'penalties_json': json.dumps(result.get('penalties', {})),
+                    'params_json': json.dumps(result.get('params', {}))
+                })
+            
+            # Queue batch insert
+            success = self._write_queue.insert_many('results', batch_data)
+            
+            # Log memory stats periodically
+            if len(results) > 0 and len(results) % 1000 == 0:
+                stats = self._candidates_cache.get_memory_stats()
+                logger.info(f"Memory stats: {stats}")
+            
+            return len(results) if success else 0
         
-        # Log memory stats periodically
-        if inserted > 0 and inserted % 1000 == 0:
-            stats = self._candidates_cache.get_memory_stats()
-            logger.info(f"Memory stats: {stats}")
-        
-        return inserted
+        else:
+            # Fallback to direct insert
+            inserted = 0
+            with self.transaction() as cursor:
+                for result in results:
+                    try:
+                        # Generate stable ID if not present
+                        stable_id = result.get('stable_id') or self._generate_stable_id(result)
+                        
+                        cursor.execute("""
+                            INSERT OR REPLACE INTO results (
+                                experiment_id, stable_id, score, max_need, var_need, tail,
+                                payload_json, schedule_json, sanity_json, 
+                                diagnostics_json, penalties_json, params_json
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            exp_id,
+                            stable_id,
+                            result.get('score', float('inf')),
+                            result.get('max_need'),
+                            result.get('var_need'),
+                            result.get('tail'),
+                            json.dumps(result),
+                            json.dumps(result.get('schedule', {})),
+                            json.dumps(result.get('sanity', {})),
+                            json.dumps(result.get('diagnostics', {})),
+                            json.dumps(result.get('penalties', {})),
+                            json.dumps(result.get('params', {}))
+                        ))
+                        inserted += 1
+                        
+                    except sqlite3.IntegrityError as e:
+                        # Duplicate stable_id, skip
+                        logger.debug(f"Skipping duplicate result: {stable_id}")
+                    except sqlite3.Error as e:
+                        logger.error(f"SQLite error inserting result: {e}", exc_info=True)
+                    except Exception as e:
+                        logger.error(f"Unexpected error inserting result: {e}", exc_info=True)
+            
+            # Log memory stats periodically
+            if inserted > 0 and inserted % 1000 == 0:
+                stats = self._candidates_cache.get_memory_stats()
+                logger.info(f"Memory stats: {stats}")
+            
+            return inserted
     
     def get_best_results(self, 
                          exp_id: int, 
