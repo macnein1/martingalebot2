@@ -1,251 +1,278 @@
--- SQL Queries for Martingale Optimization Analysis
--- ================================================
+-- Martingale Lab SQL Queries
+-- Useful queries for analyzing optimization results
 
--- 1. Best Strategy by Score
--- -------------------------
-WITH best AS (
-  SELECT 
-    r.id,
-    r.experiment_id,
+-- ============================================
+-- BASIC QUERIES
+-- ============================================
+
+-- Get best results from latest experiment
+SELECT 
     r.score,
-    r.payload_json,
-    r.diagnostics_json,
-    e.notes
-  FROM results r
-  JOIN experiments e ON r.experiment_id = e.id
-  WHERE r.score < 100000  -- Exclude inf scores
-  ORDER BY r.score ASC
-  LIMIT 1
-)
-SELECT 
-  printf('%.2f', score) as score,
-  json_extract(diagnostics_json, '$.q1_share') as q1_pct,
-  json_extract(diagnostics_json, '$.q4_share') as q4_pct,
-  printf('%.3f', json_extract(diagnostics_json, '$.m2')) as m2,
-  printf('%.3f', json_extract(diagnostics_json, '$.ee_harmonic')) as ee_harmonic,
-  printf('%.3f', json_extract(diagnostics_json, '$.ee_tail_weighted')) as ee_tail,
-  notes
-FROM best;
-
--- 2. Top 10 Strategies Comparison
--- --------------------------------
-WITH top_strategies AS (
-  SELECT 
-    r.*,
-    ROW_NUMBER() OVER (ORDER BY r.score ASC) as rank
-  FROM results r
-  WHERE r.score < 100000
-)
-SELECT 
-  rank,
-  printf('%.2f', score) as score,
-  printf('%.1f', json_extract(diagnostics_json, '$.q1_share')) as q1,
-  printf('%.1f', json_extract(diagnostics_json, '$.q4_share')) as q4,
-  printf('%.3f', json_extract(diagnostics_json, '$.m2')) as m2,
-  printf('%.3f', json_extract(diagnostics_json, '$.ee_tail_weighted')) as ee_tail
-FROM top_strategies
-WHERE rank <= 10;
-
--- 3. Strategy Distribution Analysis
--- ----------------------------------
-WITH strategy_metrics AS (
-  SELECT 
-    json_extract(diagnostics_json, '$.q1_share') as q1,
-    json_extract(diagnostics_json, '$.q4_share') as q4,
-    json_extract(diagnostics_json, '$.m2') as m2,
-    json_extract(diagnostics_json, '$.ee_tail_weighted') as ee_tail,
-    score
-  FROM results
-  WHERE score < 100000
-)
-SELECT 
-  'Q1 Distribution' as metric,
-  printf('%.1f', MIN(q1)) as min_val,
-  printf('%.1f', AVG(q1)) as avg_val,
-  printf('%.1f', MAX(q1)) as max_val
-FROM strategy_metrics
-UNION ALL
-SELECT 
-  'Q4 Distribution',
-  printf('%.1f', MIN(q4)),
-  printf('%.1f', AVG(q4)),
-  printf('%.1f', MAX(q4))
-FROM strategy_metrics
-UNION ALL
-SELECT 
-  'm[2] Distribution',
-  printf('%.3f', MIN(m2)),
-  printf('%.3f', AVG(m2)),
-  printf('%.3f', MAX(m2))
-FROM strategy_metrics
-UNION ALL
-SELECT 
-  'Exit-Ease Tail',
-  printf('%.3f', MIN(ee_tail)),
-  printf('%.3f', AVG(ee_tail)),
-  printf('%.3f', MAX(ee_tail))
-FROM strategy_metrics;
-
--- 4. Volume Profile of Best Strategy
--- -----------------------------------
-WITH best AS (
-  SELECT payload_json
-  FROM results
-  WHERE score < 100000
-  ORDER BY score ASC
-  LIMIT 1
-),
-volumes AS (
-  SELECT 
-    CAST(key AS INT) + 1 as order_num,
-    printf('%.2f', value) as volume_pct
-  FROM best, 
-       json_each(json_extract(payload_json, '$.schedule.volume_pct'))
-  WHERE CAST(key AS INT) < 20
-)
-SELECT * FROM volumes
-ORDER BY order_num;
-
--- 5. Martingale Ratios Analysis
--- ------------------------------
-WITH best AS (
-  SELECT payload_json
-  FROM results
-  WHERE score < 100000
-  ORDER BY score ASC
-  LIMIT 1
-),
-martingales AS (
-  SELECT 
-    CAST(key AS INT) as idx,
-    value/100.0 as m_ratio
-  FROM best,
-       json_each(json_extract(payload_json, '$.schedule.martingale_pct'))
-  WHERE CAST(key AS INT) >= 2 AND CAST(key AS INT) < 10
-)
-SELECT 
-  idx as i,
-  printf('%.3f', m_ratio) as m_value,
-  CASE 
-    WHEN m_ratio < 0.05 THEN '⚠️ Too Low'
-    WHEN m_ratio > 0.30 THEN '⚠️ Too High'
-    ELSE '✓ Good'
-  END as status
-FROM martingales
-ORDER BY idx;
-
--- 6. Strategies Meeting Your Criteria
--- ------------------------------------
-WITH filtered AS (
-  SELECT 
-    r.*,
-    json_extract(r.diagnostics_json, '$.q1_share') as q1,
-    json_extract(r.diagnostics_json, '$.q4_share') as q4,
-    json_extract(r.diagnostics_json, '$.m2') as m2,
-    json_extract(r.diagnostics_json, '$.ee_tail_weighted') as ee_tail
-  FROM results r
-  WHERE r.score < 100000
-    AND json_extract(r.diagnostics_json, '$.q1_share') < 10  -- Low front-loading
-    AND json_extract(r.diagnostics_json, '$.q4_share') > 50  -- Strong tail
-    AND json_extract(r.diagnostics_json, '$.m2') BETWEEN 0.10 AND 0.20  -- Reasonable m2
-    AND json_extract(r.diagnostics_json, '$.ee_tail_weighted') > 0.6  -- Good exit-ease
-)
-SELECT 
-  COUNT(*) as matching_strategies,
-  printf('%.2f', MIN(score)) as best_score,
-  printf('%.2f', AVG(score)) as avg_score
-FROM filtered;
-
--- 7. Parameter Sensitivity Analysis
--- ----------------------------------
-WITH param_analysis AS (
-  SELECT 
-    json_extract(params_json, '$.overlap_pct') as overlap,
-    json_extract(params_json, '$.num_orders') as n_orders,
-    AVG(score) as avg_score,
-    COUNT(*) as count
-  FROM results
-  WHERE score < 100000
-  GROUP BY overlap, n_orders
-)
-SELECT 
-  overlap,
-  n_orders,
-  printf('%.2f', avg_score) as avg_score,
-  count
-FROM param_analysis
-ORDER BY avg_score ASC
+    json_extract(r.params_json, '$.overlap_pct') as overlap_pct,
+    json_extract(r.params_json, '$.num_orders') as num_orders,
+    json_extract(r.payload_json, '$.schedule.volume_pct') as volumes
+FROM results r
+JOIN experiments e ON r.experiment_id = e.id
+WHERE e.id = (SELECT MAX(id) FROM experiments)
+ORDER BY r.score ASC
 LIMIT 10;
 
--- 8. Experiment Summary
--- ---------------------
+-- Count results by experiment
 SELECT 
-  e.id as exp_id,
-  e.created_at,
-  COUNT(r.id) as total_results,
-  COUNT(CASE WHEN r.score < 100000 THEN 1 END) as valid_results,
-  printf('%.2f', MIN(CASE WHEN r.score < 100000 THEN r.score END)) as best_score,
-  e.notes
+    e.id,
+    e.run_id,
+    e.status,
+    COUNT(r.id) as result_count,
+    MIN(r.score) as best_score,
+    AVG(r.score) as avg_score
 FROM experiments e
 LEFT JOIN results r ON e.id = r.experiment_id
 GROUP BY e.id
-ORDER BY e.created_at DESC;
+ORDER BY e.id DESC;
 
--- 9. Check Monotonicity and Constraints
--- --------------------------------------
-WITH best AS (
-  SELECT payload_json, diagnostics_json
-  FROM results
-  WHERE score < 100000
-  ORDER BY score ASC
-  LIMIT 1
-),
-volumes AS (
-  SELECT 
-    CAST(key AS INT) as idx,
-    value as vol
-  FROM best,
-       json_each(json_extract(payload_json, '$.schedule.volume_pct'))
-),
-violations AS (
-  SELECT 
-    COUNT(CASE WHEN v2.vol <= v1.vol THEN 1 END) as monotonicity_violations
-  FROM volumes v1
-  JOIN volumes v2 ON v2.idx = v1.idx + 1
-)
+-- ============================================
+-- CONSTRAINT ANALYSIS
+-- ============================================
+
+-- Find results with constraint violations
 SELECT 
-  CASE 
-    WHEN monotonicity_violations = 0 THEN '✅ Strict Monotonicity'
-    ELSE '❌ ' || monotonicity_violations || ' violations'
-  END as monotonicity_check,
-  printf('%.4f', (SELECT SUM(vol) FROM volumes)) as total_sum,
-  CASE 
-    WHEN ABS((SELECT SUM(vol) FROM volumes) - 100.0) < 0.01 THEN '✅ Sum = 100%'
-    ELSE '❌ Sum != 100%'
-  END as sum_check
-FROM violations;
-
--- 10. Performance Over Time
--- -------------------------
-WITH time_series AS (
-  SELECT 
     r.id,
     r.score,
-    r.created_at,
-    ROW_NUMBER() OVER (ORDER BY r.created_at) as eval_num,
-    MIN(r.score) OVER (ORDER BY r.created_at ROWS UNBOUNDED PRECEDING) as best_so_far
-  FROM results r
-  WHERE r.score < 100000
+    json_extract(r.diagnostics_json, '$.slope_violations') as slope_violations,
+    json_extract(r.diagnostics_json, '$.m2_valid') as m2_valid,
+    json_extract(r.diagnostics_json, '$.monotone_valid') as monotone_valid
+FROM results r
+WHERE 
+    json_extract(r.diagnostics_json, '$.slope_violations') > 0
+    OR json_extract(r.diagnostics_json, '$.m2_valid') = 0
+    OR json_extract(r.diagnostics_json, '$.monotone_valid') = 0
+ORDER BY r.score ASC
+LIMIT 20;
+
+-- Analyze slope violations distribution
+SELECT 
+    json_extract(diagnostics_json, '$.slope_violations') as violations,
+    COUNT(*) as count,
+    AVG(score) as avg_score,
+    MIN(score) as best_score
+FROM results
+GROUP BY violations
+ORDER BY violations;
+
+-- Check 2dp normalization
+SELECT 
+    r.id,
+    r.score,
+    json_extract(r.payload_json, '$.schedule.volume_pct') as volumes,
+    CASE 
+        WHEN json_extract(r.payload_json, '$.schedule.volume_pct') LIKE '%.___' 
+        THEN 'NOT_2DP'
+        ELSE '2DP_OK'
+    END as normalization_status
+FROM results r
+WHERE r.experiment_id = (SELECT MAX(id) FROM experiments)
+LIMIT 10;
+
+-- ============================================
+-- CONFIGURATION ANALYSIS
+-- ============================================
+
+-- Best configurations by performance
+SELECT 
+    cv.config_hash,
+    cv.best_score,
+    cv.avg_score,
+    cv.use_count,
+    json_extract(cv.config_json, '$.constraints.slope_cap') as slope_cap,
+    json_extract(cv.config_json, '$.constraints.m2_min') as m2_min,
+    json_extract(cv.config_json, '$.constraints.m2_max') as m2_max
+FROM config_versions cv
+WHERE cv.best_score IS NOT NULL
+ORDER BY cv.best_score ASC
+LIMIT 10;
+
+-- Configuration lineage (parent-child relationships)
+SELECT 
+    cl.parent_hash,
+    cl.child_hash,
+    cl.change_type,
+    cl.change_description,
+    p.best_score as parent_score,
+    c.best_score as child_score,
+    (p.best_score - c.best_score) as improvement
+FROM config_lineage cl
+LEFT JOIN config_versions p ON cl.parent_hash = p.config_hash
+LEFT JOIN config_versions c ON cl.child_hash = c.config_hash
+WHERE p.best_score IS NOT NULL AND c.best_score IS NOT NULL
+ORDER BY improvement DESC;
+
+-- Configuration performance over time
+SELECT 
+    cp.config_hash,
+    cp.experiment_id,
+    cp.best_score,
+    cp.convergence_batch,
+    cp.time_to_best,
+    cp.created_at
+FROM config_performance cp
+ORDER BY cp.created_at DESC
+LIMIT 20;
+
+-- ============================================
+-- PARAMETER ANALYSIS
+-- ============================================
+
+-- Overlap vs Score correlation
+SELECT 
+    json_extract(params_json, '$.overlap_pct') as overlap,
+    AVG(score) as avg_score,
+    MIN(score) as best_score,
+    COUNT(*) as count
+FROM results
+GROUP BY overlap
+ORDER BY overlap;
+
+-- Number of orders vs Score
+SELECT 
+    json_extract(params_json, '$.num_orders') as orders,
+    AVG(score) as avg_score,
+    MIN(score) as best_score,
+    COUNT(*) as count
+FROM results
+GROUP BY orders
+ORDER BY orders;
+
+-- Penalty weights analysis
+SELECT 
+    json_extract(params_json, '$.penalty_preset') as preset,
+    AVG(score) as avg_score,
+    MIN(score) as best_score,
+    COUNT(*) as count
+FROM results
+WHERE json_extract(params_json, '$.penalty_preset') IS NOT NULL
+GROUP BY preset;
+
+-- ============================================
+-- SCHEDULE ANALYSIS
+-- ============================================
+
+-- Analyze volume distributions
+WITH volume_analysis AS (
+    SELECT 
+        r.id,
+        r.score,
+        json_extract(r.payload_json, '$.schedule.volume_pct[0]') as v0,
+        json_extract(r.payload_json, '$.schedule.volume_pct[1]') as v1,
+        json_extract(r.payload_json, '$.schedule.q1_share_pct') as q1_share,
+        json_extract(r.payload_json, '$.schedule.q4_share_pct') as q4_share
+    FROM results r
+    WHERE r.score < 100000  -- Only good results
 )
 SELECT 
-  eval_num,
-  printf('%.2f', score) as current_score,
-  printf('%.2f', best_so_far) as best_score,
-  CASE 
-    WHEN score = best_so_far THEN '🎯 New Best!'
-    ELSE ''
-  END as milestone
-FROM time_series
-WHERE eval_num % 50 = 0 OR score = best_so_far
-ORDER BY eval_num
-LIMIT 20;
+    AVG(CAST(v0 as REAL)) as avg_v0,
+    AVG(CAST(v1 as REAL)) as avg_v1,
+    AVG(CAST(q1_share as REAL)) as avg_q1,
+    AVG(CAST(q4_share as REAL)) as avg_q4
+FROM volume_analysis;
+
+-- Find schedules with specific characteristics
+SELECT 
+    r.id,
+    r.score,
+    json_extract(r.payload_json, '$.schedule.m2') as m2,
+    json_extract(r.payload_json, '$.schedule.max_martingale') as max_m,
+    json_extract(r.payload_json, '$.schedule.tail_weight') as tail_weight
+FROM results r
+WHERE 
+    CAST(json_extract(r.payload_json, '$.schedule.m2') as REAL) BETWEEN 0.15 AND 0.25
+    AND CAST(json_extract(r.payload_json, '$.schedule.tail_weight') as REAL) > 30
+ORDER BY r.score ASC
+LIMIT 10;
+
+-- ============================================
+-- CHECKPOINT & RESUME
+-- ============================================
+
+-- Get resumable runs
+SELECT 
+    run_id,
+    batch_idx,
+    best_score,
+    kept_total,
+    created_at
+FROM checkpoints
+WHERE run_id IN (
+    SELECT run_id 
+    FROM experiments 
+    WHERE status = 'RUNNING'
+)
+ORDER BY created_at DESC;
+
+-- Checkpoint progress
+SELECT 
+    run_id,
+    MIN(batch_idx) as start_batch,
+    MAX(batch_idx) as last_batch,
+    MIN(best_score) as best_score,
+    MAX(kept_total) as total_candidates
+FROM checkpoints
+GROUP BY run_id
+ORDER BY MAX(created_at) DESC;
+
+-- ============================================
+-- PERFORMANCE METRICS
+-- ============================================
+
+-- Evaluation speed by experiment
+SELECT 
+    e.id,
+    e.run_id,
+    COUNT(r.id) as total_evals,
+    (julianday(e.finished_at) - julianday(e.started_at)) * 86400 as duration_sec,
+    COUNT(r.id) / ((julianday(e.finished_at) - julianday(e.started_at)) * 86400) as evals_per_sec
+FROM experiments e
+JOIN results r ON e.id = r.experiment_id
+WHERE e.finished_at IS NOT NULL
+GROUP BY e.id
+ORDER BY e.id DESC;
+
+-- Memory usage estimation
+SELECT 
+    COUNT(*) as total_results,
+    ROUND(COUNT(*) * 0.1 / 1024.0, 2) as estimated_mb,
+    COUNT(DISTINCT experiment_id) as experiments,
+    COUNT(DISTINCT json_extract(params_json, '$.seed')) as unique_seeds
+FROM results;
+
+-- ============================================
+-- CLEANUP QUERIES
+-- ============================================
+
+-- Delete old/failed experiments
+DELETE FROM results 
+WHERE experiment_id IN (
+    SELECT id FROM experiments 
+    WHERE status = 'FAILED' 
+    AND created_at < datetime('now', '-7 days')
+);
+
+-- Vacuum database to reclaim space
+-- VACUUM;
+
+-- ============================================
+-- EXPORT QUERIES
+-- ============================================
+
+-- Export best results to CSV format
+.mode csv
+.output best_results.csv
+SELECT 
+    score,
+    json_extract(params_json, '$.overlap_pct') as overlap_pct,
+    json_extract(params_json, '$.num_orders') as num_orders,
+    json_extract(payload_json, '$.schedule.volume_pct') as volumes
+FROM results
+WHERE score < 50000
+ORDER BY score ASC;
+.output stdout
+.mode list
