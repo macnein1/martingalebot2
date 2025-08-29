@@ -1,0 +1,81 @@
+{
+  "core": {
+    "base_price": 1.0,
+    "overlap_pct": 20.0,
+    "num_orders": 10,
+    "seed": null
+  },
+  "generation": {
+    "wave_pattern": true,
+    "wave_mode": "anchors",
+    "anchors": 6,
+    "blocks": 3,
+    "wave_amp_min": 0.05,
+    "wave_amp_max": 0.3,
+    "wave_strong_threshold": 50.0,
+    "wave_weak_threshold": 10.0,
+    "use_smart_init": false,
+    "history_db": null,
+    "min_indent_step": 0.05,
+    "softmax_temp": 1.0,
+    "first_volume_target": 1.0,
+    "first_indent_target": 0.0
+  },
+  "constraints": {
+    "m2_min": 0.1,
+    "m2_max": 1.0,
+    "m_min": 0.05,
+    "m_max": 1.0,
+    "g_min": 1.01,
+    "g_max": 1.2,
+    "slope_cap": 0.25,
+    "strict_inc_eps": 1e-06,
+    "second_upper_c2": 2.0,
+    "q1_cap": 22.0,
+    "tail_floor": 32.0,
+    "tail_cap": 0.4,
+    "m_head": 0.4,
+    "m_tail": 0.2,
+    "tau_scale": 0.3333333333333333,
+    "use_hc0_bootstrap": true,
+    "use_head_budget": false,
+    "head_budget_pct": 2.0,
+    "firstK_min": 1.0,
+    "k_front": 3,
+    "front_cap": 5.0
+  },
+  "penalties": {
+    "w_fixed": 3.0,
+    "w_band": 2.5,
+    "w_front": 3.0,
+    "w_tv": 1.5,
+    "w_sec": 3.0,
+    "w_wave": 1.0,
+    "w_second": 3.0,
+    "w_plateau": 2.0,
+    "w_front_share": 2.0,
+    "w_tailweak": 2.0,
+    "w_slope": 1.0,
+    "w_wave_shape": 1.0,
+    "w_varm": 2.0,
+    "w_blocks": 1.0,
+    "penalty_preset": "robust",
+    "target_std": 0.1
+  },
+  "scoring": {
+    "alpha": 0.5,
+    "beta": 0.3,
+    "gamma": 0.2,
+    "lambda_penalty": 0.1
+  },
+  "adaptive": {
+    "use_adaptive": false,
+    "strategy_type": "balanced"
+  },
+  "normalization": {
+    "post_round_2dp": true,
+    "post_round_strategy": "tail-first",
+    "post_round_m2_tolerance": 0.05,
+    "post_round_keep_v1_band": true
+  }
+}

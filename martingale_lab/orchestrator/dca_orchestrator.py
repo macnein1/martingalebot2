@@ -16,6 +16,8 @@ import random
 from martingale_lab.optimizer.evaluation_engine import evaluation_function
 from martingale_lab.storage.unified_store import UnifiedStore
 from martingale_lab.storage.memory_manager import BoundedBestCandidates, log_memory_stats
+from martingale_lab.core.config_classes import EvaluationConfig
+from martingale_lab.core.config_adapter import config_to_flat_dict
 from martingale_lab.utils.stable_id import make_stable_id
 from martingale_lab.utils.logging import (
     get_orchestrator_logger, BatchAggregator, log_with_context
@@ -165,6 +167,9 @@ class DCAConfig:
     overlap_max: float = 30.0
     orders_min: int = 5
     orders_max: int = 15
+    
+    # Optional: Use EvaluationConfig for structured parameters
+    evaluation_config: Optional['EvaluationConfig'] = None
     
     # Optimization parameters
     n_candidates_per_batch: int = 1000

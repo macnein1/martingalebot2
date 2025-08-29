@@ -19,6 +19,10 @@ from martingale_lab.utils.logging import (
     configure_logging, configure_eval_sampling, get_cli_logger
 )
 from martingale_lab.utils.runctx import make_runctx
+from martingale_lab.cli.config_cli import (
+    add_config_arguments, args_to_config, print_config, save_config_file
+)
+from martingale_lab.core.config_classes import EvaluationConfig
 
 # Use the new centralized logging system
 cli_logger = get_cli_logger()
@@ -215,6 +219,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--post-round-keep-v1-band", action="store_true", default=True,
                        help="Preserve v1 band constraint during normalization")
     
+    # Add config-based arguments
+    add_config_arguments(parser)
+    
     return parser.parse_args()
 
 
@@ -233,6 +240,19 @@ def setup_database(db_path: str) -> UnifiedStore:
 
 def create_orchestrator_config(args: argparse.Namespace) -> tuple[DCAConfig, OrchestratorConfig]:
     """Create orchestrator configurations from CLI arguments."""
+    
+    # Check for config-based flow
+    if hasattr(args, 'print_config') and args.print_config:
+        eval_config = args_to_config(args)
+        print_config(eval_config)
+        sys.exit(0)
+    
+    # Create evaluation config from args
+    eval_config = args_to_config(args)
+    
+    # Save config if requested
+    if hasattr(args, 'save_config') and args.save_config:
+        save_config_file(eval_config, args.save_config)
     
     def _parse_band(s: str):
         try:
