@@ -14,12 +14,15 @@ from dataclasses import replace
 from martingale_lab.orchestrator.dca_orchestrator import (
     DCAOrchestrator, DCAConfig, OrchestratorConfig
 )
-from martingale_lab.storage.experiments_store import ExperimentsStore
-from martingale_lab.storage.checkpoint_store import CheckpointStore
+from martingale_lab.storage.unified_store import UnifiedStore
 from martingale_lab.utils.logging import (
     configure_logging, configure_eval_sampling, get_cli_logger
 )
 from martingale_lab.utils.runctx import make_runctx
+from martingale_lab.cli.config_cli import (
+    add_config_arguments, args_to_config, print_config, save_config_file
+)
+from martingale_lab.core.config_classes import EvaluationConfig
 
 # Use the new centralized logging system
 cli_logger = get_cli_logger()
@@ -203,10 +206,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume-into", type=str, default=None,
                        help="Resume into a specific run_id (instead of latest)")
     
+    # Schedule normalization parameters
+    parser.add_argument("--post-round-2dp", action="store_true", default=True,
+                       help="Round schedule outputs to 2 decimal places (default: on)")
+    parser.add_argument("--no-post-round-2dp", dest="post_round_2dp", action="store_false",
+                       help="Disable rounding of schedule outputs")
+    parser.add_argument("--post-round-strategy", choices=["tail-first", "largest-remainder", "balanced"],
+                       default="tail-first",
+                       help="Strategy for adjusting sum to 100 after rounding")
+    parser.add_argument("--post-round-m2-tolerance", type=float, default=0.05,
+                       help="Tolerance for m2 preservation in percentage points")
+    parser.add_argument("--post-round-keep-v1-band", action="store_true", default=True,
+                       help="Preserve v1 band constraint during normalization")
+    
+    # Add config-based arguments
+    add_config_arguments(parser)
+    
     return parser.parse_args()
 
 
-def setup_database(db_path: str) -> ExperimentsStore:
+def setup_database(db_path: str) -> UnifiedStore:
     """Setup database directory and return store."""
     db_dir = Path(db_path).parent
     db_dir.mkdir(parents=True, exist_ok=True)
@@ -216,11 +235,24 @@ def setup_database(db_path: str) -> ExperimentsStore:
         extra={"event": "CLI.DB_SETUP", "db_path": db_path}
     )
     
-    return ExperimentsStore(db_path)
+    return UnifiedStore(db_path)
 
 
 def create_orchestrator_config(args: argparse.Namespace) -> tuple[DCAConfig, OrchestratorConfig]:
     """Create orchestrator configurations from CLI arguments."""
+    
+    # Check for config-based flow
+    if hasattr(args, 'print_config') and args.print_config:
+        eval_config = args_to_config(args)
+        print_config(eval_config)
+        sys.exit(0)
+    
+    # Create evaluation config from args
+    eval_config = args_to_config(args)
+    
+    # Save config if requested
+    if hasattr(args, 'save_config') and args.save_config:
+        save_config_file(eval_config, args.save_config)
     
     def _parse_band(s: str):
         try:
@@ -333,7 +365,13 @@ def create_orchestrator_config(args: argparse.Namespace) -> tuple[DCAConfig, Orc
         # Logging configuration
         log_eval_sample=args.log_eval_sample,
         log_every_batch=args.log_every_batch,
-        max_time_sec=args.max_time_sec
+        max_time_sec=args.max_time_sec,
+        
+        # Schedule normalization
+        post_round_2dp=args.post_round_2dp,
+        post_round_strategy=args.post_round_strategy,
+        post_round_m2_tolerance=args.post_round_m2_tolerance,
+        post_round_keep_v1_band=args.post_round_keep_v1_band
     )
     
     orch_config = OrchestratorConfig(
@@ -476,17 +514,9 @@ def main() -> int:
         store = setup_database(args.db)
         
         # Create checkpoint store with same database path
-        checkpoint_store = CheckpointStore(args.db)
-        # Create run context and start run record (for resume listing)
+        # Store handles checkpoints internally
+        # Create run context
         run_ctx = make_runctx(args.seed)
-        try:
-            checkpoint_store.start_run(run_ctx, {
-                "orchestrator": args.orchestrator,
-                "db_path": args.db,
-                "notes": args.notes,
-            })
-        except Exception:
-            pass
         
         # Handle resume functionality
         resume_from = None
@@ -496,7 +526,6 @@ def main() -> int:
             temp_orchestrator = DCAOrchestrator(
                 config=temp_config, 
                 store=store,
-                checkpoint_store=checkpoint_store,
                 workers_mode=args.workers_mode
             )
             
@@ -530,11 +559,10 @@ def main() -> int:
         
         # Create orchestrator
         orchestrator = DCAOrchestrator(
-            config=dca_config,
-            store=store,
+            config=dca_config, 
+            store=store, 
             run_id=resume_from if resume_from else run_ctx.run_id,  # Use resume run_id or new run_id
             orch_config=orch_config,
-            checkpoint_store=checkpoint_store,
             workers_mode=args.workers_mode
         )
         run_id = orchestrator.run_id
@@ -599,10 +627,7 @@ def main() -> int:
         if stats.get("timeout_reached", False):
             print(f"⚠️  Stopped due to timeout ({args.max_time_sec}s)", file=sys.stderr)
         print(f"Database: {args.db}", file=sys.stderr)
-        try:
-            checkpoint_store.finish_run(run_id, status='completed')
-        except Exception:
-            pass
+        # Store handles cleanup internally
         
         return 0
         
@@ -611,7 +636,8 @@ def main() -> int:
         try:
             # Best-effort mark as cancelled
             args = parse_args()
-            CheckpointStore(args.db).finish_run(run_id if 'run_id' in locals() else "unknown", status='cancelled')
+            # Store will handle cleanup
+            pass
         except Exception:
             pass
         return 130  # Standard exit code for SIGINT
@@ -628,7 +654,8 @@ def main() -> int:
         print(f"Error: {e}", file=sys.stderr)
         try:
             args = parse_args()
-            CheckpointStore(args.db).finish_run(run_id if 'run_id' in locals() else "unknown", status='failed')
+            # Store will handle cleanup
+            pass
         except Exception:
             pass
         return 1

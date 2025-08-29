@@ -16,6 +16,7 @@ from martingale_lab.utils.logging import get_eval_logger, should_log_eval
 from martingale_lab.core.constraints import enforce_schedule_shape_fixed
 from martingale_lab.core.penalties import compute_shape_penalties
 from martingale_lab.core.parameter_forwarding import filter_kwargs_for_function
+from martingale_lab.core.schedule_normalizer import normalize_schedule_to_2dp, is_schedule_normalized
 
 # Use the new centralized logging system
 logger = get_eval_logger()
@@ -296,6 +297,11 @@ def evaluation_function(
     # Smart initial generation
     use_smart_init: bool = False,
     history_db: Optional[str] = None,
+    # Schedule normalization parameters
+    post_round_2dp: bool = True,
+    post_round_strategy: str = "tail-first",
+    post_round_m2_tolerance: float = 0.05,
+    post_round_keep_v1_band: bool = True,
     **kwargs
 ) -> Dict[str, Any]:
     """
@@ -512,6 +518,24 @@ def evaluation_function(
             "order_prices": _ensure_json_serializable(order_prices),
             "price_step_pct": _ensure_json_serializable(price_step_pct),
         }
+        
+        # Apply 2dp normalization if enabled
+        if post_round_2dp:
+            schedule = normalize_schedule_to_2dp(
+                schedule,
+                post_round_strategy=post_round_strategy,
+                post_round_m2_tolerance=post_round_m2_tolerance,
+                post_round_keep_v1_band=post_round_keep_v1_band,
+                strict_monotonicity=True,
+                preserve_quartiles=True,
+                verbose=should_log_eval()
+            )
+            
+            # Update local references to normalized values
+            volume_pct = schedule["volume_pct"]
+            indent_pct = schedule["indent_pct"]
+            martingale_pct = schedule.get("martingale_pct", martingale_pct)
+            needpct = schedule.get("needpct", needpct)
         
         # Calculate sanity checks on repaired arrays
         calculated_max_need = float(np.max(needpct)) if len(needpct) > 0 else 0.0

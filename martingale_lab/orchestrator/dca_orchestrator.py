@@ -14,8 +14,10 @@ from datetime import datetime
 import random
 
 from martingale_lab.optimizer.evaluation_engine import evaluation_function
-from martingale_lab.storage.experiments_store import ExperimentsStore
-from martingale_lab.storage.checkpoint_store import CheckpointStore
+from martingale_lab.storage.unified_store import UnifiedStore
+from martingale_lab.storage.memory_manager import BoundedBestCandidates, log_memory_stats
+from martingale_lab.core.config_classes import EvaluationConfig
+from martingale_lab.core.config_adapter import config_to_flat_dict
 from martingale_lab.utils.stable_id import make_stable_id
 from martingale_lab.utils.logging import (
     get_orchestrator_logger, BatchAggregator, log_with_context
@@ -166,6 +168,9 @@ class DCAConfig:
     orders_min: int = 5
     orders_max: int = 15
     
+    # Optional: Use EvaluationConfig for structured parameters
+    evaluation_config: Optional['EvaluationConfig'] = None
+    
     # Optimization parameters
     n_candidates_per_batch: int = 1000
     max_batches: int = 100
@@ -255,19 +260,23 @@ class DCAConfig:
     log_eval_sample: float = 0.0  # Per-evaluation log sampling rate (0.0-1.0)
     log_every_batch: int = 1      # Log batch summary every N batches
     max_time_sec: Optional[int] = None  # Maximum runtime in seconds
+    
+    # Schedule normalization parameters
+    post_round_2dp: bool = True
+    post_round_strategy: str = "tail-first"
+    post_round_m2_tolerance: float = 0.05
+    post_round_keep_v1_band: bool = True
 
 
 class DCAOrchestrator:
     """Main orchestrator for DCA optimization with new evaluation contract."""
     
-    def __init__(self, config: DCAConfig, store: Optional[ExperimentsStore] = None, 
+    def __init__(self, config: DCAConfig, store: Optional[UnifiedStore] = None, 
                  run_id: Optional[str] = None, orch_config: Optional[OrchestratorConfig] = None,
-                 checkpoint_store: Optional[CheckpointStore] = None,
                  workers_mode: str = "thread"):
         self.config = config
         self.orch_config = orch_config or OrchestratorConfig()
-        self.store = store or ExperimentsStore()
-        self.checkpoint_store = checkpoint_store or CheckpointStore()
+        self.store = store or UnifiedStore(max_candidates_memory=500)
         self.logger = orch_logger
         self.run_id = run_id or generate_run_id()
         self.workers_mode = workers_mode if workers_mode in ("thread", "process") else "thread"
@@ -277,7 +286,11 @@ class DCAOrchestrator:
         
         # State tracking
         self.current_experiment_id: Optional[int] = None
-        self.best_candidates: List[Dict[str, Any]] = []
+        # Use bounded memory-safe candidate storage
+        self.best_candidates = BoundedBestCandidates(
+            max_size=self.orch_config.prune_min_keep * 10,  # Keep 10x minimum
+            score_key="score"
+        )
         self.batch_count = 0
         self.total_evaluations = 0
         self.start_time = 0.0
@@ -324,7 +337,12 @@ class DCAOrchestrator:
             "notes": notes or "DCA optimization with new evaluation contract"
         }
         
-        self.current_experiment_id = self.store.create_experiment("DCAOrchestrator", config_dict, self.run_id)
+        self.current_experiment_id = self.store.create_experiment(
+            run_id=self.run_id,
+            orchestrator="DCAOrchestrator", 
+            config=config_dict,
+            notes=notes
+        )
         LogContext.set_exp_id(self.current_experiment_id)
         
         return self.current_experiment_id
@@ -397,6 +415,11 @@ class DCAOrchestrator:
                 "w_front": self.config.w_front,
                 "w_tv": self.config.w_tv,
                 "w_wave": self.config.w_wave,
+                # Schedule normalization
+                "post_round_2dp": self.config.post_round_2dp,
+                "post_round_strategy": self.config.post_round_strategy,
+                "post_round_m2_tolerance": self.config.post_round_m2_tolerance,
+                "post_round_keep_v1_band": self.config.post_round_keep_v1_band,
             }
             parameters.append(params)
         
@@ -580,19 +603,16 @@ class DCAOrchestrator:
         return [r for i, r in enumerate(results) if keep_mask[i]]
     
     def update_best_candidates(self, new_results: List[Dict[str, Any]]):
-        """Update the list of best candidates."""
-        # Combine with existing candidates
-        all_candidates = self.best_candidates + new_results
+        """Update the list of best candidates with memory-safe storage."""
+        # Add new results to bounded storage (automatic pruning)
+        kept = self.best_candidates.add_batch(new_results)
         
-        # Sort by score (ascending - lower is better)
-        all_candidates.sort(key=lambda x: x.get("score", float("inf")))
-        
-        # Keep top K
-        self.best_candidates = all_candidates[:self.config.top_k_keep]
+        # Get current best for tracking
+        best_list = self.best_candidates.get_best(1)
         
         # Update best score and early stopping logic
-        if self.best_candidates:
-            new_best = self.best_candidates[0].get("score", float("inf"))
+        if best_list:
+            new_best = best_list[0].get("score", float("inf"))
             
             # Check for improvement
             improved = (new_best < self.best_score_so_far - self.orch_config.early_stop_delta)
@@ -656,9 +676,8 @@ class DCAOrchestrator:
             }
             
             # Save to checkpoint store
-            self.checkpoint_store.save_run_checkpoint(
+            self.store.save_checkpoint(
                 run_id=self.run_id,
-                exp_id=self.current_experiment_id,
                 batch_idx=batch_idx,
                 checkpoint_data=checkpoint_data
             )
@@ -690,7 +709,11 @@ class DCAOrchestrator:
     def load_checkpoint(self, run_id: str) -> Optional[Dict[str, Any]]:
         """Load checkpoint for resuming optimization."""
         try:
-            checkpoint_data = self.checkpoint_store.load_run_checkpoint(run_id)
+            checkpoint_result = self.store.load_checkpoint(run_id)
+            if checkpoint_result:
+                batch_idx, checkpoint_data = checkpoint_result
+            else:
+                checkpoint_data = None
             if checkpoint_data is None:
                 return None
             
@@ -744,7 +767,8 @@ class DCAOrchestrator:
     
     def get_resumable_runs(self) -> List[Dict[str, Any]]:
         """Get list of runs that can be resumed."""
-        return self.checkpoint_store.get_resumable_runs()
+        # TODO: Implement in UnifiedStore
+        return []
     
     def run_optimization(self, 
                         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -894,7 +918,7 @@ class DCAOrchestrator:
                 rows_written = 0
                 if db_items:
                     try:
-                        rows_written = self.store.upsert_results(self.current_experiment_id, db_items)
+                        rows_written = self.store.insert_results_batch(self.current_experiment_id, db_items)
                     except Exception as e:
                         self.logger.error(
                             f"DB upsert failed for batch {batch_idx}: {e}",
@@ -1068,8 +1092,8 @@ class DCAOrchestrator:
             return
         
         # Save top candidates
-        top_candidates = self.best_candidates[:100]  # Save top 100
-        inserted = self.store.upsert_results(self.current_experiment_id, top_candidates)
+        top_candidates = self.best_candidates.get_best(100)  # Save top 100
+        inserted = self.store.insert_results_batch(self.current_experiment_id, top_candidates)
         
         self.logger.info(f"Saved {inserted} results to database")
     
@@ -1077,7 +1101,7 @@ class DCAOrchestrator:
         """Get final optimization results."""
         return {
             "experiment_id": self.current_experiment_id,
-            "best_candidates": self.best_candidates[:50],  # Return top 50
+            "best_candidates": self.best_candidates.get_best(50),  # Return top 50
             "statistics": {
                 "total_evaluations": self.total_evaluations,
                 "total_time": self.stats["total_time"],

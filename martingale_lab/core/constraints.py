@@ -10,6 +10,7 @@ from typing import Dict, Any, Tuple
 from martingale_lab.core.repair import hard_clip_local_growth, isotonic_non_decreasing
 from martingale_lab.core.slope_enforcement import enforce_martingale_slopes, project_to_slope_feasible
 from martingale_lab.core.two_phase_enforcement import apply_two_phase_enforcement, validate_slope_constraints
+from martingale_lab.core.improved_slope_enforcement import multi_strategy_slope_enforcement
 import math
 
 
@@ -685,7 +686,7 @@ def enforce_schedule_shape_fixed(
     if total > 1e-9:
         vol *= 100.0 / total
     
-    # 7) Apply two-phase enforcement for perfect slope control
+    # 7) Apply multi-strategy slope enforcement
     vol_array = np.asarray(vol, dtype=np.float64)
     
     # Calculate m2 target (capped by slope_cap since m[0] = 0)
@@ -695,18 +696,21 @@ def enforce_schedule_shape_fixed(
         current_m2 = vol[1] / vol[0] - 1.0
         m2_target = max(m2_min, min(current_m2, m2_target))
     
-    # Apply two-phase enforcement
-    vol_array, converged = apply_two_phase_enforcement(
+    # Try multiple strategies to enforce slopes
+    vol_array, converged, num_violations, strategy_used = multi_strategy_slope_enforcement(
         vol_array,
-        v0_target=first_volume_target,
-        m2_target=m2_target,
         slope_cap=slope_cap,
+        m2_target=m2_target,
         m_min=m_min,
         m_max=m_max
     )
     
     # Validate the result
-    is_valid, num_violations, max_violation = validate_slope_constraints(vol_array, slope_cap)
+    is_valid, num_violations_check, max_violation = validate_slope_constraints(vol_array, slope_cap)
+    
+    # Use the check result if different
+    if num_violations_check != num_violations:
+        num_violations = num_violations_check
     
     # Store diagnostics about slope enforcement
     slope_diagnostics = {
