@@ -18,6 +18,7 @@ from threading import Lock
 
 from .schema_manager import get_schema_manager
 from .memory_manager import BoundedBestCandidates, BatchAccumulator
+from .config_store import ConfigStore
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,9 @@ class UnifiedStore:
         # Memory management
         self._candidates_cache = BoundedBestCandidates(max_size=max_candidates_memory)
         self._batch_accumulator = BatchAccumulator(batch_size=100)
+        
+        # Config store
+        self.config_store = ConfigStore(db_path)
         
         # Connection pool (simple implementation)
         self._connection_pool: List[sqlite3.Connection] = []
