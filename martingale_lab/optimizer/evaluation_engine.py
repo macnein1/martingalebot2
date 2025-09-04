@@ -258,6 +258,8 @@ def evaluation_function(
     sens_min: float = 0.25,
     w_template: float = 0.8,
     template_close: float = 0.6,
+    template_mode: str = "doubling",  # [doubling, linear, custom]
+    template_custom: Optional[List[float]] = None,
     # Generation mode knobs
     wave_mode: str = "anchors",  # [anchors, blocks]
     anchors: int = 9,
@@ -571,6 +573,23 @@ def evaluation_function(
                 vs = vs * (100.0 / total)
             volume_pct = [float(x) for x in vs.tolist()]
 
+        # Recompute derived fields AFTER smoothing
+        martingale_pct = []
+        needpct = []
+        cumsum = 0.0
+        base_price_local = order_prices[0] if len(order_prices) > 0 else 1.0
+        for i, v in enumerate(volume_pct):
+            if i == 0:
+                martingale_pct.append(0.0)
+            else:
+                cumsum += volume_pct[i-1]
+                martingale_pct.append(v / cumsum * 100.0 if cumsum > 0 else 0.0)
+            if i < len(order_prices):
+                price_ratio = (order_prices[i] / base_price_local) if base_price_local else 1.0
+                needpct.append(v * price_ratio)
+            else:
+                needpct.append(v)
+
         # Recompute derived fields after rescale
         martingale_pct = []
         needpct = []
@@ -823,7 +842,12 @@ def evaluation_function(
         try:
             n = len(volume_pct)
             if n > 0:
-                g = np.array([2.0 ** i for i in range(n)], dtype=np.float64)
+                if (template_mode or "").lower() == "linear":
+                    g = np.linspace(1.0, float(n), n)
+                elif (template_mode or "").lower() == "custom" and template_custom and len(template_custom) == n:
+                    g = np.asarray(template_custom, dtype=np.float64)
+                else:
+                    g = np.array([2.0 ** i for i in range(n)], dtype=np.float64)
                 g = g / np.sum(g) * 100.0
                 v_norm = np.asarray(schedule.get("volume_pct_norm", volume_pct), dtype=np.float64)
                 v_norm = v_norm / max(1e-12, np.sum(v_norm)) * 100.0
