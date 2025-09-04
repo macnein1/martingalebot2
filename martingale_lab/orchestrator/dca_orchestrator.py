@@ -68,6 +68,10 @@ def _process_eval_worker(params: Dict[str, Any]) -> Dict[str, Any]:
             "w_front": params.get("w_front"),
             "w_tv": params.get("w_tv"),
             "w_wave": params.get("w_wave"),
+            "w_sens": params.get("w_sens"),
+            "sens_min": params.get("sens_min"),
+            "w_template": params.get("w_template"),
+            "template_close": params.get("template_close"),
         }
         result["params"] = param_subset
         return result
@@ -183,18 +187,18 @@ class DCAConfig:
     lambda_penalty: float = 0.1
     
     # Wave pattern settings
-    wave_pattern: bool = False
+    wave_pattern: bool = True
     wave_strong_threshold: float = 50.0
     wave_weak_threshold: float = 10.0
     
     # Constraints
     tail_cap: float = 0.40
     min_indent_step: float = 0.05
-    softmax_temp: float = 1.0
+    softmax_temp: float = 1.4
 
     # Generation controls
     wave_mode: str = "anchors"  # [anchors, blocks]
-    anchors: int = 6
+    anchors: int = 9
     blocks: int = 3
     wave_amp_min: float = 0.05
     wave_amp_max: float = 0.30
@@ -243,8 +247,13 @@ class DCAConfig:
     w_second: float = 3.0
     w_gband: float = 2.0
     w_front: float = 3.0
-    w_tv: float = 1.0
+    w_tv: float = 3.5
     w_wave: float = 1.0
+    # New penalties (sensitivity/template)
+    w_sens: float = 1.0
+    sens_min: float = 0.25
+    w_template: float = 0.8
+    template_close: float = 0.6
     
     # Early stopping
     early_stop_threshold: float = 1e-6  # Stop if improvement < threshold
@@ -262,10 +271,14 @@ class DCAConfig:
     max_time_sec: Optional[int] = None  # Maximum runtime in seconds
     
     # Schedule normalization parameters
-    post_round_2dp: bool = True
+    post_round_2dp: bool = False
     post_round_strategy: str = "tail-first"
     post_round_m2_tolerance: float = 0.05
     post_round_keep_v1_band: bool = True
+
+    # Novelty filter parameters
+    diversity_min_l1: float = 0.8
+    novelty_k: int = 500
 
 
 class DCAOrchestrator:
@@ -319,6 +332,8 @@ class DCAOrchestrator:
             "pruned": 0,
             "saved_rows": 0
         }
+        # Novelty filter pool of normalized volume shapes (list of numpy arrays)
+        self._novelty_pool: List[np.ndarray] = []
     
     def create_experiment(self, notes: Optional[str] = None) -> int:
         """Create a new experiment in the database."""
@@ -476,6 +491,11 @@ class DCAOrchestrator:
                 "w_front": params.get("w_front"),
                 "w_tv": params.get("w_tv"),
                 "w_wave": params.get("w_wave"),
+                # New penalties
+                "w_sens": params.get("w_sens"),
+                "sens_min": params.get("sens_min"),
+                "w_template": params.get("w_template"),
+                "template_close": params.get("template_close"),
             }
             result["params"] = param_subset
             
@@ -543,6 +563,42 @@ class DCAOrchestrator:
                         # Fallback to sequential evaluation for this item
                         results.append(self.evaluate_candidate(params))
         
+        # Apply novelty filter within-batch: build pool incrementally to penalize clones immediately
+        if results:
+            filtered: List[Dict[str, Any]] = []
+            for res in results:
+                try:
+                    v_norm = res.get("schedule", {}).get("volume_pct_norm") or res.get("schedule", {}).get("volume_pct")
+                    if not v_norm:
+                        filtered.append(res)
+                        continue
+                    v_arr = np.asarray(v_norm, dtype=np.float64)
+                    if np.sum(v_arr) > 0:
+                        v_arr = v_arr / np.sum(v_arr) * 100.0
+                    # Compute min L1 distance versus current pool
+                    min_l1 = 1e9
+                    for p in self._novelty_pool:
+                        if len(p) != len(v_arr):
+                            continue
+                        d = float(np.sum(np.abs(v_arr - p)) / 100.0)
+                        if d < min_l1:
+                            min_l1 = d
+                            if min_l1 < self.config.diversity_min_l1:
+                                break
+                    if min_l1 < self.config.diversity_min_l1:
+                        # Strong downweight: inflate score to deprioritize clones but still retain for stats
+                        res["score"] = float(res.get("score", float("inf")) + 1000.0 * (self.config.diversity_min_l1 - min_l1))
+                        filtered.append(res)
+                        # Do not add shape to pool
+                    else:
+                        filtered.append(res)
+                        # Add to novelty pool
+                        self._novelty_pool.append(v_arr)
+                        if len(self._novelty_pool) > max(1, self.config.novelty_k):
+                            self._novelty_pool = self._novelty_pool[-self.config.novelty_k:]
+                except Exception:
+                    filtered.append(res)
+            results = filtered
         return results
     
     def apply_pruning(self, results: List[Dict[str, Any]], batch_idx: int) -> List[Dict[str, Any]]:
@@ -908,6 +964,7 @@ class DCAOrchestrator:
                     db_items.append({
                         "stable_id": sid,
                         "score": float(res.get("score", float("inf"))),
+                        "schedule": res.get("schedule", {}),
                         "payload": payload,
                         "sanity": res.get("sanity", {}),
                         "diagnostics": res.get("diagnostics", {}),

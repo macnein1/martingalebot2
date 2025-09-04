@@ -8,7 +8,7 @@ core:
 generation:
   wave_pattern: true
   wave_mode: anchors
-  anchors: 6
+  anchors: 9
   blocks: 3
   wave_amp_min: 0.05
   wave_amp_max: 0.30
@@ -17,7 +17,7 @@ generation:
   use_smart_init: false
   history_db:
   min_indent_step: 0.05
-  softmax_temp: 1.0
+  softmax_temp: 1.4
   first_volume_target: 0.01     # toplam hacmin %1'i ile başla
   first_indent_target: 0.00
 
@@ -50,7 +50,7 @@ penalties:
   w_second: 2.0
   w_band: 1.5
   w_front: 2.0
-  w_tv: 0.5
+  w_tv: 3.5
   w_wave: 0.75
   w_varm: 2.0
   w_blocks: 1.0
@@ -58,7 +58,12 @@ penalties:
   w_front_share: 2.0
   w_tailweak: 2.0
   w_slope: 1.0
-  w_wave_shape: 1.0
+  w_wave_shape: 1.2
+  # New penalties
+  w_sens: 1.0
+  sens_min: 0.25
+  w_template: 0.8
+  template_close: 0.6
   penalty_preset:
   target_std: 0.10
 
@@ -73,7 +78,7 @@ adaptive:
   strategy_type: balanced
 
 normalization:
-  post_round_2dp: true
+  post_round_2dp: false
   post_round_strategy: tail-first
   post_round_m2_tolerance: 0.05
   post_round_keep_v1_band: true
