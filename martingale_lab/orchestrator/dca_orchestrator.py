@@ -574,6 +574,7 @@ class DCAOrchestrator:
         if results:
             filtered: List[Dict[str, Any]] = []
             l1_vals: List[float] = []
+            unique_added = 0
             for res in results:
                 try:
                     sch = res.get("schedule", {})
@@ -615,6 +616,7 @@ class DCAOrchestrator:
                         filtered.append(res)
                         # Add to novelty pool
                         self._novelty_pool.append(v_arr)
+                        unique_added += 1
                         if len(self._novelty_pool) > max(1, self.config.novelty_k):
                             # Simple LRU: keep most recent K
                             self._novelty_pool = self._novelty_pool[-self.config.novelty_k:]
@@ -625,17 +627,20 @@ class DCAOrchestrator:
             try:
                 reject_rate = float(sum(1 for x in l1_vals if x < self.config.diversity_min_l1) / max(1, len(l1_vals)))
                 avg_l1 = float(np.nanmean(np.asarray(l1_vals, dtype=np.float64))) if l1_vals else float('nan')
+                unique_ratio = float(unique_added / max(1, len(l1_vals)))
             except Exception:
                 reject_rate = 0.0
                 avg_l1 = float('nan')
+                unique_ratio = 0.0
             self.logger.info(
-                f"NOVELTY: reject_rate={reject_rate:.2%} avg_L1={avg_l1:.3f} pool={len(self._novelty_pool)}",
+                f"NOVELTY: reject_rate={reject_rate:.2%} unique_rate={unique_ratio:.2%} avg_L1={avg_l1:.3f} pool={len(self._novelty_pool)}",
                 extra={
                     "event": "NOVELTY.STATS",
                     "run_id": self.run_id,
                     "exp_id": self.current_experiment_id,
                     "batch_idx": self.batch_count,
                     "reject_rate": reject_rate,
+                    "unique_rate": unique_ratio,
                     "avg_l1": avg_l1,
                     "pool_size": len(self._novelty_pool),
                 }
@@ -1070,6 +1075,44 @@ class DCAOrchestrator:
                 self.stats["batches_completed"] = batch_idx + 1
                 self.stats["total_time"] = time.time() - self.start_time
                 self.stats["evaluations_per_second"] = self.total_evaluations / self.stats["total_time"]
+
+                # Penalty breakdown (mean/median) over kept results in this batch
+                try:
+                    import numpy as _np
+                    def _collect_p(keys: List[str]) -> Dict[str, Dict[str, float]]:
+                        out: Dict[str, Dict[str, float]] = {}
+                        arrs: Dict[str, List[float]] = {k: [] for k in keys}
+                        for r in pruned_results:
+                            p = r.get("penalties", {})
+                            for k in keys:
+                                v = p.get(k)
+                                if isinstance(v, (int, float)):
+                                    arrs[k].append(float(v))
+                        for k, vs in arrs.items():
+                            if vs:
+                                a = _np.asarray(vs, dtype=_np.float64)
+                                out[k] = {
+                                    "mean": float(_np.mean(a)),
+                                    "median": float(_np.median(a)),
+                                }
+                        return out
+                    p_keys = [
+                        "P_gini","P_entropy","P_monotone","P_smooth","P_tailcap","P_need_mismatch","P_wave",
+                        "P_sensitivity","P_template"
+                    ]
+                    p_stats = _collect_p(p_keys)
+                    self.logger.info(
+                        f"PEN.BREAKDOWN: " + ", ".join([f"{k}(μ={v['mean']:.3f},~={v['median']:.3f})" for k,v in p_stats.items()]),
+                        extra={
+                            "event": "PEN.BREAKDOWN",
+                            "run_id": self.run_id,
+                            "exp_id": self.current_experiment_id,
+                            "batch_idx": batch_idx,
+                            "stats": p_stats
+                        }
+                    )
+                except Exception:
+                    pass
                 
                 # Count sanity violations and wave patterns
                 for result in batch_results:
