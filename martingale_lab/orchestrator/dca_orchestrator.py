@@ -279,6 +279,7 @@ class DCAConfig:
     # Novelty filter parameters
     diversity_min_l1: float = 0.8
     novelty_k: int = 500
+    diversity_metric: str = "l1"  # [l1, emd]
 
 
 class DCAOrchestrator:
@@ -581,12 +582,19 @@ class DCAOrchestrator:
                         v_arr = v_arr * (100.0 / s)
                     if np.sum(v_arr) > 0:
                         v_arr = v_arr / np.sum(v_arr) * 100.0
-                    # Compute min L1 distance versus current pool
+                    # Compute min distance versus current pool
                     min_l1 = 1e9
                     for p in self._novelty_pool:
                         if len(p) != len(v_arr):
                             continue
-                        d = float(np.sum(np.abs(v_arr - p)) / 100.0)
+                        if self.config.diversity_metric == "emd":
+                            # Wasserstein-1 via CDF difference (O(n))
+                            c1 = np.cumsum(v_arr) / 100.0
+                            c2 = np.cumsum(p) / 100.0
+                            d = float(np.sum(np.abs(c1 - c2)) / len(v_arr))
+                        else:
+                            # Default L1 on percentages normalized by 100
+                            d = float(np.sum(np.abs(v_arr - p)) / 100.0)
                         if d < min_l1:
                             min_l1 = d
                             if min_l1 < self.config.diversity_min_l1:
