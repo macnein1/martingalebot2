@@ -160,8 +160,11 @@ def parse_args() -> argparse.Namespace:
                        help="Random seed")
     
     # Wave pattern
-    parser.add_argument("--wave-pattern", action="store_true",
-                       help="Enable wave pattern optimization")
+    wave_group = parser.add_mutually_exclusive_group()
+    wave_group.add_argument("--wave-pattern", action="store_true",
+                           help="Enable wave pattern optimization (default)")
+    wave_group.add_argument("--no-wave-pattern", action="store_true",
+                           help="Disable wave pattern optimization")
     parser.add_argument("--wave-mode", choices=["anchors", "blocks"], default="anchors",
                        help="Volume shape generator: anchors (default) or blocks (wave blocks).")
     parser.add_argument("--anchors", type=int, default=9,
@@ -209,6 +212,11 @@ def parse_args() -> argparse.Namespace:
     # Schedule normalization parameters
     parser.add_argument("--post-round-2dp", action="store_true", default=False,
                        help="Round schedule outputs to 2 decimal places (default: off)")
+    # Post-normalization smoothing
+    parser.add_argument("--post-norm-smoothing", action="store_true", default=False,
+                       help="Enable post-normalization smoothing (light isotonic/TV blend)")
+    parser.add_argument("--smoothing-alpha", type=float, default=0.15,
+                       help="Smoothing blend factor (0..1)")
     parser.add_argument("--no-post-round-2dp", dest="post_round_2dp", action="store_false",
                        help="Disable rounding of schedule outputs")
     parser.add_argument("--post-round-strategy", choices=["tail-first", "largest-remainder", "balanced"],
@@ -300,7 +308,7 @@ def create_orchestrator_config(args: argparse.Namespace) -> tuple[DCAConfig, Orc
         lambda_penalty=args.penalty,
         
         # Wave pattern
-        wave_pattern=args.wave_pattern,
+        wave_pattern=(False if args.no_wave_pattern else True),
         wave_mode=args.wave_mode,
         anchors=args.anchors,
         blocks=args.blocks,
@@ -377,7 +385,10 @@ def create_orchestrator_config(args: argparse.Namespace) -> tuple[DCAConfig, Orc
         post_round_2dp=args.post_round_2dp,
         post_round_strategy=args.post_round_strategy,
         post_round_m2_tolerance=args.post_round_m2_tolerance,
-        post_round_keep_v1_band=args.post_round_keep_v1_band
+        post_round_keep_v1_band=args.post_round_keep_v1_band,
+        # Post-normalization smoothing
+        post_norm_smoothing=args.post_norm_smoothing,
+        smoothing_alpha=args.smoothing_alpha
     )
     
     orch_config = OrchestratorConfig(

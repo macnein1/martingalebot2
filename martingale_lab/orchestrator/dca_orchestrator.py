@@ -275,6 +275,9 @@ class DCAConfig:
     post_round_strategy: str = "tail-first"
     post_round_m2_tolerance: float = 0.05
     post_round_keep_v1_band: bool = True
+    # Post-normalization smoothing (optional)
+    post_norm_smoothing: bool = False
+    smoothing_alpha: float = 0.15
 
     # Novelty filter parameters
     diversity_min_l1: float = 0.8
@@ -436,6 +439,9 @@ class DCAOrchestrator:
                 "post_round_strategy": self.config.post_round_strategy,
                 "post_round_m2_tolerance": self.config.post_round_m2_tolerance,
                 "post_round_keep_v1_band": self.config.post_round_keep_v1_band,
+                # Post-normalization smoothing
+                "post_norm_smoothing": self.config.post_norm_smoothing,
+                "smoothing_alpha": self.config.smoothing_alpha,
             }
             parameters.append(params)
         
