@@ -307,6 +307,9 @@ def evaluation_function(
     post_round_strategy: str = "tail-first",
     post_round_m2_tolerance: float = 0.05,
     post_round_keep_v1_band: bool = True,
+    # Post-normalization optional smoothing
+    post_norm_smoothing: bool = False,
+    smoothing_alpha: float = 0.15,
     **kwargs
 ) -> Dict[str, Any]:
     """
@@ -534,6 +537,39 @@ def evaluation_function(
             volume_pct = [float(v * scale) for v in volume_pct]
         else:
             volume_pct = [float(100.0 / max(1, len(volume_pct)))] * len(volume_pct)
+
+        # Assert sum ~ 100 and epsilon-fix the last element if needed
+        s = float(np.sum(np.asarray(volume_pct, dtype=np.float64)))
+        diff = 100.0 - s
+        if abs(diff) > 1e-9 and len(volume_pct) > 0:
+            volume_pct[-1] = float(volume_pct[-1] + diff)
+            # Guard against negative due to numerical issues
+            if volume_pct[-1] < 0:
+                volume_pct[-1] = 0.0
+                # Rebalance tiny deficit to previous element if exists
+                if len(volume_pct) > 1:
+                    volume_pct[-2] = float(max(0.0, volume_pct[-2] + diff))
+
+        # Optional light smoothing (then re-project to 100 and enforce monotonic)
+        if post_norm_smoothing and len(volume_pct) >= 3:
+            v = np.asarray(volume_pct, dtype=np.float64)
+            alpha = max(0.0, min(1.0, smoothing_alpha))
+            # 3-point smoothing kernel [0.25, 0.5, 0.25] blended by alpha
+            vs = v.copy()
+            vs[1:-1] = (1 - alpha) * v[1:-1] + alpha * (0.25 * v[:-2] + 0.5 * v[1:-1] + 0.25 * v[2:])
+            # Re-project to sum 100
+            total = float(np.sum(vs))
+            if total > 1e-12:
+                vs = vs * (100.0 / total)
+            # Enforce non-decreasing very softly
+            for i in range(1, len(vs)):
+                if vs[i] < vs[i-1]:
+                    vs[i] = vs[i-1]
+            # Re-project again to sum 100
+            total = float(np.sum(vs))
+            if total > 1e-12:
+                vs = vs * (100.0 / total)
+            volume_pct = [float(x) for x in vs.tolist()]
 
         # Recompute derived fields after rescale
         martingale_pct = []
@@ -769,7 +805,13 @@ def evaluation_function(
             if len(vol_arr) >= 2 and len(ind_arr) >= 2:
                 dv = np.abs(np.diff(vol_arr))
                 di = np.abs(np.diff(ind_arr))
-                S = float(np.mean(dv / (1e-6 + di)))
+                mean_di = float(np.mean(di)) if di.size > 0 else 0.0
+                eps = 1e-6 * mean_di + 1e-9
+                mask = di >= eps  # ignore pairs with tiny indent differences
+                if np.any(mask):
+                    S = float(np.mean(dv[mask] / (eps + di[mask])))
+                else:
+                    S = 0.0
             else:
                 S = 0.0
         except Exception:
@@ -792,6 +834,9 @@ def evaluation_function(
             D = 0.0
         penalty_template = max(0.0, template_close - D) * w_template
         penalties["P_template"] = float(penalty_template)
+        # Diagnostics for analysis
+        diagnostics["sensitivity_S"] = float(S)
+        diagnostics["template_D"] = float(D)
         
         # Weighted sum of shape penalties (including new SP penalties)
         shape_penalty_sum = (
