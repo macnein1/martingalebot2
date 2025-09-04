@@ -66,7 +66,7 @@ def parse_args() -> argparse.Namespace:
                        help="Tail cap constraint")
     parser.add_argument("--min-indent-step", type=float, default=0.05,
                        help="Minimum indent step")
-    parser.add_argument("--softmax-temp", type=float, default=1.0,
+    parser.add_argument("--softmax-temp", type=float, default=1.4,
                        help="Softmax temperature")
     parser.add_argument("--first-volume", type=float, default=0.01,
                        help="First order volume pct (fixed).")
@@ -160,11 +160,14 @@ def parse_args() -> argparse.Namespace:
                        help="Random seed")
     
     # Wave pattern
-    parser.add_argument("--wave-pattern", action="store_true",
-                       help="Enable wave pattern optimization")
+    wave_group = parser.add_mutually_exclusive_group()
+    wave_group.add_argument("--wave-pattern", action="store_true",
+                           help="Enable wave pattern optimization (default)")
+    wave_group.add_argument("--no-wave-pattern", action="store_true",
+                           help="Disable wave pattern optimization")
     parser.add_argument("--wave-mode", choices=["anchors", "blocks"], default="anchors",
                        help="Volume shape generator: anchors (default) or blocks (wave blocks).")
-    parser.add_argument("--anchors", type=int, default=6,
+    parser.add_argument("--anchors", type=int, default=9,
                        help="Number of anchor points for anchors mode (4..8 typical).")
     parser.add_argument("--blocks", type=int, default=3,
                        help="Number of wave blocks for blocks mode.")
@@ -180,7 +183,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w-second", type=float, default=3.0, help="Weight for second<=first penalty")
     parser.add_argument("--w-gband", type=float, default=2.0, help="Weight for g band penalty")
     parser.add_argument("--w-front", type=float, default=3.0, help="Weight for front-load penalty")
-    parser.add_argument("--w-tv", type=float, default=1.0, help="Weight for total variation penalty")
+    parser.add_argument("--w-tv", type=float, default=3.5, help="Weight for total variation penalty")
     parser.add_argument("--w-wave", type=float, default=1.0, help="Weight for wave penalty")
     
     # Logging configuration
@@ -207,8 +210,13 @@ def parse_args() -> argparse.Namespace:
                        help="Resume into a specific run_id (instead of latest)")
     
     # Schedule normalization parameters
-    parser.add_argument("--post-round-2dp", action="store_true", default=True,
-                       help="Round schedule outputs to 2 decimal places (default: on)")
+    parser.add_argument("--post-round-2dp", action="store_true", default=False,
+                       help="Round schedule outputs to 2 decimal places (default: off)")
+    # Post-normalization smoothing
+    parser.add_argument("--post-norm-smoothing", action="store_true", default=False,
+                       help="Enable post-normalization smoothing (light isotonic/TV blend)")
+    parser.add_argument("--smoothing-alpha", type=float, default=0.15,
+                       help="Smoothing blend factor (0..1)")
     parser.add_argument("--no-post-round-2dp", dest="post_round_2dp", action="store_false",
                        help="Disable rounding of schedule outputs")
     parser.add_argument("--post-round-strategy", choices=["tail-first", "largest-remainder", "balanced"],
@@ -235,7 +243,8 @@ def setup_database(db_path: str) -> UnifiedStore:
         extra={"event": "CLI.DB_SETUP", "db_path": db_path}
     )
     
-    return UnifiedStore(db_path)
+    # Use synchronous writes to ensure results are visible immediately in reports/tests
+    return UnifiedStore(db_path, use_write_queue=False)
 
 
 def create_orchestrator_config(args: argparse.Namespace) -> tuple[DCAConfig, OrchestratorConfig]:
@@ -299,7 +308,7 @@ def create_orchestrator_config(args: argparse.Namespace) -> tuple[DCAConfig, Orc
         lambda_penalty=args.penalty,
         
         # Wave pattern
-        wave_pattern=args.wave_pattern,
+        wave_pattern=(False if args.no_wave_pattern else True),
         wave_mode=args.wave_mode,
         anchors=args.anchors,
         blocks=args.blocks,
@@ -355,6 +364,11 @@ def create_orchestrator_config(args: argparse.Namespace) -> tuple[DCAConfig, Orc
         w_front=penalty_weights["w_front"],
         w_tv=penalty_weights["w_tv"],
         w_wave=penalty_weights["w_wave"],
+        # New penalties
+        w_sens=1.0,
+        sens_min=0.25,
+        w_template=0.8,
+        template_close=0.6,
         
         # Parallelization
         n_workers=args.workers,
@@ -371,7 +385,10 @@ def create_orchestrator_config(args: argparse.Namespace) -> tuple[DCAConfig, Orc
         post_round_2dp=args.post_round_2dp,
         post_round_strategy=args.post_round_strategy,
         post_round_m2_tolerance=args.post_round_m2_tolerance,
-        post_round_keep_v1_band=args.post_round_keep_v1_band
+        post_round_keep_v1_band=args.post_round_keep_v1_band,
+        # Post-normalization smoothing
+        post_norm_smoothing=args.post_norm_smoothing,
+        smoothing_alpha=args.smoothing_alpha
     )
     
     orch_config = OrchestratorConfig(

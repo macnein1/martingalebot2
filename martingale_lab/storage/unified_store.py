@@ -268,6 +268,7 @@ class UnifiedStore:
                     'var_need': result.get('var_need'),
                     'tail': result.get('tail'),
                     'payload_json': json.dumps(result),
+                    # Schedule JSON now includes raw and normalized arrays
                     'schedule_json': json.dumps(result.get('schedule', {})),
                     'sanity_json': json.dumps(result.get('sanity', {})),
                     'diagnostics_json': json.dumps(result.get('diagnostics', {})),

@@ -237,7 +237,7 @@ def evaluation_function(
     wave_weak_threshold: float = 10.0,
     tail_cap: float = 0.40,
     min_indent_step: float = 0.05,
-    softmax_temp: float = 1.0,
+    softmax_temp: float = 1.4,
     # New shape-enforcement parameters
     first_volume_target: float = 1.0,  # Changed from 0.01 to 1.0 for reasonable m2
     first_indent_target: float = 0.0,
@@ -250,12 +250,19 @@ def evaluation_function(
     w_fixed: float = 3.0,
     w_band: float = 2.0,
     w_front: float = 3.0,
-    w_tv: float = 1.0,
+    w_tv: float = 3.5,
     w_sec: float = 3.0,
     w_wave: float = 1.0,
+    # Diversity/sensitivity/template penalties
+    w_sens: float = 1.0,
+    sens_min: float = 0.25,
+    w_template: float = 0.8,
+    template_close: float = 0.6,
+    template_mode: str = "doubling",  # [doubling, linear, custom]
+    template_custom: Optional[List[float]] = None,
     # Generation mode knobs
     wave_mode: str = "anchors",  # [anchors, blocks]
-    anchors: int = 6,
+    anchors: int = 9,
     blocks: int = 3,
     wave_amp_min: float = 0.05,
     wave_amp_max: float = 0.30,
@@ -290,7 +297,7 @@ def evaluation_function(
     w_front_share: float = 2.0,
     w_tailweak: float = 2.0,
     w_slope: float = 1.0,
-    w_wave_shape: float = 1.0,
+    w_wave_shape: float = 1.2,
     # Adaptive parameters
     use_adaptive: bool = False,
     strategy_type: str = "balanced",
@@ -298,10 +305,13 @@ def evaluation_function(
     use_smart_init: bool = False,
     history_db: Optional[str] = None,
     # Schedule normalization parameters
-    post_round_2dp: bool = True,
+    post_round_2dp: bool = False,
     post_round_strategy: str = "tail-first",
     post_round_m2_tolerance: float = 0.05,
     post_round_keep_v1_band: bool = True,
+    # Post-normalization optional smoothing
+    post_norm_smoothing: bool = False,
+    smoothing_alpha: float = 0.15,
     **kwargs
 ) -> Dict[str, Any]:
     """
@@ -407,7 +417,7 @@ def evaluation_function(
             if wave_mode == "blocks":
                 vol_sample = _wave_blocks(num_orders, blocks, rng, first_volume_target, wave_amp_min, wave_amp_max)
             else:
-                vol_sample, anchor_idx, logv = _interp_from_anchors(num_orders, max(4, min(anchors, 8)), rng, first_volume_target, 1.0)
+                vol_sample, anchor_idx, logv = _interp_from_anchors(num_orders, max(4, min(anchors, 10)), rng, first_volume_target, 1.0)
                 # Normalize anchor indices to t-space [0,1]
                 if num_orders > 1:
                     anchor_points_norm = anchor_idx.astype(np.float64) / float(num_orders - 1)
@@ -519,10 +529,104 @@ def evaluation_function(
             "price_step_pct": _ensure_json_serializable(price_step_pct),
         }
         
-        # Apply 2dp normalization if enabled
+        # Normalization-always-on: rescale to sum exactly 100.0 for scoring
+        # Preserve raw arrays as debug fields
+        volume_pct_raw = list(volume_pct)
+        indent_pct_raw = list(indent_pct)
+        vol_sum = float(np.sum(np.asarray(volume_pct, dtype=np.float64)))
+        if vol_sum > 1e-12:
+            scale = 100.0 / vol_sum
+            volume_pct = [float(v * scale) for v in volume_pct]
+        else:
+            volume_pct = [float(100.0 / max(1, len(volume_pct)))] * len(volume_pct)
+
+        # Assert sum ~ 100 and epsilon-fix the last element if needed
+        s = float(np.sum(np.asarray(volume_pct, dtype=np.float64)))
+        diff = 100.0 - s
+        if abs(diff) > 1e-9 and len(volume_pct) > 0:
+            volume_pct[-1] = float(volume_pct[-1] + diff)
+            # Guard against negative due to numerical issues
+            if volume_pct[-1] < 0:
+                volume_pct[-1] = 0.0
+                # Rebalance tiny deficit to previous element if exists
+                if len(volume_pct) > 1:
+                    volume_pct[-2] = float(max(0.0, volume_pct[-2] + diff))
+
+        # Optional light smoothing (then re-project to 100 and enforce monotonic)
+        if post_norm_smoothing and len(volume_pct) >= 3:
+            v = np.asarray(volume_pct, dtype=np.float64)
+            alpha = max(0.0, min(1.0, smoothing_alpha))
+            # 3-point smoothing kernel [0.25, 0.5, 0.25] blended by alpha
+            vs = v.copy()
+            vs[1:-1] = (1 - alpha) * v[1:-1] + alpha * (0.25 * v[:-2] + 0.5 * v[1:-1] + 0.25 * v[2:])
+            # Re-project to sum 100
+            total = float(np.sum(vs))
+            if total > 1e-12:
+                vs = vs * (100.0 / total)
+            # Enforce non-decreasing very softly
+            for i in range(1, len(vs)):
+                if vs[i] < vs[i-1]:
+                    vs[i] = vs[i-1]
+            # Re-project again to sum 100
+            total = float(np.sum(vs))
+            if total > 1e-12:
+                vs = vs * (100.0 / total)
+            volume_pct = [float(x) for x in vs.tolist()]
+
+        # Recompute derived fields AFTER smoothing
+        martingale_pct = []
+        needpct = []
+        cumsum = 0.0
+        base_price_local = order_prices[0] if len(order_prices) > 0 else 1.0
+        for i, v in enumerate(volume_pct):
+            if i == 0:
+                martingale_pct.append(0.0)
+            else:
+                cumsum += volume_pct[i-1]
+                martingale_pct.append(v / cumsum * 100.0 if cumsum > 0 else 0.0)
+            if i < len(order_prices):
+                price_ratio = (order_prices[i] / base_price_local) if base_price_local else 1.0
+                needpct.append(v * price_ratio)
+            else:
+                needpct.append(v)
+
+        # Recompute derived fields after rescale
+        martingale_pct = []
+        needpct = []
+        cumsum = 0.0
+        base_price_local = order_prices[0] if len(order_prices) > 0 else 1.0
+        for i, v in enumerate(volume_pct):
+            if i == 0:
+                martingale_pct.append(0.0)
+            else:
+                cumsum += volume_pct[i-1]
+                martingale_pct.append(v / cumsum * 100.0 if cumsum > 0 else 0.0)
+            if i < len(order_prices):
+                price_ratio = (order_prices[i] / base_price_local) if base_price_local else 1.0
+                needpct.append(v * price_ratio)
+            else:
+                needpct.append(v)
+
+        # Attach normalized and raw arrays to schedule for reporting
+        schedule["volume_pct_norm"] = [float(v) for v in volume_pct]
+        schedule["indent_pct_norm"] = [float(i) for i in indent_pct]
+        schedule["volume_pct_raw"] = [float(v) for v in volume_pct_raw]
+        schedule["indent_pct_raw"] = [float(i) for i in indent_pct_raw]
+        schedule["volume_pct_norm_2dp"] = [round(float(v), 2) for v in schedule["volume_pct_norm"]]
+        schedule["volume_pct_raw_2dp"] = [round(float(v), 2) for v in schedule["volume_pct_raw"]]
+        schedule["indent_pct_2dp"] = [round(float(i), 2) for i in schedule.get("indent_pct", [])]
+
+        # Optionally produce 2dp rounded schedule for consumers
         if post_round_2dp:
-            schedule = normalize_schedule_to_2dp(
-                schedule,
+            rounded = normalize_schedule_to_2dp(
+                {
+                    "indent_pct": schedule.get("indent_pct", []),
+                    "volume_pct": schedule["volume_pct_norm"],
+                    "martingale_pct": martingale_pct,
+                    "needpct": needpct,
+                    "order_prices": order_prices,
+                    "price_step_pct": price_step_pct,
+                },
                 post_round_strategy=post_round_strategy,
                 post_round_m2_tolerance=post_round_m2_tolerance,
                 post_round_keep_v1_band=post_round_keep_v1_band,
@@ -530,12 +634,14 @@ def evaluation_function(
                 preserve_quartiles=True,
                 verbose=should_log_eval()
             )
-            
-            # Update local references to normalized values
-            volume_pct = schedule["volume_pct"]
-            indent_pct = schedule["indent_pct"]
-            martingale_pct = schedule.get("martingale_pct", martingale_pct)
-            needpct = schedule.get("needpct", needpct)
+            volume_pct = rounded["volume_pct"]
+            indent_pct = rounded.get("indent_pct", indent_pct)
+            martingale_pct = rounded.get("martingale_pct", martingale_pct)
+            needpct = rounded.get("needpct", needpct)
+            schedule.update(rounded)
+        else:
+            schedule["volume_pct"] = [float(v) for v in volume_pct]
+            schedule["indent_pct"] = [float(i) for i in indent_pct]
         
         # Calculate sanity checks on repaired arrays
         calculated_max_need = float(np.max(needpct)) if len(needpct) > 0 else 0.0
@@ -710,6 +816,51 @@ def evaluation_function(
             slope_cap,  # slope_delta_cap
         )
         penalties.update(shape_pens)
+
+        # Sensitivity penalty
+        try:
+            vol_arr = np.asarray(schedule.get("volume_pct_norm", volume_pct), dtype=np.float64)
+            ind_arr = np.asarray(schedule.get("indent_pct", indent_pct), dtype=np.float64)
+            if len(vol_arr) >= 2 and len(ind_arr) >= 2:
+                dv = np.abs(np.diff(vol_arr))
+                di = np.abs(np.diff(ind_arr))
+                mean_di = float(np.mean(di)) if di.size > 0 else 0.0
+                eps = 1e-6 * mean_di + 1e-9
+                mask = di >= eps  # ignore pairs with tiny indent differences
+                if np.any(mask):
+                    S = float(np.mean(dv[mask] / (eps + di[mask])))
+                else:
+                    S = 0.0
+            else:
+                S = 0.0
+        except Exception:
+            S = 0.0
+        penalty_sens = max(0.0, sens_min - S) * w_sens
+        penalties["P_sensitivity"] = float(penalty_sens)
+
+        # Template closeness penalty (geometric doubling template)
+        try:
+            n = len(volume_pct)
+            if n > 0:
+                if (template_mode or "").lower() == "linear":
+                    g = np.linspace(1.0, float(n), n)
+                elif (template_mode or "").lower() == "custom" and template_custom and len(template_custom) == n:
+                    g = np.asarray(template_custom, dtype=np.float64)
+                else:
+                    g = np.array([2.0 ** i for i in range(n)], dtype=np.float64)
+                g = g / np.sum(g) * 100.0
+                v_norm = np.asarray(schedule.get("volume_pct_norm", volume_pct), dtype=np.float64)
+                v_norm = v_norm / max(1e-12, np.sum(v_norm)) * 100.0
+                D = float(np.sum(np.abs(v_norm - g)) / 100.0)
+            else:
+                D = 0.0
+        except Exception:
+            D = 0.0
+        penalty_template = max(0.0, template_close - D) * w_template
+        penalties["P_template"] = float(penalty_template)
+        # Diagnostics for analysis
+        diagnostics["sensitivity_S"] = float(S)
+        diagnostics["template_D"] = float(D)
         
         # Weighted sum of shape penalties (including new SP penalties)
         shape_penalty_sum = (
@@ -728,7 +879,8 @@ def evaluation_function(
             w_wave_shape * shape_pens.get("penalty_wave_shape", 0.0) +
             w_front_share * shape_pens.get("penalty_front_share", 0.0) +
             w_tailweak * shape_pens.get("penalty_tailweak", 0.0) +
-            w_slope * shape_pens.get("penalty_slope", 0.0)
+            w_slope * shape_pens.get("penalty_slope", 0.0) +
+            penalty_sens + penalty_template
         )
         
         # Add entropy penalty if enabled
