@@ -263,6 +263,9 @@ class NormalizationConfig:
     post_round_strategy: str = RoundStrategy.TAIL_FIRST
     post_round_m2_tolerance: float = 0.05
     post_round_keep_v1_band: bool = True
+    # Optional post-normalization smoothing controls (accepted for YAML compatibility)
+    post_norm_smoothing: bool = False
+    smoothing_alpha: float = 0.15
     
     def validate(self) -> List[str]:
         """Validate normalization parameters."""
@@ -273,6 +276,8 @@ class NormalizationConfig:
             errors.append(f"Invalid post_round_strategy: {self.post_round_strategy}")
         if not (0 <= self.post_round_m2_tolerance <= 1):
             errors.append("post_round_m2_tolerance must be in [0, 1]")
+        if not (0.0 <= self.smoothing_alpha <= 1.0):
+            errors.append("smoothing_alpha must be in [0, 1]")
         return errors
 
 

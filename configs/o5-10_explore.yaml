@@ -1,0 +1,79 @@
+core:
+  base_price: 1.0
+  overlap_pct: 10.0
+  num_orders: 10
+  seed: 42
+
+generation:
+  wave_pattern: true
+  wave_mode: anchors
+  anchors: 9
+  softmax_temp: 2.0
+  wave_amp_min: 0.04
+  wave_amp_max: 0.40
+  min_indent_step: 0.05
+  first_volume_target: 0.01
+  first_indent_target: 0.00
+
+constraints:
+  m2_min: 0.10
+  m2_max: 1.00
+  m_min: 0.05
+  m_max: 1.00
+  g_min: 1.01
+  g_max: 1.20
+  slope_cap: 0.25
+  strict_inc_eps: 0.000001
+  second_upper_c2: 2.0
+  q1_cap: 22.0
+  tail_floor: 32.0
+  tail_cap: 0.40
+  m_head: 0.40
+  m_tail: 0.20
+  tau_scale: 0.3333333333333333
+  use_hc0_bootstrap: true
+  use_head_budget: false
+  head_budget_pct: 2.0
+  firstK_min: 1.0
+  k_front: 3
+  front_cap: 5.0
+
+penalties:
+  w_fixed: 3.0
+  w_second: 3.0
+  w_band: 2.0
+  w_front: 3.0
+  w_tv: 3.2
+  w_wave: 1.0
+  w_varm: 2.0
+  w_blocks: 1.0
+  w_plateau: 2.0
+  w_front_share: 2.0
+  w_tailweak: 2.0
+  w_slope: 1.0
+  w_wave_shape: 1.4
+  # anti-lock
+  w_sens: 2.8
+  sens_min: 0.68
+  w_template: 1.9
+  template_close: 0.90
+  target_std: 0.10
+
+scoring:
+  alpha: 0.50
+  beta: 0.30
+  gamma: 0.25
+  lambda_penalty: 0.08
+
+normalization:
+  post_round_2dp: false
+  post_round_strategy: tail-first
+  post_round_m2_tolerance: 0.05
+  post_round_keep_v1_band: true
+  post_norm_smoothing: false
+  smoothing_alpha: 0.15
+
+search:
+  diversity_metric: emd
+  diversity_min_l1: 6.0
+  novelty_k: 2200
