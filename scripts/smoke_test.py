@@ -181,6 +181,37 @@ def validate_monotonicity(db_path: str) -> Tuple[bool, str]:
     return True, "Monotonicity and sum OK"
 
 
+def report_diversity(db_path: str, top_n: int = 50) -> Tuple[int, int]:
+    """Report unique normalized volume patterns in top-N results."""
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        WITH top AS (
+          SELECT schedule_json
+          FROM results r JOIN (SELECT MAX(id) id FROM experiments) l ON r.experiment_id=l.id
+          WHERE r.score > 0
+          ORDER BY r.score ASC
+          LIMIT ?
+        )
+        SELECT json_extract(t.schedule_json, '$.volume_pct_norm_2dp')
+        FROM top t
+        """,
+        (top_n,)
+    )
+    rows = cur.fetchall()
+    conn.close()
+    arrs = []
+    for (js,) in rows:
+        try:
+            arrs.append(tuple(json.loads(js)))
+        except Exception:
+            arrs.append(None)
+    total = len(arrs)
+    unique = len({a for a in arrs if a is not None})
+    return unique, total
+
+
 def validate_quartiles(db_path: str) -> Tuple[bool, str]:
     """Validate Q1/Q4 share and m2 percentage."""
     query = """
@@ -264,6 +295,9 @@ def main():
             print(f"    ❌ {message}")
             all_passed = False
     
+    # Diversity report
+    uniq, tot = report_diversity(db_path, top_n=50)
+    print(f"\nUnique normalized volume patterns in top-50: {uniq}/{tot}")
     print("\n" + "=" * 60)
     if all_passed:
         print("✅ All smoke tests passed!")

@@ -138,8 +138,11 @@ def args_to_config(args: argparse.Namespace) -> EvaluationConfig:
     # Note: overlap and orders are handled by orchestrator search space
     
     # Generation parameters
-    if hasattr(args, 'wave_pattern'):
-        config.generation.wave_pattern = args.wave_pattern
+    # Wave pattern default is True; allow explicit disable to override preset
+    if hasattr(args, 'no_wave_pattern') and args.no_wave_pattern:
+        config.generation.wave_pattern = False
+    elif hasattr(args, 'wave_pattern'):
+        config.generation.wave_pattern = True if args.wave_pattern else config.generation.wave_pattern
     if hasattr(args, 'wave_mode'):
         config.generation.wave_mode = args.wave_mode
     if hasattr(args, 'anchors'):

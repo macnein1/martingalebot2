@@ -72,7 +72,7 @@ class GenerationConfig:
     
     # Basic generation
     min_indent_step: float = 0.05
-    softmax_temp: float = 1.0
+    softmax_temp: float = 1.4
     first_volume_target: float = 1.0
     first_indent_target: float = 0.0
     
@@ -157,7 +157,7 @@ class PenaltyWeightConfig:
     w_fixed: float = 3.0
     w_band: float = 2.0
     w_front: float = 3.0
-    w_tv: float = 1.0
+    w_tv: float = 3.5
     w_sec: float = 3.0
     w_wave: float = 1.0
     
@@ -167,7 +167,12 @@ class PenaltyWeightConfig:
     w_front_share: float = 2.0
     w_tailweak: float = 2.0
     w_slope: float = 1.0
-    w_wave_shape: float = 1.0
+    w_wave_shape: float = 1.2
+    # Diversity penalties
+    w_sens: float = 1.0
+    sens_min: float = 0.25
+    w_template: float = 0.8
+    template_close: float = 0.6
     
     # Variance penalties
     w_varm: float = 2.0
@@ -254,7 +259,7 @@ class AdaptiveConfig:
 @dataclass
 class NormalizationConfig:
     """Output normalization settings."""
-    post_round_2dp: bool = True
+    post_round_2dp: bool = False
     post_round_strategy: str = RoundStrategy.TAIL_FIRST
     post_round_m2_tolerance: float = 0.05
     post_round_keep_v1_band: bool = True
@@ -369,6 +374,7 @@ class EvaluationConfig:
         for param in ['w_fixed', 'w_band', 'w_front', 'w_tv', 'w_sec', 'w_wave',
                      'w_second', 'w_plateau', 'w_front_share', 'w_tailweak',
                      'w_slope', 'w_wave_shape', 'w_varm', 'w_blocks',
+                     'w_sens', 'sens_min', 'w_template', 'template_close',
                      'penalty_preset', 'target_std']:
             if param in kwargs:
                 setattr(config.penalties, param, kwargs[param])

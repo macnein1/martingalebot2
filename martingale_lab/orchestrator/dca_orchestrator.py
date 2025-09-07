@@ -68,6 +68,10 @@ def _process_eval_worker(params: Dict[str, Any]) -> Dict[str, Any]:
             "w_front": params.get("w_front"),
             "w_tv": params.get("w_tv"),
             "w_wave": params.get("w_wave"),
+            "w_sens": params.get("w_sens"),
+            "sens_min": params.get("sens_min"),
+            "w_template": params.get("w_template"),
+            "template_close": params.get("template_close"),
         }
         result["params"] = param_subset
         return result
@@ -183,18 +187,18 @@ class DCAConfig:
     lambda_penalty: float = 0.1
     
     # Wave pattern settings
-    wave_pattern: bool = False
+    wave_pattern: bool = True
     wave_strong_threshold: float = 50.0
     wave_weak_threshold: float = 10.0
     
     # Constraints
     tail_cap: float = 0.40
     min_indent_step: float = 0.05
-    softmax_temp: float = 1.0
+    softmax_temp: float = 1.4
 
     # Generation controls
     wave_mode: str = "anchors"  # [anchors, blocks]
-    anchors: int = 6
+    anchors: int = 9
     blocks: int = 3
     wave_amp_min: float = 0.05
     wave_amp_max: float = 0.30
@@ -243,8 +247,13 @@ class DCAConfig:
     w_second: float = 3.0
     w_gband: float = 2.0
     w_front: float = 3.0
-    w_tv: float = 1.0
+    w_tv: float = 3.5
     w_wave: float = 1.0
+    # New penalties (sensitivity/template)
+    w_sens: float = 1.0
+    sens_min: float = 0.25
+    w_template: float = 0.8
+    template_close: float = 0.6
     
     # Early stopping
     early_stop_threshold: float = 1e-6  # Stop if improvement < threshold
@@ -262,10 +271,18 @@ class DCAConfig:
     max_time_sec: Optional[int] = None  # Maximum runtime in seconds
     
     # Schedule normalization parameters
-    post_round_2dp: bool = True
+    post_round_2dp: bool = False
     post_round_strategy: str = "tail-first"
     post_round_m2_tolerance: float = 0.05
     post_round_keep_v1_band: bool = True
+    # Post-normalization smoothing (optional)
+    post_norm_smoothing: bool = False
+    smoothing_alpha: float = 0.15
+
+    # Novelty filter parameters
+    diversity_min_l1: float = 0.8
+    novelty_k: int = 500
+    diversity_metric: str = "l1"  # [l1, emd]
 
 
 class DCAOrchestrator:
@@ -319,6 +336,8 @@ class DCAOrchestrator:
             "pruned": 0,
             "saved_rows": 0
         }
+        # Novelty filter pool of normalized volume shapes (list of numpy arrays)
+        self._novelty_pool: List[np.ndarray] = []
     
     def create_experiment(self, notes: Optional[str] = None) -> int:
         """Create a new experiment in the database."""
@@ -420,6 +439,9 @@ class DCAOrchestrator:
                 "post_round_strategy": self.config.post_round_strategy,
                 "post_round_m2_tolerance": self.config.post_round_m2_tolerance,
                 "post_round_keep_v1_band": self.config.post_round_keep_v1_band,
+                # Post-normalization smoothing
+                "post_norm_smoothing": self.config.post_norm_smoothing,
+                "smoothing_alpha": self.config.smoothing_alpha,
             }
             parameters.append(params)
         
@@ -476,6 +498,11 @@ class DCAOrchestrator:
                 "w_front": params.get("w_front"),
                 "w_tv": params.get("w_tv"),
                 "w_wave": params.get("w_wave"),
+                # New penalties
+                "w_sens": params.get("w_sens"),
+                "sens_min": params.get("sens_min"),
+                "w_template": params.get("w_template"),
+                "template_close": params.get("template_close"),
             }
             result["params"] = param_subset
             
@@ -543,6 +570,81 @@ class DCAOrchestrator:
                         # Fallback to sequential evaluation for this item
                         results.append(self.evaluate_candidate(params))
         
+        # Apply novelty filter within-batch: build pool incrementally to penalize clones immediately
+        if results:
+            filtered: List[Dict[str, Any]] = []
+            l1_vals: List[float] = []
+            unique_added = 0
+            for res in results:
+                try:
+                    sch = res.get("schedule", {})
+                    v_norm = sch.get("volume_pct_norm") or sch.get("volume_pct")
+                    if not v_norm:
+                        filtered.append(res)
+                        continue
+                    # Canonicalize with 2dp rounding and ensure sum 100
+                    v_arr = np.asarray([round(float(x), 2) for x in v_norm], dtype=np.float64)
+                    s = float(np.sum(v_arr))
+                    if s > 1e-12:
+                        v_arr = v_arr * (100.0 / s)
+                    if np.sum(v_arr) > 0:
+                        v_arr = v_arr / np.sum(v_arr) * 100.0
+                    # Compute min distance versus current pool
+                    min_l1 = 1e9
+                    for p in self._novelty_pool:
+                        if len(p) != len(v_arr):
+                            continue
+                        if self.config.diversity_metric == "emd":
+                            # Wasserstein-1 via CDF difference (O(n))
+                            c1 = np.cumsum(v_arr) / 100.0
+                            c2 = np.cumsum(p) / 100.0
+                            d = float(np.sum(np.abs(c1 - c2)) / len(v_arr))
+                        else:
+                            # Default L1 on percentages normalized by 100
+                            d = float(np.sum(np.abs(v_arr - p)) / 100.0)
+                        if d < min_l1:
+                            min_l1 = d
+                            if min_l1 < self.config.diversity_min_l1:
+                                break
+                    l1_vals.append(min_l1 if np.isfinite(min_l1) else float('nan'))
+                    if min_l1 < self.config.diversity_min_l1:
+                        # Strong downweight: inflate score to deprioritize clones but still retain for stats
+                        res["score"] = float(res.get("score", float("inf")) + 1000.0 * (self.config.diversity_min_l1 - min_l1))
+                        filtered.append(res)
+                        # Do not add shape to pool
+                    else:
+                        filtered.append(res)
+                        # Add to novelty pool
+                        self._novelty_pool.append(v_arr)
+                        unique_added += 1
+                        if len(self._novelty_pool) > max(1, self.config.novelty_k):
+                            # Simple LRU: keep most recent K
+                            self._novelty_pool = self._novelty_pool[-self.config.novelty_k:]
+                except Exception:
+                    filtered.append(res)
+            results = filtered
+            # Log novelty stats
+            try:
+                reject_rate = float(sum(1 for x in l1_vals if x < self.config.diversity_min_l1) / max(1, len(l1_vals)))
+                avg_l1 = float(np.nanmean(np.asarray(l1_vals, dtype=np.float64))) if l1_vals else float('nan')
+                unique_ratio = float(unique_added / max(1, len(l1_vals)))
+            except Exception:
+                reject_rate = 0.0
+                avg_l1 = float('nan')
+                unique_ratio = 0.0
+            self.logger.info(
+                f"NOVELTY: reject_rate={reject_rate:.2%} unique_rate={unique_ratio:.2%} avg_L1={avg_l1:.3f} pool={len(self._novelty_pool)}",
+                extra={
+                    "event": "NOVELTY.STATS",
+                    "run_id": self.run_id,
+                    "exp_id": self.current_experiment_id,
+                    "batch_idx": self.batch_count,
+                    "reject_rate": reject_rate,
+                    "unique_rate": unique_ratio,
+                    "avg_l1": avg_l1,
+                    "pool_size": len(self._novelty_pool),
+                }
+            )
         return results
     
     def apply_pruning(self, results: List[Dict[str, Any]], batch_idx: int) -> List[Dict[str, Any]]:
@@ -890,6 +992,7 @@ class DCAOrchestrator:
                         "softmax_temp": params_info.get("softmax_temp"),
                         "seed": params_info.get("seed"),
                         "candidate_uid": f"{self.run_id}:{batch_idx}:{cand_idx}",
+                        "payload_schema": 2,
                         "param_repr": {
                             "mode": params_info.get("wave_mode", res.get("diagnostics", {}).get("wave_mode", "anchors")),
                             "orders": params_info.get("num_orders"),
@@ -902,12 +1005,15 @@ class DCAOrchestrator:
                             "front_cap": params_info.get("front_cap", 5.0),
                             "k_front": params_info.get("k_front", 3),
                             "isotonic_tail": bool(params_info.get("isotonic_tail", False))
-                        }
+                        },
+                        "run_id": self.run_id,
+                        "seed": params_info.get("seed"),
                     }
                     sid = make_stable_id(payload, run_id=self.run_id, batch_idx=batch_idx, cand_idx=cand_idx)
                     db_items.append({
                         "stable_id": sid,
                         "score": float(res.get("score", float("inf"))),
+                        "schedule": res.get("schedule", {}),
                         "payload": payload,
                         "sanity": res.get("sanity", {}),
                         "diagnostics": res.get("diagnostics", {}),
@@ -969,6 +1075,44 @@ class DCAOrchestrator:
                 self.stats["batches_completed"] = batch_idx + 1
                 self.stats["total_time"] = time.time() - self.start_time
                 self.stats["evaluations_per_second"] = self.total_evaluations / self.stats["total_time"]
+
+                # Penalty breakdown (mean/median) over kept results in this batch
+                try:
+                    import numpy as _np
+                    def _collect_p(keys: List[str]) -> Dict[str, Dict[str, float]]:
+                        out: Dict[str, Dict[str, float]] = {}
+                        arrs: Dict[str, List[float]] = {k: [] for k in keys}
+                        for r in pruned_results:
+                            p = r.get("penalties", {})
+                            for k in keys:
+                                v = p.get(k)
+                                if isinstance(v, (int, float)):
+                                    arrs[k].append(float(v))
+                        for k, vs in arrs.items():
+                            if vs:
+                                a = _np.asarray(vs, dtype=_np.float64)
+                                out[k] = {
+                                    "mean": float(_np.mean(a)),
+                                    "median": float(_np.median(a)),
+                                }
+                        return out
+                    p_keys = [
+                        "P_gini","P_entropy","P_monotone","P_smooth","P_tailcap","P_need_mismatch","P_wave",
+                        "P_sensitivity","P_template"
+                    ]
+                    p_stats = _collect_p(p_keys)
+                    self.logger.info(
+                        f"PEN.BREAKDOWN: " + ", ".join([f"{k}(μ={v['mean']:.3f},~={v['median']:.3f})" for k,v in p_stats.items()]),
+                        extra={
+                            "event": "PEN.BREAKDOWN",
+                            "run_id": self.run_id,
+                            "exp_id": self.current_experiment_id,
+                            "batch_idx": batch_idx,
+                            "stats": p_stats
+                        }
+                    )
+                except Exception:
+                    pass
                 
                 # Count sanity violations and wave patterns
                 for result in batch_results:
