@@ -249,6 +249,12 @@ class DCAConfig:
     w_front: float = 3.0
     w_tv: float = 3.5
     w_wave: float = 1.0
+    # Additional SP penalty weights to forward to evaluation
+    w_plateau: float = 2.0
+    w_front_share: float = 2.0
+    w_tailweak: float = 2.0
+    w_slope: float = 1.0
+    w_wave_shape: float = 1.2
     # New penalties (sensitivity/template)
     w_sens: float = 1.0
     sens_min: float = 0.25
@@ -434,6 +440,12 @@ class DCAOrchestrator:
                 "w_front": self.config.w_front,
                 "w_tv": self.config.w_tv,
                 "w_wave": self.config.w_wave,
+                # Additional SP penalty weights
+                "w_plateau": self.config.w_plateau,
+                "w_front_share": self.config.w_front_share,
+                "w_tailweak": self.config.w_tailweak,
+                "w_slope": self.config.w_slope,
+                "w_wave_shape": self.config.w_wave_shape,
                 # Schedule normalization
                 "post_round_2dp": self.config.post_round_2dp,
                 "post_round_strategy": self.config.post_round_strategy,
