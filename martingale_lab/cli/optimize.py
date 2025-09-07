@@ -446,6 +446,15 @@ def create_orchestrator_config(args: argparse.Namespace) -> tuple[DCAConfig, Orc
         dca_config.w_wave = float(eval_config.penalties.w_wave)
         dca_config.w_varm = float(eval_config.penalties.w_varm)
         dca_config.w_blocks = float(eval_config.penalties.w_blocks)
+        # Additional SP penalty weights
+        try:
+            dca_config.w_plateau = float(eval_config.penalties.w_plateau)
+            dca_config.w_front_share = float(eval_config.penalties.w_front_share)
+            dca_config.w_tailweak = float(eval_config.penalties.w_tailweak)
+            dca_config.w_slope = float(eval_config.penalties.w_slope)
+            dca_config.w_wave_shape = float(eval_config.penalties.w_wave_shape)
+        except Exception:
+            pass
 
         dca_config.w_sens = float(eval_config.penalties.w_sens)
         dca_config.sens_min = float(eval_config.penalties.sens_min)
@@ -496,6 +505,13 @@ def create_orchestrator_config(args: argparse.Namespace) -> tuple[DCAConfig, Orc
                     if "smoothing_alpha" in search_blk and args.smoothing_alpha == 0.15:
                         # use YAML only if default CLI not overridden
                         dca_config.smoothing_alpha = float(search_blk.get("smoothing_alpha"))
+                # Also allow normalization block to set smoothing controls
+                norm_blk = raw.get("normalization") or {}
+                if isinstance(norm_blk, dict):
+                    if "post_norm_smoothing" in norm_blk and not args.post_norm_smoothing:
+                        dca_config.post_norm_smoothing = bool(norm_blk.get("post_norm_smoothing"))
+                    if "smoothing_alpha" in norm_blk and args.smoothing_alpha == 0.15:
+                        dca_config.smoothing_alpha = float(norm_blk.get("smoothing_alpha"))
         except Exception:
             # YAML extras are optional; ignore failures
             pass
