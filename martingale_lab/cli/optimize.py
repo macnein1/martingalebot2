@@ -226,6 +226,14 @@ def parse_args() -> argparse.Namespace:
                        help="Tolerance for m2 preservation in percentage points")
     parser.add_argument("--post-round-keep-v1-band", action="store_true", default=True,
                        help="Preserve v1 band constraint during normalization")
+
+    # Diversity/Novelty (search) parameters
+    parser.add_argument("--diversity-metric", choices=["l1", "emd"], default=None,
+                       help="Diversity metric for novelty filtering (l1 or emd)")
+    parser.add_argument("--diversity-min-l1", type=float, default=None,
+                       help="Minimum distance threshold for accepting novel shapes")
+    parser.add_argument("--novelty-k", type=int, default=None,
+                       help="Novelty pool size (recent unique patterns kept)")
     
     # Add config-based arguments
     add_config_arguments(parser)
@@ -256,7 +264,7 @@ def create_orchestrator_config(args: argparse.Namespace) -> tuple[DCAConfig, Orc
         print_config(eval_config)
         sys.exit(0)
     
-    # Create evaluation config from args
+    # Create evaluation config from args (and optionally from --config file)
     eval_config = args_to_config(args)
     
     # Save config if requested
@@ -390,6 +398,115 @@ def create_orchestrator_config(args: argparse.Namespace) -> tuple[DCAConfig, Orc
         post_norm_smoothing=args.post_norm_smoothing,
         smoothing_alpha=args.smoothing_alpha
     )
+
+    # If a config file is supplied, map relevant EvaluationConfig fields into DCAConfig
+    # so YAML presets can drive the orchestrator defaults without extra CLI flags.
+    try:
+        # Generation knobs
+        dca_config.wave_pattern = eval_config.generation.wave_pattern
+        dca_config.wave_mode = str(eval_config.generation.wave_mode)
+        dca_config.anchors = int(eval_config.generation.anchors)
+        dca_config.blocks = int(eval_config.generation.blocks)
+        dca_config.wave_amp_min = float(eval_config.generation.wave_amp_min)
+        dca_config.wave_amp_max = float(eval_config.generation.wave_amp_max)
+        dca_config.softmax_temp = float(eval_config.generation.softmax_temp)
+        dca_config.min_indent_step = float(eval_config.generation.min_indent_step)
+        dca_config.first_volume = float(eval_config.generation.first_volume_target)
+        dca_config.first_indent = float(eval_config.generation.first_indent_target)
+
+        # Hard constraints
+        dca_config.m2_min = float(eval_config.constraints.m2_min)
+        dca_config.m2_max = float(eval_config.constraints.m2_max)
+        dca_config.m_min = float(eval_config.constraints.m_min)
+        dca_config.m_max = float(eval_config.constraints.m_max)
+        dca_config.slope_cap = float(eval_config.constraints.slope_cap)
+        dca_config.strict_inc_eps = float(eval_config.constraints.strict_inc_eps)
+        dca_config.second_upper_c2 = float(eval_config.constraints.second_upper_c2)
+        dca_config.q1_cap = float(eval_config.constraints.q1_cap)
+        dca_config.tail_floor = float(eval_config.constraints.tail_floor)
+        dca_config.tail_cap = float(eval_config.constraints.tail_cap)
+        dca_config.m_head = float(eval_config.constraints.m_head)
+        dca_config.m_tail = float(eval_config.constraints.m_tail)
+        dca_config.tau_scale = float(eval_config.constraints.tau_scale)
+        dca_config.use_hc0_bootstrap = bool(eval_config.constraints.use_hc0_bootstrap)
+        dca_config.use_head_budget = bool(eval_config.constraints.use_head_budget)
+        dca_config.head_budget_pct = float(eval_config.constraints.head_budget_pct)
+        dca_config.firstK_min = float(eval_config.constraints.firstK_min)
+        dca_config.k_front = int(eval_config.constraints.k_front)
+        dca_config.front_cap = float(eval_config.constraints.front_cap)
+
+        # Penalties - include anti-lock knobs
+        if eval_config.penalties.penalty_preset:
+            dca_config.penalty_preset = eval_config.penalties.penalty_preset
+        dca_config.w_fixed = float(eval_config.penalties.w_fixed)
+        dca_config.w_second = float(eval_config.penalties.w_second)
+        dca_config.w_gband = float(eval_config.penalties.w_band)
+        dca_config.w_front = float(eval_config.penalties.w_front)
+        dca_config.w_tv = float(eval_config.penalties.w_tv)
+        dca_config.w_wave = float(eval_config.penalties.w_wave)
+        dca_config.w_varm = float(eval_config.penalties.w_varm)
+        dca_config.w_blocks = float(eval_config.penalties.w_blocks)
+
+        dca_config.w_sens = float(eval_config.penalties.w_sens)
+        dca_config.sens_min = float(eval_config.penalties.sens_min)
+        dca_config.w_template = float(eval_config.penalties.w_template)
+        dca_config.template_close = float(eval_config.penalties.template_close)
+
+        # Scoring
+        dca_config.alpha = float(eval_config.scoring.alpha)
+        dca_config.beta = float(eval_config.scoring.beta)
+        dca_config.gamma = float(eval_config.scoring.gamma)
+        dca_config.lambda_penalty = float(eval_config.scoring.lambda_penalty)
+
+        # Normalization
+        dca_config.post_round_2dp = bool(eval_config.normalization.post_round_2dp)
+        dca_config.post_round_strategy = str(eval_config.normalization.post_round_strategy)
+        dca_config.post_round_m2_tolerance = float(eval_config.normalization.post_round_m2_tolerance)
+        dca_config.post_round_keep_v1_band = bool(eval_config.normalization.post_round_keep_v1_band)
+    except Exception:
+        # Best-effort mapping only; continue with CLI/defaults on any issue
+        pass
+
+    # Read extra orchestrator/search settings directly from YAML if provided
+    # Keys supported under top-level 'search': diversity_metric, diversity_min_l1, novelty_k,
+    # and optional post_norm_smoothing, smoothing_alpha (orchestrator-level)
+    if hasattr(args, 'config') and args.config:
+        try:
+            import yaml  # type: ignore
+            from pathlib import Path as _Path
+            cfg_path = _Path(args.config)
+            if cfg_path.exists() and cfg_path.suffix.lower() in [".yml", ".yaml"]:
+                with open(cfg_path, "r") as _f:
+                    raw = yaml.safe_load(_f) or {}
+                search_blk = raw.get("search") or {}
+                if isinstance(search_blk, dict):
+                    if dca_config.diversity_metric is None or args.diversity_metric is not None:
+                        # explicit CLI wins; otherwise use YAML
+                        pass
+                    # Apply YAML values if CLI not provided
+                    if args.diversity_metric is None and search_blk.get("diversity_metric"):
+                        dca_config.diversity_metric = str(search_blk.get("diversity_metric")).lower()
+                    if args.diversity_min_l1 is None and search_blk.get("diversity_min_l1") is not None:
+                        dca_config.diversity_min_l1 = float(search_blk.get("diversity_min_l1"))
+                    if args.novelty_k is None and search_blk.get("novelty_k") is not None:
+                        dca_config.novelty_k = int(search_blk.get("novelty_k"))
+                    # Smoothing may be included under search for presets
+                    if "post_norm_smoothing" in search_blk and not args.post_norm_smoothing:
+                        dca_config.post_norm_smoothing = bool(search_blk.get("post_norm_smoothing"))
+                    if "smoothing_alpha" in search_blk and args.smoothing_alpha == 0.15:
+                        # use YAML only if default CLI not overridden
+                        dca_config.smoothing_alpha = float(search_blk.get("smoothing_alpha"))
+        except Exception:
+            # YAML extras are optional; ignore failures
+            pass
+
+    # CLI overrides for diversity/novelty take precedence if provided
+    if args.diversity_metric is not None:
+        dca_config.diversity_metric = args.diversity_metric
+    if args.diversity_min_l1 is not None:
+        dca_config.diversity_min_l1 = args.diversity_min_l1
+    if args.novelty_k is not None:
+        dca_config.novelty_k = args.novelty_k
     
     orch_config = OrchestratorConfig(
         # Pruning configuration
@@ -436,6 +553,13 @@ def log_config_summary(dca_config: DCAConfig, orch_config: OrchestratorConfig, r
                 "wave_mode": dca_config.wave_mode,
                 "anchors": dca_config.anchors,
                 "blocks": dca_config.blocks
+            },
+            "novelty": {
+                "diversity_metric": dca_config.diversity_metric,
+                "diversity_min_l1": dca_config.diversity_min_l1,
+                "novelty_k": dca_config.novelty_k,
+                "post_norm_smoothing": dca_config.post_norm_smoothing,
+                "smoothing_alpha": dca_config.smoothing_alpha
             },
             "constraints": {
                 "first_volume": dca_config.first_volume,
